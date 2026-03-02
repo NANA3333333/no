@@ -322,30 +322,41 @@ function SettingsPanel({ apiUrl, onCharactersUpdate, onProfileUpdate, onBack }) 
     const handleFileUpload = async (event, setAvatarCallback) => {
         const targetInput = event.target;
         const file = targetInput.files[0];
-        console.log("File selected:", file, "Event:", event);
+        console.log("DEBUG: File selected:", file ? file.name : "null", "size:", file ? file.size : 0);
+
         if (!file) {
-            console.log("No file detected by input!");
+            console.log("DEBUG: No file detected by input!");
             return;
         }
+
         const formData = new FormData();
         formData.append('image', file);
+
+        console.log("DEBUG: Sending POST to", `${apiUrl}/upload`);
+
         try {
             const res = await fetch(`${apiUrl}/upload`, {
                 method: 'POST',
                 headers: { 'Authorization': `Bearer ${localStorage.getItem('cp_token') || ''}` },
                 body: formData
             });
+            console.log("DEBUG: Fetch resolved with status", res.status);
+
             const data = await res.json();
+            console.log("DEBUG: Server JSON response:", data);
+
             if (data.success) {
                 setAvatarCallback(data.url);
+                alert("上传成功 / Upload Success!\n\n文件路径：" + data.url + "\n\n请不要忘记点击下方的【Save / 保存】按钮使头像生效！\n(Please click Save below)");
             } else {
                 alert(lang === 'en' ? "Failed to save: " + data.error : "保存失败: " + data.error);
             }
         } catch (e) {
-            console.error('Upload Error:', e);
-            alert('Upload failed.');
+            console.error('DEBUG Upload Error Exception:', e);
+            alert('上传过程发生错误/Upload Exception: ' + e.message);
         } finally {
             if (targetInput) targetInput.value = null;
+            console.log("DEBUG: Upload process finished.");
         }
     };
 
