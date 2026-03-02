@@ -72,12 +72,12 @@ function App() {
           }
           return newContact;
         }));
-        if (activeContactId && !data.find(c => c.id === activeContactId)) {
+        if (activeContactRef.current && !data.find(c => c.id === activeContactRef.current)) {
           setActiveContactId(null);
         }
       })
       .catch(err => console.error('Failed to load contacts:', err));
-  }, [activeContactId]);
+  }, []);
 
   // 1. Fetch Contacts (Characters) and Profile on mount
   // eslint-disable-next-line react-hooks/exhaustive-deps
