@@ -169,11 +169,25 @@ app.get('/api/system/export', async (req, res) => {
         const decoded = jwt.verify(token, JWT_SECRET);
         const userId = decoded.id;
 
-        getUserDb(userId); // ensure db is initialized
+        const db = getUserDb(userId); // ensure db is initialized
         const dbPath = path.join(__dirname, '..', 'data', `chatpulse_user_${userId}.db`);
         if (!fs.existsSync(dbPath)) return res.status(404).send('Database not found');
 
-        res.download(dbPath, `chatpulse_backup_${userId}_${Date.now()}.db`);
+        res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+        res.setHeader('Pragma', 'no-cache');
+        res.setHeader('Expires', '0');
+
+        const backupFileName = `chatpulse_backup_${userId}_${Date.now()}.db`;
+        const backupPath = path.join(__dirname, '..', 'data', backupFileName);
+
+        // Await the backup snapshot. This correctly captures all memory buffered in WAL.
+        await db.backup(backupPath);
+
+        res.download(backupPath, backupFileName, (err) => {
+            if (fs.existsSync(backupPath)) {
+                fs.unlinkSync(backupPath); // Cleanup the temp backup
+            }
+        });
     } catch (e) {
         res.status(500).send(e.message);
     }
