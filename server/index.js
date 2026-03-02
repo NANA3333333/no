@@ -27,7 +27,8 @@ const app = express();
 // accidentally blocking frontend scripts since it's an SPA.
 app.use(helmet({ contentSecurityPolicy: false }));
 app.use(cors());
-app.use(express.json()); // Parses incoming JSON requests
+app.use(express.json({ limit: '50mb' })); // Parses incoming JSON requests
+app.use(express.urlencoded({ limit: '50mb', extended: true })); // Parses URL-encoded data
 
 // Define rate limiters
 const authLimiter = rateLimit({
