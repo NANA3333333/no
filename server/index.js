@@ -438,8 +438,8 @@ app.get('/api/user', authMiddleware, (req, res) => {
 app.post('/api/user', authMiddleware, (req, res) => {
     const db = req.db;
     try {
-        if (typeof db.saveUserProfile === 'function') {
-            db.saveUserProfile(req.body);
+        if (typeof db.updateUserProfile === 'function') {
+            db.updateUserProfile(req.body);
         }
         const updatedProfile = typeof db.getUserProfile === 'function' ? db.getUserProfile() : null;
         res.json({ success: true, profile: { ...(updatedProfile || { name: req.user.username }), username: req.user.username } });
