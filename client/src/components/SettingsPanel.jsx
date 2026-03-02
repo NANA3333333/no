@@ -339,6 +339,8 @@ function SettingsPanel({ apiUrl, onCharactersUpdate, onProfileUpdate, onBack }) 
         } catch (e) {
             console.error('Upload Error:', e);
             alert('Upload failed.');
+        } finally {
+            event.target.value = null;
         }
     };
 
