@@ -40,6 +40,7 @@ function App() {
   const [activeGroupId, setActiveGroupId] = useState(null);
   const [newGroupMessage, setNewGroupMessage] = useState(null);
   const [groupTyping, setGroupTyping] = useState({}); // { groupId: [{ sender_id, name }, ...] }
+  const [globalAnnouncement, setGlobalAnnouncement] = useState(null);
 
   // Use a ref to track the active contact ID without causing useEffect re-renders when it changes.
   const activeContactRef = useRef(activeContactId);
@@ -118,6 +119,15 @@ function App() {
       })
       .then(data => setGroups(data))
       .catch(err => console.error('Failed to load groups:', err));
+
+    fetch(`${API_URL}/system/announcement`, { headers })
+      .then(res => res.json())
+      .then(data => {
+        if (data.success && data.announcement) {
+          setGlobalAnnouncement(data.announcement.content);
+        }
+      })
+      .catch(err => console.error('Failed to load announcement:', err));
   }, [token]);
 
   // Listen for iframe postMessage from SillyTavern parent
@@ -177,6 +187,8 @@ function App() {
           }
         } else if (msg.type === 'refresh_contacts') {
           fetchContacts();
+        } else if (msg.type === 'announcement') {
+          setGlobalAnnouncement(msg.content);
         }
       } catch (e) {
         console.error('WS Parse Error', e);
@@ -271,6 +283,13 @@ function App() {
 
   return (
     <div className={`app-container tab-${activeTab} ${activeContactId || activeGroupId ? 'has-active-chat' : 'no-active-chat'} ${isViewingList ? 'viewing-list' : 'viewing-content'}`}>
+      {globalAnnouncement && (
+        <div style={{ position: 'absolute', top: 0, left: '70px', right: 0, zIndex: 9999, background: 'var(--primary, #07c160)', color: 'white', padding: '10px 20px', textAlign: 'center', boxShadow: '0 2px 8px rgba(0,0,0,0.1)', display: 'flex', justifyContent: 'center', alignItems: 'center', gap: '10px' }}>
+          <span style={{ fontWeight: 'bold' }}>📢</span>
+          <span>{globalAnnouncement}</span>
+          <button onClick={() => setGlobalAnnouncement(null)} style={{ background: 'none', border: 'none', color: 'rgba(255,255,255,0.8)', cursor: 'pointer', marginLeft: 'auto', fontSize: '20px', padding: '0 5px' }}>&times;</button>
+        </div>
+      )}
       {/* 1. Very Left Sidebar (Navigation) */}
       <nav className="sidebar-nav">
         <div className="my-avatar" onClick={() => setActiveTab('settings')} style={{ cursor: 'pointer' }}>

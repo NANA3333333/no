@@ -27,7 +27,18 @@ function initAuthDb() {
             used_by TEXT,
             created_at INTEGER NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS announcements (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            content TEXT NOT NULL,
+            created_at INTEGER NOT NULL
+        );
     `);
+
+    try {
+        db.exec("ALTER TABLE users ADD COLUMN last_active_at INTEGER DEFAULT 0;");
+    } catch (e) {
+        // Column may already exist, ignore error
+    }
 
     // Auto-seed root admin account "Nana"
     const rootUser = db.prepare('SELECT id FROM users WHERE username = ?').get('Nana');
@@ -102,7 +113,31 @@ function getInviteCodes() {
 }
 
 function getAllUsers() {
-    return db.prepare('SELECT id, username, created_at FROM users ORDER BY created_at DESC').all();
+    return db.prepare('SELECT id, username, created_at, last_active_at FROM users ORDER BY created_at DESC').all();
+}
+
+function updateLastActive(id) {
+    try {
+        db.prepare('UPDATE users SET last_active_at = ? WHERE id = ?').run(Date.now(), id);
+    } catch (e) {
+        console.error('[AuthDB] Failed to update last active:', e.message);
+    }
+}
+
+function deleteUser(id) {
+    db.prepare('DELETE FROM users WHERE id = ?').run(id);
+}
+
+function deleteInviteCode(code) {
+    db.prepare('DELETE FROM invite_codes WHERE code = ?').run(code);
+}
+
+function getLatestAnnouncement() {
+    return db.prepare('SELECT content, created_at FROM announcements ORDER BY created_at DESC LIMIT 1').get();
+}
+
+function setAnnouncement(content) {
+    db.prepare('INSERT INTO announcements (content, created_at) VALUES (?, ?)').run(content, Date.now());
 }
 
 module.exports = {
@@ -112,5 +147,10 @@ module.exports = {
     getUserById,
     generateInviteCode,
     getInviteCodes,
-    getAllUsers
+    getAllUsers,
+    updateLastActive,
+    deleteUser,
+    deleteInviteCode,
+    getLatestAnnouncement,
+    setAnnouncement
 };
