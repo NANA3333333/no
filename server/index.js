@@ -290,8 +290,19 @@ app.post('/api/system/import', authMiddleware, upload.single('db_file'), async (
             await memory.wipeIndex(c.id);
         }
 
-        req.db.close();
         const dbPath = req.db.getDbPath();
+
+        // Ensure WAL is checkpointed and DB is closed before overwriting
+        try {
+            await req.db.backup(dbPath + '.tmp'); // Forces a WAL checkpoint in db.js
+        } catch (e) { }
+
+        req.db.close();
+
+        // Delete existing WAL and SHM files to prevent corruption with the new DB file
+        if (fs.existsSync(dbPath + '-wal')) fs.unlinkSync(dbPath + '-wal');
+        if (fs.existsSync(dbPath + '-shm')) fs.unlinkSync(dbPath + '-shm');
+
         fs.copyFileSync(req.file.path, dbPath);
         fs.unlinkSync(req.file.path);
 
