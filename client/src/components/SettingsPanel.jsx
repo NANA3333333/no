@@ -311,6 +311,10 @@ function SettingsPanel({ apiUrl, onCharactersUpdate, onProfileUpdate, onBack }) 
             if (res.ok) {
                 setEditingContact(null);
                 if (onCharactersUpdate) onCharactersUpdate();
+                fetch(`${apiUrl}/characters`, { headers: { 'Authorization': `Bearer ${localStorage.getItem('cp_token') || ''}` } })
+                    .then(r => r.json())
+                    .then(d => setContacts(d))
+                    .catch(console.error);
             } else {
                 alert("Failed to save: " + data.error);
             }
