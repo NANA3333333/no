@@ -441,7 +441,8 @@ app.post('/api/user', authMiddleware, (req, res) => {
         if (typeof db.saveUserProfile === 'function') {
             db.saveUserProfile(req.body);
         }
-        res.json({ success: true });
+        const updatedProfile = typeof db.getUserProfile === 'function' ? db.getUserProfile() : null;
+        res.json({ success: true, profile: { ...(updatedProfile || { name: req.user.username }), username: req.user.username } });
     } catch (e) {
         res.status(500).json({ error: e.message });
     }
