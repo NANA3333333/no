@@ -136,6 +136,18 @@ module.exports = function initRelationships(app, context) {
         }
     });
 
+    // 13.5.5 Get character impression history
+    app.get('/api/characters/:id/impressions/:targetId', authMiddleware, (req, res) => {
+        const db = getUserDb(req.user.id);
+        try {
+            const limit = parseInt(req.query.limit) || 50;
+            const history = db.getCharImpressionHistory(req.params.id, req.params.targetId, limit);
+            res.json(history);
+        } catch (e) {
+            res.status(500).json({ error: e.message });
+        }
+    });
+
     // 13.6 Regenerate impression for a specific relationship pair
     app.post('/api/characters/:id/relationships/regenerate', authMiddleware, async (req, res) => {
         const db = getUserDb(req.user.id);

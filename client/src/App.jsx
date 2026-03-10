@@ -31,7 +31,7 @@ function App() {
   const [activeContactId, setActiveContactId] = useState(null);
   const [contacts, setContacts] = useState([]);
 
-  const [newIncomingMessage, setNewIncomingMessage] = useState(null);
+  const [incomingMessageQueue, setIncomingMessageQueue] = useState([]);
   const [activeDrawer, setActiveDrawer] = useState(null); // 'memo', 'diary', or null
   const [userProfile, setUserProfile] = useState(null);
   const [isLoaded, setIsLoaded] = useState(false);
@@ -40,13 +40,16 @@ function App() {
   const [showCreateGroupModal, setShowCreateGroupModal] = useState(false);
   const [groups, setGroups] = useState([]);
   const [activeGroupId, setActiveGroupId] = useState(null);
-  const [newGroupMessage, setNewGroupMessage] = useState(null);
+  const [incomingGroupMessageQueue, setIncomingGroupMessageQueue] = useState([]);
   const [groupTyping, setGroupTyping] = useState({}); // { groupId: [{ sender_id, name }, ...] }
   const [globalAnnouncement, setGlobalAnnouncement] = useState(null);
   const [groupChatEnabled, setGroupChatEnabled] = useState(false); // Auto-detected: true if Group Chat DLC is loaded
   const [redpacketClaimEvent, setRedpacketClaimEvent] = useState(null);
   const [hasNewMoments, setHasNewMoments] = useState(false); // Moments notification
+  const [generatingSchedules, setGeneratingSchedules] = useState({});
+  const [hiddenMessagesCount, setHiddenMessagesCount] = useState(0);
 
+  console.log('App render hiddenCount:', hiddenMessagesCount);
 
   // Use a ref to track the active contact ID without causing useEffect re-renders when it changes.
   const activeContactRef = useRef(activeContactId);
@@ -167,12 +170,11 @@ function App() {
       try {
         const msg = JSON.parse(event.data);
         if (msg.type === 'new_message') {
-          setNewIncomingMessage(msg.data);
+          setIncomingMessageQueue(prev => [...prev, msg.data]);
         } else if (msg.type === 'engine_state') {
           setEngineState(msg.data);
         } else if (msg.type === 'group_message') {
-          groupMsgSeqRef.current += 1;
-          setNewGroupMessage({ ...msg.data, _seq: groupMsgSeqRef.current });
+          setIncomingGroupMessageQueue(prev => [...prev, msg.data]);
         } else if (msg.type === 'group_typing') {
           setGroupTyping(prev => {
             const key = msg.data.group_id;
@@ -194,6 +196,7 @@ function App() {
             setUserProfile(prev => prev ? { ...prev, wallet: userWallet } : prev);
           }
         } else if (msg.type === 'refresh_contacts') {
+          window.dispatchEvent(new Event('refresh_contacts'));
           fetchContacts();
         } else if (msg.type === 'announcement') {
           setGlobalAnnouncement(msg.content);
@@ -207,6 +210,15 @@ function App() {
           if (activeTab !== 'moments') {
             setHasNewMoments(true);
           }
+        } else if (msg.type === 'memory_update') {
+          console.log('[WS] Memory update received for character:', msg.characterId);
+          window.dispatchEvent(new CustomEvent('memory_update', { detail: { characterId: msg.characterId } }));
+        } else if (msg.type === 'city_update') {
+          if (msg.action === 'schedule_generating') {
+            setGeneratingSchedules(prev => ({ ...prev, [msg.charId]: true }));
+          } else if (msg.action === 'schedule_updated') {
+            setGeneratingSchedules(prev => ({ ...prev, [msg.charId]: false }));
+          }
         }
       } catch (e) {
         console.error('WS Parse Error', e);
@@ -217,36 +229,47 @@ function App() {
 
   // Update contact last message preview on new incoming message
   useEffect(() => {
-    if (newIncomingMessage) {
-      // Prevent double-processing the exact same message if React re-renders for other reasons
-      if (processedMessagesRef.current.has(newIncomingMessage.id)) {
-        return;
-      }
-      processedMessagesRef.current.add(newIncomingMessage.id);
+    if (incomingMessageQueue.length > 0) {
+      let playedSound = false;
+      let contactsChanged = false;
 
-      // Play notification sound
-      if (newIncomingMessage.role !== 'user' && newIncomingMessage.character_id !== activeContactRef.current) {
-        try {
-          const audio = new Audio('/pop.wav');
-          audio.play().catch(e => console.error("Audio play blocked:", e));
-        } catch (e) { console.error(e); }
-      }
+      setContacts(prev => {
+        let updatedContacts = [...prev];
 
-      setContacts(prev => prev.map(c => {
-        if (c.id === newIncomingMessage.character_id) {
-          const newUnread = c.id === activeContactRef.current ? 0 : (c.unread || 0) + 1;
-          return {
-            ...c,
-            lastMessage: newIncomingMessage.content,
-            time: new Date(newIncomingMessage.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-            unread: newUnread
-          };
-        }
-        return c;
-      }));
+        incomingMessageQueue.forEach(incomingMsg => {
+          // Prevent double-processing the exact same message
+          if (processedMessagesRef.current.has(incomingMsg.id)) return;
+          processedMessagesRef.current.add(incomingMsg.id);
+          contactsChanged = true;
+
+          // Play notification sound
+          if (!playedSound && incomingMsg.role !== 'user' && incomingMsg.character_id !== activeContactRef.current) {
+            playedSound = true;
+            try {
+              const audio = new Audio('/pop.wav');
+              audio.play().catch(e => console.error("Audio play blocked:", e));
+            } catch (e) { console.error(e); }
+          }
+
+          updatedContacts = updatedContacts.map(c => {
+            if (c.id === incomingMsg.character_id) {
+              const newUnread = c.id === activeContactRef.current ? 0 : (c.unread || 0) + 1;
+              return {
+                ...c,
+                lastMessage: incomingMsg.content,
+                time: new Date(incomingMsg.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+                unread: newUnread
+              };
+            }
+            return c;
+          });
+        });
+
+        return contactsChanged ? updatedContacts : prev;
+      });
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [newIncomingMessage]);
+  }, [incomingMessageQueue]);
 
   // Apply Dynamic Theme & Custom CSS
   useEffect(() => {
@@ -311,7 +334,7 @@ function App() {
       {/* 1. Very Left Sidebar (Navigation) */}
       <nav className="sidebar-nav">
         <div className="my-avatar" onClick={() => setActiveTab('settings')} style={{ cursor: 'pointer' }}>
-          <img src={userProfile?.avatar || "https://api.dicebear.com/7.x/shapes/svg?seed=User"} alt="Me" />
+          <img src={resolveAvatarUrl(userProfile?.avatar, API_URL) || "https://api.dicebear.com/7.x/shapes/svg?seed=User"} alt="Me" />
         </div>
         <div className="nav-icons">
           <button className={`nav-icon ${activeTab === 'chats' ? 'active' : ''}`} onClick={() => setActiveTab('chats')} title={lang === 'en' ? 'Chats — View conversations' : '聊天 — 查看会话列表'}>
@@ -517,12 +540,15 @@ function App() {
                   allContacts={contacts}
                   userAvatar={userProfile?.avatar}
                   apiUrl={API_URL}
-                  newIncomingMessage={newIncomingMessage}
+                  incomingMessageQueue={incomingMessageQueue}
                   engineState={engineState}
                   onToggleMemo={() => setActiveDrawer(activeDrawer === 'memo' ? null : 'memo')}
                   onToggleDiary={() => setActiveDrawer(activeDrawer === 'diary' ? null : 'diary')}
                   onToggleSettings={() => setActiveDrawer(activeDrawer === 'settings' ? null : 'settings')}
                   onBack={() => { setActiveContactId(null); activeContactRef.current = null; }}
+                  onSwitchTab={setActiveTab}
+                  isGeneratingSchedule={generatingSchedules[activeContactId]}
+                  onMessagesChange={setHiddenMessagesCount}
                 />
               </div>
               {activeDrawer === 'memo' && (
@@ -549,6 +575,8 @@ function App() {
                     setActiveContactId(null);
                     fetchContacts(); // Re-pull character data so stats show as reset immediately
                   }}
+                  isGeneratingSchedule={!!generatingSchedules[activeContactId]}
+                  messagesHideStateCount={hiddenMessagesCount}
                 />
               )}
             </div>
@@ -559,10 +587,13 @@ function App() {
                 apiUrl={API_URL}
                 allContacts={contacts}
                 userProfile={userProfile}
-                newGroupMessage={newGroupMessage}
+                incomingGroupMessageQueue={incomingGroupMessageQueue}
                 typingIndicators={groupTyping[activeGroupId] || []}
                 redpacketClaimEvent={redpacketClaimEvent}
                 onBack={() => setActiveGroupId(null)}
+                onGroupUpdated={(updatedGroup) => {
+                  setGroups(prev => prev.map(g => g.id === updatedGroup.id ? updatedGroup : g));
+                }}
               />
             </div>
           ) : (

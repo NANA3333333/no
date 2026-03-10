@@ -15,7 +15,12 @@ function ContactList({ apiUrl, contacts, activeId, onSelect, engineState = {} })
                         onClick={() => onSelect(contact.id)}
                     >
                         <div className="contact-avatar" style={{ position: 'relative' }}>
-                            <img src={resolveAvatarUrl(contact.avatar, apiUrl)} alt={contact.name} style={{ objectFit: 'cover' }} />
+                            <img
+                                src={resolveAvatarUrl(contact.avatar, apiUrl)}
+                                alt={contact.name}
+                                style={{ objectFit: 'cover' }}
+                                onError={(e) => { e.target.onerror = null; e.target.src = 'https://api.dicebear.com/7.x/shapes/svg?seed=' + encodeURIComponent(contact.id || 'User'); }}
+                            />
                             <div className={`autopulse-status-dot ${state?.isThinking ? 'thinking' : 'connected'}`} />
                         </div>
                         <div className="contact-info">

@@ -133,7 +133,7 @@ function TransferCardInteractive({ content, isUser, apiUrl }) {
     );
 }
 
-function MessageBubble({ message, avatar, characterName, apiUrl, onRetry }) {
+function MessageBubble({ message, avatar, characterName, apiUrl, onRetry, contacts }) {
     const isUser = message.role === 'user';
     const content = message.content || '';  // null-safe: old DB records may have null content
     const { lang } = useLanguage();
@@ -175,7 +175,12 @@ function MessageBubble({ message, avatar, characterName, apiUrl, onRetry }) {
         <>
             <div className={`message-wrapper ${isUser ? 'user' : 'character'}`}>
                 <div className="message-avatar">
-                    <img src={resolveAvatarUrl(avatar, apiUrl)} style={{ objectFit: 'cover' }} alt="Avatar" />
+                    <img
+                        src={resolveAvatarUrl(avatar, apiUrl)}
+                        style={{ objectFit: 'cover' }}
+                        alt="Avatar"
+                        onError={(e) => { e.target.onerror = null; e.target.src = 'https://api.dicebear.com/7.x/shapes/svg?seed=' + encodeURIComponent(isUser ? 'User' : (message.character_id || 'User')); }}
+                    />
                 </div>
                 <div className="message-content">
                     {content.startsWith('[TRANSFER]') ? (
@@ -184,12 +189,25 @@ function MessageBubble({ message, avatar, characterName, apiUrl, onRetry }) {
                         (() => {
                             const parts = content.split(':');
                             if (parts.length >= 4) {
+                                const cardId = parts[1];
                                 const cardName = parts[2];
-                                const cardAvatar = parts.slice(3).join(':');
+                                let cardAvatar = parts.slice(3).join(':');
+
+                                // Fetch real-time avatar if available to fix stale URLs in old messages
+                                if (contacts && Array.isArray(contacts)) {
+                                    const match = contacts.find(c => String(c.id) === String(cardId));
+                                    if (match && match.avatar) cardAvatar = match.avatar;
+                                }
+
                                 return (
                                     <div className="message-bubble" style={{ padding: 0, overflow: 'hidden', backgroundColor: '#fff', color: '#333', textAlign: 'left', width: '220px', boxSizing: 'border-box', border: '1px solid #eaeaea' }}>
                                         <div style={{ padding: '12px 15px', display: 'flex', alignItems: 'center', gap: '12px', borderBottom: '1px solid #f0f0f0' }}>
-                                            <img src={resolveAvatarUrl(cardAvatar.replace(']', ''), apiUrl)} alt={cardName} style={{ width: '40px', height: '40px', borderRadius: '50%', objectFit: 'cover' }} />
+                                            <img
+                                                src={resolveAvatarUrl(cardAvatar.replace(']', ''), apiUrl)}
+                                                alt={cardName}
+                                                style={{ width: '40px', height: '40px', borderRadius: '50%', objectFit: 'cover' }}
+                                                onError={(e) => { e.target.onerror = null; e.target.src = 'https://api.dicebear.com/7.x/shapes/svg?seed=' + encodeURIComponent(cardId || 'User'); }}
+                                            />
                                             <div style={{ fontSize: '16px', fontWeight: '400' }}>{cardName}</div>
                                         </div>
                                         <div style={{ padding: '4px 15px 6px', fontSize: '12px', color: '#999' }}>
@@ -212,6 +230,27 @@ function MessageBubble({ message, avatar, characterName, apiUrl, onRetry }) {
                             justifyContent: isUser ? 'flex-end' : 'flex-start'
                         }}>
                             <span>{new Date(message.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>
+                        </div>
+                    )}
+                    {!isUser && message.metadata?.retrievedMemories && message.metadata.retrievedMemories.length > 0 && (
+                        <div style={{
+                            marginTop: '6px',
+                            padding: '6px 10px',
+                            backgroundColor: 'rgba(255, 255, 255, 0.4)',
+                            borderRadius: '8px',
+                            fontSize: '11px',
+                            color: '#888',
+                            borderLeft: '2px solid #ddd',
+                            display: 'flex',
+                            flexDirection: 'column',
+                            gap: '3px'
+                        }}>
+                            <div style={{ fontWeight: '500', display: 'flex', alignItems: 'center', gap: '4px' }}>
+                                <span>🧠</span> {lang === 'en' ? 'Recalled Memory:' : '回忆起：'}
+                            </div>
+                            {message.metadata.retrievedMemories.map((mem, idx) => (
+                                <div key={idx} style={{ lineHeight: '1.3' }}>- {mem.event}</div>
+                            ))}
                         </div>
                     )}
                 </div>

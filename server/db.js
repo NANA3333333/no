@@ -45,7 +45,12 @@ function getUserDb(userId) {
             is_diary_unlocked INTEGER DEFAULT 0,
             hidden_state TEXT DEFAULT '',
             jealousy_level INTEGER DEFAULT 0,
-            jealousy_target TEXT DEFAULT ''
+            jealousy_target TEXT DEFAULT '',
+            stat_int INTEGER DEFAULT 50,
+            stat_sta INTEGER DEFAULT 50,
+            stat_cha INTEGER DEFAULT 50,
+            sweep_limit INTEGER DEFAULT 30,
+            impression_q_limit INTEGER DEFAULT 3
         );
 
         CREATE TABLE IF NOT EXISTS messages (
@@ -56,6 +61,7 @@ function getUserDb(userId) {
             timestamp INTEGER NOT NULL,
             read INTEGER DEFAULT 0,
             hidden INTEGER DEFAULT 0,
+            is_summarized INTEGER DEFAULT 0,
             FOREIGN KEY (character_id) REFERENCES characters(id)
         );
 
@@ -132,6 +138,15 @@ function getUserDb(userId) {
             FOREIGN KEY (char2_id) REFERENCES characters(id) ON DELETE CASCADE
         );
 
+        CREATE TABLE IF NOT EXISTS token_usage (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            character_id TEXT NOT NULL,
+            context_type TEXT NOT NULL,
+            prompt_tokens INTEGER DEFAULT 0,
+            completion_tokens INTEGER DEFAULT 0,
+            timestamp INTEGER NOT NULL
+        );
+
         CREATE TABLE IF NOT EXISTS group_chats (
             id TEXT PRIMARY KEY,
             name TEXT NOT NULL,
@@ -143,6 +158,7 @@ function getUserDb(userId) {
             group_id TEXT NOT NULL,
             member_id TEXT NOT NULL,
             role TEXT DEFAULT 'member',
+            joined_at INTEGER DEFAULT 0,
             PRIMARY KEY (group_id, member_id)
         );
 
@@ -151,7 +167,8 @@ function getUserDb(userId) {
             group_id TEXT NOT NULL,
             sender_id TEXT NOT NULL,
             content TEXT NOT NULL,
-            timestamp INTEGER NOT NULL
+            timestamp INTEGER NOT NULL,
+            is_summarized INTEGER DEFAULT 0
         );
 
         CREATE TABLE IF NOT EXISTS char_relationships (
@@ -161,6 +178,15 @@ function getUserDb(userId) {
             impression TEXT DEFAULT '',
             source TEXT DEFAULT 'recommend',
             PRIMARY KEY (source_id, target_id, source)
+        );
+
+        CREATE TABLE IF NOT EXISTS char_impression_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            source_id TEXT NOT NULL,
+            target_id TEXT NOT NULL,
+            impression TEXT NOT NULL,
+            trigger_event TEXT NOT NULL,
+            timestamp INTEGER NOT NULL
         );
 
         CREATE TABLE IF NOT EXISTS group_red_packets (
@@ -214,6 +240,11 @@ function getUserDb(userId) {
             // Ignore error if column already exists
         }
 
+        // Add joined_at for group_members (Migration)
+        try {
+            db.prepare('ALTER TABLE group_members ADD COLUMN joined_at INTEGER DEFAULT 0').run();
+        } catch (e) { }
+
         // Add banner for existing DBs
         try {
             db.prepare('ALTER TABLE user_profile ADD COLUMN banner TEXT').run();
@@ -228,6 +259,18 @@ function getUserDb(userId) {
         // Add max_tokens for existing DBs
         try {
             db.prepare('ALTER TABLE characters ADD COLUMN max_tokens INTEGER DEFAULT 800').run();
+        } catch (e) {
+        }
+
+        // Add is_blocked for older DBs
+        try {
+            db.prepare('ALTER TABLE characters ADD COLUMN is_blocked INTEGER DEFAULT 0').run();
+        } catch (e) {
+        }
+
+        // Add impression_q_limit for existing DBs
+        try {
+            db.prepare('ALTER TABLE characters ADD COLUMN impression_q_limit INTEGER DEFAULT 3').run();
         } catch (e) {
         }
 
@@ -246,6 +289,12 @@ function getUserDb(userId) {
         } catch (e) {
         }
 
+        // Add sweep_limit to characters
+        try {
+            db.prepare('ALTER TABLE characters ADD COLUMN sweep_limit INTEGER DEFAULT 30').run();
+        } catch (e) {
+        }
+
         // Add diary_password to characters (password-lock mechanic)
         try {
             db.prepare('ALTER TABLE characters ADD COLUMN diary_password TEXT').run();
@@ -258,9 +307,42 @@ function getUserDb(userId) {
         } catch (e) {
         }
 
+        // --- Data Migration: Backfill char_impression_history ---
+        try {
+            const historyCount = db.prepare('SELECT COUNT(*) as c FROM char_impression_history').get().c;
+            if (historyCount === 0) {
+                // If history is completely empty, backfill it from existing impressions
+                const existingRels = db.prepare('SELECT * FROM char_relationships WHERE impression IS NOT NULL AND impression != \'\'').all();
+                if (existingRels.length > 0) {
+                    const insertStmt = db.prepare('INSERT INTO char_impression_history (source_id, target_id, impression, trigger_event, timestamp) VALUES (?, ?, ?, ?, ?)');
+                    db.transaction(() => {
+                        for (const r of existingRels) {
+                            insertStmt.run(r.source_id, r.target_id, r.impression, `Migration: ${r.source}`, Date.now());
+                        }
+                    })();
+                    console.log(`[DB Migration] Backfilled ${existingRels.length} impression histories for user ${userId}.`);
+                }
+            }
+        } catch (e) {
+            console.error('[DB Migration] Failed to backfill impression history:', e.message);
+        }
+
         // Add hidden column to messages (context hide mechanic)
         try {
             db.prepare('ALTER TABLE messages ADD COLUMN hidden INTEGER DEFAULT 0').run();
+        } catch (e) {
+        }
+
+        // Add metadata column to messages (memory visualization)
+        try {
+            db.prepare('ALTER TABLE messages ADD COLUMN metadata TEXT DEFAULT NULL').run();
+        } catch (e) {
+        }
+
+        // Add is_summarized for overflow memory feature
+        try {
+            db.prepare('ALTER TABLE messages ADD COLUMN is_summarized INTEGER DEFAULT 0').run();
+            db.prepare('ALTER TABLE group_messages ADD COLUMN is_summarized INTEGER DEFAULT 0').run();
         } catch (e) {
         }
 
@@ -308,6 +390,11 @@ function getUserDb(userId) {
         // Add hidden column to group_messages (context hide mechanic)
         try {
             db.prepare('ALTER TABLE group_messages ADD COLUMN hidden INTEGER DEFAULT 0').run();
+        } catch (e) { }
+
+        // Add metadata column to group_messages (memory visualization)
+        try {
+            db.prepare('ALTER TABLE group_messages ADD COLUMN metadata TEXT DEFAULT NULL').run();
         } catch (e) { }
 
         // Add group_msg_limit to user_profile for controlling group context injection
@@ -361,6 +448,17 @@ function getUserDb(userId) {
         try { db.prepare('ALTER TABLE characters ADD COLUMN jealousy_level INTEGER DEFAULT 0').run(); } catch (e) { }
         try { db.prepare("ALTER TABLE characters ADD COLUMN jealousy_target TEXT DEFAULT ''").run(); } catch (e) { }
 
+        // City DLC: per-character toggle for city event notifications to private chat
+        try { db.prepare('ALTER TABLE characters ADD COLUMN sys_city_notify INTEGER DEFAULT 0').run(); } catch (e) { }
+        // City DLC: schedule & activity frequency
+        try { db.prepare('ALTER TABLE characters ADD COLUMN is_scheduled INTEGER DEFAULT 1').run(); } catch (e) { }
+        try { db.prepare('ALTER TABLE characters ADD COLUMN city_action_frequency INTEGER DEFAULT 1').run(); } catch (e) { }
+
+        // Character Base Stats
+        try { db.prepare('ALTER TABLE characters ADD COLUMN stat_int INTEGER DEFAULT 50').run(); } catch (e) { }
+        try { db.prepare('ALTER TABLE characters ADD COLUMN stat_sta INTEGER DEFAULT 50').run(); } catch (e) { }
+        try { db.prepare('ALTER TABLE characters ADD COLUMN stat_cha INTEGER DEFAULT 50').run(); } catch (e) { }
+
         console.log('[DB] Database initialized successfully.');
     }
 
@@ -380,7 +478,11 @@ function getUserDb(userId) {
         'memory_model_name', 'interval_min', 'interval_max', 'affinity', 'initial_affinity',
         'status', 'pressure_level', 'last_user_msg_time', 'is_blocked', 'system_prompt', 'max_tokens',
         'sys_proactive', 'sys_timer', 'sys_pressure', 'sys_jealousy', 'is_diary_unlocked', 'diary_password', 'wallet', 'emoji', 'last_moment_at',
-        'jealousy_level', 'jealousy_target'
+        'jealousy_level', 'jealousy_target',
+        'stat_int', 'stat_sta', 'stat_cha', 'sweep_limit',
+        // City DLC fields
+        'calories', 'city_status', 'location', 'education', 'sys_survival', 'sys_city_notify',
+        'impression_q_limit', 'is_scheduled', 'city_action_frequency'
     ];
 
     // Generates a memorable random diary password (4-digit number)
@@ -477,6 +579,11 @@ function getUserDb(userId) {
             .all(characterId);
     }
 
+    function getVisibleMessagesSince(characterId, sinceTimestamp = 0) {
+        return db.prepare('SELECT * FROM messages WHERE character_id = ? AND hidden = 0 AND timestamp >= ? ORDER BY timestamp ASC')
+            .all(characterId, sinceTimestamp);
+    }
+
     // Hide a range of messages by index (0-based from oldest)
     function hideMessagesByRange(characterId, startIdx, endIdx) {
         const allMsgs = db.prepare('SELECT id FROM messages WHERE character_id = ? ORDER BY timestamp ASC').all(characterId);
@@ -487,16 +594,52 @@ function getUserDb(userId) {
         return info.changes;
     }
 
+    // Hide an array of exact message IDs
+    function hideMessagesByIds(characterId, messageIds) {
+        if (!messageIds || messageIds.length === 0) return 0;
+        const placeholders = messageIds.map(() => '?').join(', ');
+        // Security check: ONLY hide messages belonging to this characterId
+        const info = db.prepare(`UPDATE messages SET hidden = 1 WHERE character_id = ? AND id IN (${placeholders})`).run(characterId, ...messageIds);
+        return info.changes;
+    }
+
     // Unhide all messages for a character
     function unhideMessages(characterId) {
         const info = db.prepare('UPDATE messages SET hidden = 0 WHERE character_id = ?').run(characterId);
         return info.changes;
     }
 
-    function addMessage(characterId, role, content) {
+    // Overflow memory summarization support
+    function getUnsummarizedMessages(characterId, olderThanTimestamp, limit = 50) {
+        return db.prepare('SELECT * FROM messages WHERE character_id = ? AND hidden = 0 AND is_summarized = 0 AND timestamp < ? ORDER BY timestamp ASC LIMIT ?')
+            .all(characterId, olderThanTimestamp, limit);
+    }
+
+    function countUnsummarizedMessages(characterId, olderThanTimestamp) {
+        const row = db.prepare('SELECT COUNT(*) as count FROM messages WHERE character_id = ? AND hidden = 0 AND is_summarized = 0 AND timestamp < ?')
+            .get(characterId, olderThanTimestamp);
+        return row ? row.count : 0;
+    }
+
+    function markMessagesSummarized(messageIds) {
+        if (!messageIds || messageIds.length === 0) return 0;
+        const placeholders = messageIds.map(() => '?').join(', ');
+        const info = db.prepare(`UPDATE messages SET is_summarized = 1 WHERE id IN (${placeholders})`).run(...messageIds);
+        return info.changes;
+    }
+
+    function addMessage(characterId, role, content, metadata = null) {
         const ts = Date.now();
-        const info = db.prepare('INSERT INTO messages (character_id, role, content, timestamp) VALUES (?, ?, ?, ?)')
-            .run(characterId, role, content, ts);
+        const metadataStr = metadata ? JSON.stringify(metadata) : null;
+        let info;
+        try {
+            info = db.prepare('INSERT INTO messages (character_id, role, content, timestamp, metadata) VALUES (?, ?, ?, ?, ?)')
+                .run(characterId, role, content, ts, metadataStr);
+        } catch (e) {
+            // Fallback for old databases without metadata column
+            info = db.prepare('INSERT INTO messages (character_id, role, content, timestamp) VALUES (?, ?, ?, ?)')
+                .run(characterId, role, content, ts);
+        }
         return { id: info.lastInsertRowid, timestamp: ts };
     }
 
@@ -587,6 +730,15 @@ function getUserDb(userId) {
         return db.prepare('SELECT * FROM moments ORDER BY timestamp DESC LIMIT 100').all();
     }
 
+    function getMomentsSince(characterId, sinceTimestamp = 0) {
+        const friends = getFriends(characterId) || [];
+        const friendIds = friends.map(f => f.id);
+        const authors = [characterId, 'user', ...friendIds];
+        const placeholders = authors.map(() => '?').join(',');
+        return db.prepare(`SELECT * FROM moments WHERE character_id IN (${placeholders}) AND timestamp >= ? ORDER BY timestamp ASC`)
+            .all(...authors, sinceTimestamp);
+    }
+
     function getCharacterMoments(characterId) {
         return db.prepare('SELECT * FROM moments WHERE character_id = ? ORDER BY timestamp DESC').all(characterId);
     }
@@ -615,6 +767,10 @@ function getUserDb(userId) {
         VALUES (?, ?, ?, ?)
     `).run(characterId, content, emotion, Date.now());
         return info.lastInsertRowid;
+    }
+
+    function deleteDiary(diaryId) {
+        db.prepare('DELETE FROM diaries WHERE id = ?').run(diaryId);
     }
 
     function unlockDiaries(characterId) {
@@ -767,7 +923,7 @@ function getUserDb(userId) {
     }
 
     function updateUserProfile(data) {
-        const allowedFields = ['name', 'avatar', 'banner', 'bio', 'theme', 'custom_css', 'theme_config', 'group_msg_limit', 'group_skip_rate', 'group_proactive_enabled', 'group_interval_min', 'group_interval_max', 'jealousy_chance', 'wallet', 'private_msg_limit_for_group'];
+        const allowedFields = ['name', 'avatar', 'banner', 'bio', 'theme', 'custom_css', 'theme_config', 'group_msg_limit', 'group_skip_rate', 'group_proactive_enabled', 'group_interval_min', 'group_interval_max', 'jealousy_chance', 'wallet', 'private_msg_limit_for_group', 'moments_token_limit'];
         const fields = Object.keys(data).filter(k => allowedFields.includes(k));
         if (fields.length === 0) return;
         const setClause = fields.map(f => `${f} = ?`).join(', ');
@@ -843,14 +999,14 @@ function getUserDb(userId) {
         const groups = db.prepare('SELECT * FROM group_chats ORDER BY created_at DESC').all();
         return groups.map(g => ({
             ...g,
-            members: db.prepare('SELECT member_id, role FROM group_members WHERE group_id = ?').all(g.id)
+            members: db.prepare('SELECT member_id, role, joined_at FROM group_members WHERE group_id = ?').all(g.id)
         }));
     }
 
     function getGroup(id) {
         const group = db.prepare('SELECT * FROM group_chats WHERE id = ?').get(id);
         if (!group) return null;
-        group.members = db.prepare('SELECT member_id, role FROM group_members WHERE group_id = ?').all(id);
+        group.members = db.prepare('SELECT member_id, role, joined_at FROM group_members WHERE group_id = ?').all(id);
         return group;
     }
 
@@ -866,13 +1022,38 @@ function getUserDb(userId) {
         return db.prepare('SELECT * FROM group_messages WHERE group_id = ? ORDER BY timestamp DESC LIMIT ?').all(groupId, limit).reverse();
     }
 
-    function getVisibleGroupMessages(groupId, limit = 50) {
-        return db.prepare('SELECT * FROM group_messages WHERE group_id = ? AND hidden = 0 ORDER BY timestamp DESC LIMIT ?').all(groupId, limit).reverse();
+    function getVisibleGroupMessages(groupId, limit = 50, sinceTimestamp = 0) {
+        return db.prepare('SELECT * FROM group_messages WHERE group_id = ? AND hidden = 0 AND timestamp >= ? ORDER BY timestamp DESC LIMIT ?').all(groupId, sinceTimestamp, limit).reverse();
     }
 
-    function addGroupMessage(groupId, senderId, content, senderName = null, senderAvatar = null) {
-        const info = db.prepare('INSERT INTO group_messages (group_id, sender_id, content, timestamp, sender_name, sender_avatar) VALUES (?, ?, ?, ?, ?, ?)')
-            .run(groupId, senderId, content, Date.now(), senderName, senderAvatar);
+    function getUnsummarizedGroupMessages(groupId, olderThanTimestamp, limit = 50) {
+        return db.prepare('SELECT * FROM group_messages WHERE group_id = ? AND hidden = 0 AND is_summarized = 0 AND timestamp < ? ORDER BY timestamp ASC LIMIT ?')
+            .all(groupId, olderThanTimestamp, limit);
+    }
+
+    function countUnsummarizedGroupMessages(groupId, olderThanTimestamp) {
+        const row = db.prepare('SELECT COUNT(*) as count FROM group_messages WHERE group_id = ? AND hidden = 0 AND is_summarized = 0 AND timestamp < ?')
+            .get(groupId, olderThanTimestamp);
+        return row ? row.count : 0;
+    }
+
+    function markGroupMessagesSummarized(messageIds) {
+        if (!messageIds || messageIds.length === 0) return 0;
+        const placeholders = messageIds.map(() => '?').join(', ');
+        const info = db.prepare(`UPDATE group_messages SET is_summarized = 1 WHERE id IN (${placeholders})`).run(...messageIds);
+        return info.changes;
+    }
+
+    function addGroupMessage(groupId, senderId, content, senderName = null, senderAvatar = null, metadata = null) {
+        const metadataStr = metadata ? JSON.stringify(metadata) : null;
+        let info;
+        try {
+            info = db.prepare('INSERT INTO group_messages (group_id, sender_id, content, timestamp, sender_name, sender_avatar, metadata) VALUES (?, ?, ?, ?, ?, ?, ?)')
+                .run(groupId, senderId, content, Date.now(), senderName, senderAvatar, metadataStr);
+        } catch (e) {
+            info = db.prepare('INSERT INTO group_messages (group_id, sender_id, content, timestamp, sender_name, sender_avatar) VALUES (?, ?, ?, ?, ?, ?)')
+                .run(groupId, senderId, content, Date.now(), senderName, senderAvatar);
+        }
         return info.lastInsertRowid;
     }
 
@@ -890,7 +1071,7 @@ function getUserDb(userId) {
     }
 
     function addGroupMember(groupId, memberId, role = 'member') {
-        db.prepare('INSERT OR IGNORE INTO group_members (group_id, member_id, role) VALUES (?, ?, ?)').run(groupId, memberId, role);
+        db.prepare('INSERT OR IGNORE INTO group_members (group_id, member_id, role, joined_at) VALUES (?, ?, ?, ?)').run(groupId, memberId, role, Date.now());
     }
 
     function removeGroupMember(groupId, memberId) {
@@ -903,6 +1084,14 @@ function getUserDb(userId) {
         if (toHide.length === 0) return 0;
         const placeholders = toHide.map(() => '?').join(', ');
         const info = db.prepare(`UPDATE group_messages SET hidden = 1 WHERE id IN (${placeholders})`).run(...toHide);
+        return info.changes;
+    }
+
+    // Hide an array of exact group message IDs
+    function hideGroupMessagesByIds(groupId, messageIds) {
+        if (!messageIds || messageIds.length === 0) return 0;
+        const placeholders = messageIds.map(() => '?').join(', ');
+        const info = db.prepare(`UPDATE group_messages SET hidden = 1 WHERE group_id = ? AND id IN (${placeholders})`).run(groupId, ...messageIds);
         return info.changes;
     }
 
@@ -935,22 +1124,39 @@ function getUserDb(userId) {
     // ─── Character Relationships (Inter-char Social System) ────────────────
 
     function initCharRelationship(sourceId, targetId, affinity, impression, source = 'recommend') {
+        const safeImpression = impression || '';
+        // Check existing record to avoid duplicate history entries
+        const existing = db.prepare('SELECT affinity, impression FROM char_relationships WHERE source_id = ? AND target_id = ? AND source = ?')
+            .get(sourceId, targetId, source);
+
         db.prepare(`INSERT OR REPLACE INTO char_relationships (source_id, target_id, affinity, impression, source) VALUES (?, ?, ?, ?, ?)`)
-            .run(sourceId, targetId, affinity, impression || '', source);
+            .run(sourceId, targetId, affinity, safeImpression, source);
+
+        // Only add history if: impression changed AND (affinity changed by ≥5 OR it's a brand new relationship)
+        const impressionChanged = !existing || existing.impression !== safeImpression;
+        const affinityDelta = existing ? Math.abs(affinity - existing.affinity) : 999;
+        if (safeImpression.trim() !== '' && impressionChanged && (!existing || affinityDelta >= 5)) {
+            addCharImpressionHistory(sourceId, targetId, safeImpression, `Formed: ${source}`);
+        }
     }
 
     function getCharRelationship(sourceId, targetId) {
         // Returns all relationship records between source→target (may have multiple sources)
         const rows = db.prepare('SELECT * FROM char_relationships WHERE source_id = ? AND target_id = ?').all(sourceId, targetId);
         if (rows.length === 0) return null;
-        // Merge: total affinity = recommend base + sum of group deltas; impression from recommend takes priority
+        // Merge: total affinity = recommend base + sum of group deltas
         const recommend = rows.find(r => r.source === 'recommend');
         const groupRows = rows.filter(r => r.source !== 'recommend');
         const totalAffinity = (recommend?.affinity || 50) + groupRows.reduce((sum, r) => sum + (r.affinity - 50), 0);
+
+        // Fetch the most recent impression from history
+        const history = getCharImpressionHistory(sourceId, targetId, 1);
+        const latestImpression = history.length > 0 ? history[0].impression : (recommend?.impression || groupRows[0]?.impression || '');
+
         return {
             sourceId, targetId,
             affinity: Math.max(0, Math.min(100, totalAffinity)),
-            impression: recommend?.impression || groupRows[0]?.impression || '',
+            impression: latestImpression,
             isAcquainted: !!recommend,
             sources: rows
         };
@@ -968,7 +1174,16 @@ function getUserDb(userId) {
             const fields = [];
             const values = [];
             if (data.affinity !== undefined) { fields.push('affinity = ?'); values.push(data.affinity); }
-            if (data.impression !== undefined) { fields.push('impression = ?'); values.push(data.impression); }
+            if (data.impression !== undefined) {
+                fields.push('impression = ?');
+                values.push(data.impression);
+
+                // Only log history if impression text actually changed AND affinity shifted by ≥5
+                const affinityDelta = data.affinity !== undefined ? Math.abs(data.affinity - existing.affinity) : 0;
+                if (data.impression !== existing.impression && String(data.impression).trim() !== '' && affinityDelta >= 5) {
+                    addCharImpressionHistory(sourceId, targetId, data.impression, `Updated: ${source}`);
+                }
+            }
             if (fields.length > 0) {
                 values.push(sourceId, targetId, source);
                 db.prepare(`UPDATE char_relationships SET ${fields.join(', ')} WHERE source_id = ? AND target_id = ? AND source = ?`).run(...values);
@@ -977,6 +1192,16 @@ function getUserDb(userId) {
             // Auto-create if doesn't exist
             initCharRelationship(sourceId, targetId, data.affinity || 50, data.impression || '', source);
         }
+    }
+
+    function addCharImpressionHistory(sourceId, targetId, impression, triggerEvent) {
+        db.prepare('INSERT INTO char_impression_history (source_id, target_id, impression, trigger_event, timestamp) VALUES (?, ?, ?, ?, ?)')
+            .run(sourceId, targetId, impression, triggerEvent, Date.now());
+    }
+
+    function getCharImpressionHistory(sourceId, targetId, limit = 50) {
+        return db.prepare('SELECT * FROM char_impression_history WHERE source_id = ? AND target_id = ? ORDER BY timestamp DESC LIMIT ?')
+            .all(sourceId, targetId, limit);
     }
 
     function deleteGroupRelationships(groupId) {
@@ -1197,9 +1422,20 @@ function getUserDb(userId) {
         return db.prepare(sql).run(...params);
     }
 
+    // --- Token Tracking ---
+    function addTokenUsage(characterId, contextType, promptTokens, completionTokens) {
+        try {
+            const stmt = db.prepare('INSERT INTO token_usage (character_id, context_type, prompt_tokens, completion_tokens, timestamp) VALUES (?, ?, ?, ?, ?)');
+            stmt.run(characterId, contextType, promptTokens, completionTokens, Date.now());
+        } catch (e) {
+            console.error('[DB] Error logging token usage:', e.message);
+        }
+    }
+
     const dbInstance = {
 
         rawRun,
+        addTokenUsage,
         initDb,
         getCharacters,
         getCharacter,
@@ -1210,7 +1446,12 @@ function getUserDb(userId) {
         getMessages,
         getMessagesBefore,
         getVisibleMessages,
+        getVisibleMessagesSince,
+        getUnsummarizedMessages,
+        countUnsummarizedMessages,
+        markMessagesSummarized,
         hideMessagesByRange,
+        hideMessagesByIds,
         unhideMessages,
         addMessage,
         deleteMessage,
@@ -1227,6 +1468,7 @@ function getUserDb(userId) {
         updateMemory,
         deleteMemory,
         getMoments,
+        getMomentsSince,
         getCharacterMoments,
         addMoment,
         deleteMoment,
@@ -1236,6 +1478,7 @@ function getUserDb(userId) {
         getComments,
         getDiaries,
         addDiary,
+        deleteDiary,
         unlockDiaries,
         setDiaryPassword,
         verifyAndUnlockDiary,
@@ -1259,12 +1502,18 @@ function getUserDb(userId) {
         addGroupMember,
         removeGroupMember,
         getVisibleGroupMessages,
+        getUnsummarizedGroupMessages,
+        countUnsummarizedGroupMessages,
+        markGroupMessagesSummarized,
         hideGroupMessagesByRange,
+        hideGroupMessagesByIds,
         unhideGroupMessages,
         initCharRelationship,
         getCharRelationship,
         getCharRelationships,
         updateCharRelationship,
+        addCharImpressionHistory,
+        getCharImpressionHistory,
         deleteGroupRelationships,
         isCharAcquainted,
         // Private Transfer
@@ -1280,6 +1529,7 @@ function getUserDb(userId) {
         getUnclaimedRedPacketsForGroup,
         getWallet,
         getMomentsContextForChar,
+        getRawDb: () => db,
         close: () => db.close(),
         getDbPath: () => dbPath,
         checkpoint: () => {

@@ -1,20 +1,161 @@
 import React, { useState, useEffect } from 'react';
 import { X, Trash2, Settings, RefreshCw } from 'lucide-react';
 import { useLanguage } from '../LanguageContext';
+import { resolveAvatarUrl } from '../utils/avatar';
 
-function ChatSettingsDrawer({ contact, apiUrl, onClose, onClearHistory }) {
+function ChatSettingsDrawer({ contact, apiUrl, onClose, onClearHistory, isGeneratingSchedule, messagesHideStateCount }) {
     const { t, lang } = useLanguage();
     const [relationships, setRelationships] = useState([]);
     const [regenLoading, setRegenLoading] = useState(null);
     const [regenError, setRegenError] = useState(null);
+    const [sweepLimit, setSweepLimit] = useState(contact?.sweep_limit ?? 30);
+    const [isSavingSweep, setIsSavingSweep] = useState(false);
+
+    // Impression Context (Q limit)
+    const [impressionQLimit, setImpressionQLimit] = useState(contact?.impression_q_limit ?? 3);
+    const [isSavingQLimit, setIsSavingQLimit] = useState(false);
+    const [expandedHistory, setExpandedHistory] = useState({}); // tracking expanded history per target
+    const [impressionHistories, setImpressionHistories] = useState({}); // map of targetId -> history array
+    const [contextStats, setContextStats] = useState(null);
+
+    // Schedule System
+    const [isScheduled, setIsScheduled] = useState(contact?.is_scheduled !== 0);
+    const [todaySchedule, setTodaySchedule] = useState([]);
+    const [isSavingSchedule, setIsSavingSchedule] = useState(false);
+    const [isRetryingSchedule, setIsRetryingSchedule] = useState(false);
+
+    // City Action Frequency (R actions per hour)
+    const [cityActionFreq, setCityActionFreq] = useState(contact?.city_action_frequency ?? 1);
+    const [isSavingFreq, setIsSavingFreq] = useState(false);
 
     useEffect(() => {
         if (!contact) return;
+        setSweepLimit(contact.sweep_limit ?? 30);
+        setImpressionQLimit(contact.impression_q_limit ?? 3);
+        setIsScheduled(contact.is_scheduled !== 0);
+        setCityActionFreq(contact.city_action_frequency ?? 1);
+
         fetch(`${apiUrl}/characters/${contact.id}/relationships`)
             .then(r => r.json())
             .then(data => setRelationships(Array.isArray(data) ? data : []))
             .catch(() => { });
-    }, [contact, apiUrl]);
+
+        fetch(`${apiUrl}/city/schedules/${contact.id}`)
+            .then(r => r.json())
+            .then(data => { if (data.success) setTodaySchedule(data.schedule || []); })
+            .catch(() => { });
+    }, [contact?.id, apiUrl]);
+
+    // Refetch context stats on mount, when hide count changes, and poll every 15s
+    useEffect(() => {
+        if (!contact) return;
+        const fetchStats = () => {
+            fetch(`${apiUrl}/characters/${contact.id}/context-stats`)
+                .then(r => r.json())
+                .then(data => { if (data.success) setContextStats(data.stats); })
+                .catch(() => { });
+        };
+        fetchStats();
+        const interval = setInterval(fetchStats, 15000);
+        return () => clearInterval(interval);
+    }, [contact?.id, apiUrl, messagesHideStateCount]);
+
+    // Refetch schedule when isGeneratingSchedule goes from true -> false
+    useEffect(() => {
+        if (!contact) return;
+        if (!isGeneratingSchedule) {
+            fetch(`${apiUrl}/city/schedules/${contact.id}`)
+                .then(r => r.json())
+                .then(data => { if (data.success) setTodaySchedule(data.schedule || []); })
+                .catch(() => { });
+        }
+    }, [isGeneratingSchedule, contact, apiUrl]);
+
+    // Handle sweep limit slider changes
+    const handleSweepLimitSave = async () => {
+        setIsSavingSweep(true);
+        try {
+            await fetch(`${apiUrl}/characters/${contact.id}`, {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ sweep_limit: sweepLimit })
+            });
+            const r = await fetch(`${apiUrl}/characters/${contact.id}/context-stats`);
+            const data = await r.json();
+            if (data.success) setContextStats(data.stats);
+        } catch (err) {
+            console.error('Failed to update sweep limit', err);
+        }
+        setIsSavingSweep(false);
+    };
+
+    const handleQLimitSave = async () => {
+        setIsSavingQLimit(true);
+        try {
+            await fetch(`${apiUrl}/characters/${contact.id}`, {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ impression_q_limit: impressionQLimit })
+            });
+            const r = await fetch(`${apiUrl}/characters/${contact.id}/context-stats`);
+            const data = await r.json();
+            if (data.success) setContextStats(data.stats);
+        } catch (err) {
+            console.error('Failed to update impression q limit', err);
+        }
+        setIsSavingQLimit(false);
+    };
+
+    const toggleHistory = async (targetId) => {
+        if (expandedHistory[targetId]) {
+            setExpandedHistory(prev => ({ ...prev, [targetId]: false }));
+            return;
+        }
+        setExpandedHistory(prev => ({ ...prev, [targetId]: true }));
+        if (!impressionHistories[targetId]) {
+            try {
+                const r = await fetch(`${apiUrl}/characters/${contact.id}/impressions/${targetId}?limit=10`);
+                const data = await r.json();
+                setImpressionHistories(prev => ({ ...prev, [targetId]: Array.isArray(data) ? data : [] }));
+            } catch (e) {
+                console.error(e);
+            }
+        }
+    };
+
+    const handleToggleSchedule = async () => {
+        const newVal = !isScheduled;
+        setIsScheduled(newVal);
+        setIsSavingSchedule(true);
+        try {
+            await fetch(`${apiUrl}/characters/${contact.id}`, {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ is_scheduled: newVal ? 1 : 0 })
+            });
+            // Sync back to the contact reference so reopening the drawer shows the saved value
+            if (contact) contact.is_scheduled = newVal ? 1 : 0;
+        } catch (err) {
+            console.error('Failed to update schedule config', err);
+        }
+        setIsSavingSchedule(false);
+    };
+
+    const handleFreqSave = async () => {
+        setIsSavingFreq(true);
+        try {
+            await fetch(`${apiUrl}/characters/${contact.id}`, {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ city_action_frequency: cityActionFreq })
+            });
+            // Sync back to the contact reference so reopening the drawer shows the saved value
+            if (contact) contact.city_action_frequency = cityActionFreq;
+        } catch (err) {
+            console.error('Failed to update city action frequency', err);
+        }
+        setIsSavingFreq(false);
+    };
 
     const handleRegenerate = async (targetId) => {
         setRegenLoading(targetId);
@@ -38,6 +179,28 @@ function ChatSettingsDrawer({ contact, apiUrl, onClose, onClearHistory }) {
             setRegenError(e.message || (lang === 'en' ? 'Network error' : '网络错误'));
         }
         setRegenLoading(null);
+    };
+
+    const forceGenerateSchedule = async () => {
+        if (!contact?.id) return;
+        setIsRetryingSchedule(true);
+        try {
+            const res = await fetch(`${apiUrl}/city/schedules/${contact.id}/generate`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' }
+            });
+            const data = await res.json();
+            if (data.success) {
+                setTodaySchedule(data.schedule || []);
+            } else {
+                alert('生成失败: ' + (data.error || '未知错误'));
+            }
+        } catch (err) {
+            console.error('Failed to force generate schedule', err);
+            alert('网络请求失败');
+        } finally {
+            setIsRetryingSchedule(false);
+        }
     };
 
     if (!contact) return null;
@@ -70,7 +233,7 @@ function ChatSettingsDrawer({ contact, apiUrl, onClose, onClearHistory }) {
             <div className="memory-content" style={{ padding: '0' }}>
                 {/* Contact Banner */}
                 <div style={{ backgroundColor: '#fff', padding: '20px', display: 'flex', flexDirection: 'column', alignItems: 'center', borderBottom: '1px solid #eee' }}>
-                    <img src={contact.avatar} alt={contact.name} style={{ width: '60px', height: '60px', borderRadius: '50%', marginBottom: '10px' }} />
+                    <img src={resolveAvatarUrl(contact.avatar, apiUrl) || 'https://api.dicebear.com/7.x/shapes/svg?seed=' + contact.id} alt={contact.name} style={{ width: '60px', height: '60px', borderRadius: '50%', marginBottom: '10px', objectFit: 'cover' }} />
                     <div style={{ fontSize: '18px', fontWeight: '500' }}>{contact.name}</div>
                     <div style={{ fontSize: '13px', color: '#999', marginTop: '5px', textAlign: 'center', padding: '0 10px' }}>
                         {contact.persona ? contact.persona.substring(0, 50) + '...' : (lang === 'en' ? 'No persona set.' : '未设置 Persona。')}
@@ -106,7 +269,285 @@ function ChatSettingsDrawer({ contact, apiUrl, onClose, onClearHistory }) {
                             {contact.is_blocked ? (lang === 'en' ? 'Blocked You' : '已拉黑') : (lang === 'en' ? 'Active' : '正常')}
                         </span>
                     </div>
+
+                    {/* Base Stats */}
+                    <div style={{ display: 'flex', gap: '8px', marginTop: '14px', paddingTop: '12px', borderTop: '1px dashed #eee' }}>
+                        <div style={{ flex: 1, textAlign: 'center', padding: '8px 4px', borderRadius: '8px', background: '#e3f2fd' }}>
+                            <div style={{ fontSize: '18px', fontWeight: '700', color: '#1565c0' }}>{contact.stat_int ?? 50}</div>
+                            <div style={{ fontSize: '10px', color: '#1976d2', marginTop: '2px' }}>🧠 {lang === 'en' ? 'INT' : '智力'}</div>
+                        </div>
+                        <div style={{ flex: 1, textAlign: 'center', padding: '8px 4px', borderRadius: '8px', background: '#e8f5e9' }}>
+                            <div style={{ fontSize: '18px', fontWeight: '700', color: '#2e7d32' }}>{contact.stat_sta ?? 50}</div>
+                            <div style={{ fontSize: '10px', color: '#388e3c', marginTop: '2px' }}>💪 {lang === 'en' ? 'STA' : '体力'}</div>
+                        </div>
+                        <div style={{ flex: 1, textAlign: 'center', padding: '8px 4px', borderRadius: '8px', background: '#fce4ec' }}>
+                            <div style={{ fontSize: '18px', fontWeight: '700', color: '#c62828' }}>{contact.stat_cha ?? 50}</div>
+                            <div style={{ fontSize: '10px', color: '#d32f2f', marginTop: '2px' }}>✨ {lang === 'en' ? 'CHA' : '魅力'}</div>
+                        </div>
+                    </div>
                 </div>
+
+                {/* Memory Sweep Config (W Slider) */}
+                <div style={{ marginTop: '10px', backgroundColor: '#fff', padding: '15px', borderTop: '1px solid #eee', borderBottom: '1px solid #eee' }}>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '8px' }}>
+                        <div style={{ fontSize: '12px', color: '#999', textTransform: 'uppercase', letterSpacing: '0.5px' }}>
+                            {lang === 'en' ? 'Long-Term Memory Sweep (W)' : '长时记忆消化量 (W参数)'}
+                        </div>
+                        {isSavingSweep && <span style={{ fontSize: '11px', color: '#aaa' }}>{lang === 'en' ? 'Saving...' : '保存中...'}</span>}
+                    </div>
+                    <div style={{ fontSize: '13px', color: '#666', marginBottom: '12px', lineHeight: '1.4' }}>
+                        {lang === 'en'
+                            ? 'The AI automatically forms long-term memories once this many old messages accumulate. Higher values = richer memory but more token cost.'
+                            : '控制系统每次提取长时记忆的积攒阈值。一旦未消化对话达到此数量，后台会立即将其打包成核心记忆。值越大长时记忆越丰富连贯，但提取开销也越大。'}
+                    </div>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '15px' }}>
+                        <input
+                            type="range"
+                            min="10"
+                            max="100"
+                            step="10"
+                            value={sweepLimit}
+                            onChange={(e) => setSweepLimit(parseInt(e.target.value, 10))}
+                            onMouseUp={handleSweepLimitSave}
+                            onTouchEnd={handleSweepLimitSave}
+                            style={{ flex: 1, accentColor: 'var(--accent-color)' }}
+                        />
+                        <div style={{ width: '40px', textAlign: 'right', fontWeight: 'bold', color: 'var(--accent-color)', fontSize: '14px' }}>
+                            {sweepLimit}
+                        </div>
+                    </div>
+                </div>
+
+                {/* Impression Context Config (Q Slider) */}
+                <div style={{ marginTop: '10px', backgroundColor: '#fff', padding: '15px', borderTop: '1px solid #eee', borderBottom: '1px solid #eee' }}>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '8px' }}>
+                        <div style={{ fontSize: '12px', color: '#999', textTransform: 'uppercase', letterSpacing: '0.5px' }}>
+                            {lang === 'en' ? 'Context History Inject (Q)' : '印象历史上下文 (Q参数)'}
+                        </div>
+                        {isSavingQLimit && <span style={{ fontSize: '11px', color: '#aaa' }}>{lang === 'en' ? 'Saving...' : '保存中...'}</span>}
+                    </div>
+                    <div style={{ fontSize: '13px', color: '#666', marginBottom: '12px', lineHeight: '1.4' }}>
+                        {lang === 'en'
+                            ? 'The AI forms its persona using Q latest historical impressions regarding the active characters in the same social setting.'
+                            : '控制AI在多人场景下的前置上下文。在生成回复时，系统会向AI提供最多Q条有关在场其余角色的往事印象（最新记录）。'}
+                    </div>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '15px' }}>
+                        <input
+                            type="range"
+                            min="0"
+                            max="10"
+                            step="1"
+                            value={impressionQLimit}
+                            onChange={(e) => setImpressionQLimit(parseInt(e.target.value, 10))}
+                            onMouseUp={handleQLimitSave}
+                            onTouchEnd={handleQLimitSave}
+                            style={{ flex: 1, accentColor: 'var(--accent-color)' }}
+                        />
+                        <div style={{ width: '40px', textAlign: 'right', fontWeight: 'bold', color: 'var(--accent-color)', fontSize: '14px' }}>
+                            {impressionQLimit}
+                        </div>
+                    </div>
+                </div>
+
+                {/* Context Token Usage Stats */}
+                <div style={{ marginTop: '10px', backgroundColor: '#fff', padding: '15px', borderTop: '1px solid #eee', borderBottom: '1px solid #eee' }}>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '12px' }}>
+                        <div style={{ fontSize: '13px', fontWeight: 'bold', color: '#333' }}>
+                            {lang === 'en' ? '🧠 AI Context Focus (Token Est.)' : '🧠 AI 实时上下文焦点估算'}
+                        </div>
+                    </div>
+                    {contextStats ? (
+                        <div style={{ display: 'flex', flexDirection: 'column', gap: '8px', fontSize: '12px' }}>
+                            <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                                <span style={{ color: '#666' }}>基础设定与系统指令 (Base)</span>
+                                <span style={{ fontWeight: '500', color: '#2c3e50' }}>~{contextStats.base} T</span>
+                            </div>
+                            <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                                <span style={{ color: '#666' }}>近期私聊回顾 (X 参数)</span>
+                                <span style={{ fontWeight: '500', color: '#27ae60' }}>~{contextStats.x_chat} T</span>
+                            </div>
+                            <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                                <span style={{ color: '#666' }}>商业街环境感知 (Y 参数)</span>
+                                <span style={{ fontWeight: '500', color: '#e67e22' }}>~{contextStats.city_x_y} T</span>
+                            </div>
+                            <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                                <span style={{ color: '#666' }}>深层潜意识记忆 (Z 参数)</span>
+                                <span style={{ fontWeight: '500', color: '#8e44ad' }}>~{contextStats.z_memory} T</span>
+                            </div>
+                            <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                                <span style={{ color: '#666' }}>社交网络动态 (朋友圈)</span>
+                                <span style={{ fontWeight: '500', color: '#2980b9' }}>~{contextStats.moments} T</span>
+                            </div>
+                            {contextStats.cross_group > 0 && (
+                                <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '8px' }}>
+                                    <span style={{ color: '#27ae60' }}>👥 {lang === 'en' ? 'Group Chats' : '近期群聊'}</span>
+                                    <span style={{ fontWeight: '500', color: '#27ae60' }}>~{contextStats.cross_group} T</span>
+                                </div>
+                            )}
+                            {contextStats.cross_private > 0 && (
+                                <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '8px' }}>
+                                    <span style={{ color: '#16a085' }}>🤫 {lang === 'en' ? 'Private Chats' : '私聊秘密'}</span>
+                                    <span style={{ fontWeight: '500', color: '#16a085' }}>~{contextStats.cross_private} T</span>
+                                </div>
+                            )}
+                            <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                                <span style={{ color: '#666' }}>往事印象注视 (Q 参数)</span>
+                                <span style={{ fontWeight: '500', color: '#e74c3c' }}>~{contextStats.q_impression} T</span>
+                            </div>
+                            <div style={{ display: 'flex', justifyContent: 'space-between', borderTop: '1px dashed #eee', paddingTop: '8px', marginTop: '4px' }}>
+                                <span style={{ color: '#666' }}>长时记忆消化积攒 (W)</span>
+                                <span style={{ fontWeight: '500', color: contextStats.w_unsummarized_count >= contextStats.w_sweep_limit ? '#c0392b' : '#34495e' }}>
+                                    {contextStats.w_unsummarized_count} / {contextStats.w_sweep_limit} 条
+                                </span>
+                            </div>
+                        </div>
+                    ) : (
+                        <div style={{ fontSize: '12px', color: '#999', textAlign: 'center', padding: '10px 0' }}>
+                            {lang === 'en' ? 'Calculating...' : '计算中...'}
+                        </div>
+                    )}
+                </div>
+
+                {/* City Action Frequency Slider - r acts per hour */}
+                <div style={{ marginTop: '10px', backgroundColor: '#fff', padding: '15px', borderTop: '1px solid #eee', borderBottom: '1px solid #eee' }}>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '8px' }}>
+                        <div style={{ fontSize: '13px', fontWeight: 'bold', color: '#333', display: 'flex', alignItems: 'center', gap: '6px' }}>
+                            🎲 {lang === 'en' ? 'City Activity Frequency (r/hr)' : '商业街活动频率 (次/小时)'}
+                        </div>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                            {isSavingFreq && <span style={{ fontSize: '11px', color: '#aaa' }}>{lang === 'en' ? 'Saving...' : '保存中...'}</span>}
+                            <span style={{ fontWeight: '700', color: '#e67e22', fontSize: '15px' }}>{cityActionFreq}</span>
+                        </div>
+                    </div>
+                    <input
+                        type="range"
+                        min="1"
+                        max="30"
+                        step="1"
+                        value={cityActionFreq}
+                        onChange={(e) => setCityActionFreq(parseInt(e.target.value, 10))}
+                        onMouseUp={handleFreqSave}
+                        onTouchEnd={handleFreqSave}
+                        style={{ width: '100%', accentColor: '#e67e22' }}
+                    />
+                    <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '10px', color: '#bbb', marginTop: '2px' }}>
+                        <span>1</span><span>10</span><span>20</span><span>30</span>
+                    </div>
+                    <div style={{ fontSize: '10px', color: '#999', marginTop: '6px', lineHeight: 1.5 }}>
+                        {lang === 'en'
+                            ? 'How many times per in-game hour this character acts in the city.'
+                            : '角色每个小时在商业街随机行动的次数。越高越活跃，但API消耗也越多。'}
+                    </div>
+                </div>
+
+                {/* Today's Schedule Panel */}
+                <div style={{ marginTop: '10px', backgroundColor: '#fff', padding: '15px', borderTop: '1px solid #eee', borderBottom: '1px solid #eee' }}>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '12px' }}>
+                        <div style={{ fontSize: '13px', fontWeight: 'bold', color: '#333', display: 'flex', alignItems: 'center', gap: '6px' }}>
+                            📅 {lang === 'en' ? "Today's Schedule" : '今日日程'}
+                        </div>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                            {isSavingSchedule && <span style={{ fontSize: '11px', color: '#aaa' }}>...</span>}
+                            <label style={{ display: 'flex', alignItems: 'center', cursor: 'pointer', gap: '6px' }}>
+                                <span style={{ fontSize: '12px', color: isScheduled ? 'var(--accent-color)' : '#999' }}>
+                                    {isScheduled ? (lang === 'en' ? 'Enabled' : '启用') : (lang === 'en' ? 'Disabled' : '禁用瞎逛')}
+                                </span>
+                                <input
+                                    type="checkbox"
+                                    checked={isScheduled}
+                                    onChange={handleToggleSchedule}
+                                    style={{ accentColor: 'var(--accent-color)', width: '16px', height: '16px', cursor: 'pointer' }}
+                                />
+                            </label>
+                        </div>
+                    </div>
+
+                    {!isScheduled ? (
+                        <div style={{ fontSize: '12px', color: '#999', textAlign: 'center', padding: '10px 0', background: '#f5f5f5', borderRadius: '6px' }}>
+                            {lang === 'en' ? 'Free roam mode. The AI will not follow a set schedule.' : '自由时间。角色将根据当前状态和想法自由探索。'}
+                        </div>
+                    ) : isGeneratingSchedule || isRetryingSchedule ? (
+                        <div style={{ padding: '20px 0', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: '10px' }}>
+                            <RefreshCw className="spinner" size={18} color="var(--accent-color)" style={{ animation: 'spin 1s linear infinite' }} />
+                            <div style={{ fontSize: '12px', color: '#666' }}>
+                                🤖 {lang === 'en' ? 'AI is thinking about today...' : '大模型正在撰写今日行程...'}
+                            </div>
+                        </div>
+                    ) : todaySchedule.length === 0 ? (
+                        <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', padding: '15px 0', gap: '8px' }}>
+                            <div style={{ fontSize: '12px', color: '#999', textAlign: 'center' }}>
+                                {lang === 'en' ? 'Schedule not generated yet.' : '今日计划还未生成...'}
+                            </div>
+                            <button
+                                onClick={forceGenerateSchedule}
+                                style={{
+                                    padding: '6px 12px', background: 'var(--accent-color)', color: '#fff', border: 'none', borderRadius: '4px',
+                                    fontSize: '12px', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: '4px'
+                                }}>
+                                <RefreshCw size={14} /> {lang === 'en' ? 'Force Generate' : '强制重新生成'}
+                            </button>
+                        </div>
+                    ) : (
+                        <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
+                            {todaySchedule.map((task, idx) => {
+                                let statusIcon = '⏳';
+                                let statusColor = '#666';
+                                if (task.status === 'completed') {
+                                    statusIcon = '✅';
+                                    statusColor = '#27ae60';
+                                } else if (task.status === 'missed') {
+                                    statusIcon = '❌';
+                                    statusColor = '#e74c3c';
+                                }
+                                return (
+                                    <div key={idx} style={{ display: 'flex', alignItems: 'center', background: '#f8f9fa', padding: '8px 10px', borderRadius: '6px', borderLeft: `3px solid ${statusColor}` }}>
+                                        <div style={{ fontSize: '13px', fontWeight: 'bold', minWidth: '45px', color: '#555' }}>
+                                            {String(task.hour).padStart(2, '0')}:00
+                                        </div>
+                                        <div style={{ flex: 1, paddingLeft: '8px' }}>
+                                            <div style={{ fontSize: '13px', color: '#333' }}>
+                                                {lang === 'en' ? `Go to [${task.action}]` : `前往 [${task.action}]`}
+                                            </div>
+                                            <div style={{ fontSize: '11px', color: '#888', marginTop: '2px' }}>
+                                                {task.reason}
+                                            </div>
+                                        </div>
+                                        <div style={{ fontSize: '16px', title: task.status }}>
+                                            {statusIcon}
+                                        </div>
+                                    </div>
+                                );
+                            })}
+                        </div>
+                    )}
+                </div>
+
+                {/* Character Inventory (Backpack) */}
+                {(contact.inventory && contact.inventory.length > 0) && (
+                    <div style={{ marginTop: '10px', backgroundColor: '#fff', padding: '15px', borderTop: '1px solid #eee', borderBottom: '1px solid #eee' }}>
+                        <div style={{ fontSize: '12px', color: '#999', marginBottom: '12px', textTransform: 'uppercase', letterSpacing: '0.5px' }}>
+                            {lang === 'en' ? 'Backpack / Inventory' : '背包物品'}
+                        </div>
+                        <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
+                            {contact.inventory.map((item, idx) => (
+                                <div key={`inv-${item.id || idx}`} style={{ display: 'flex', alignItems: 'center', background: '#f8f9fa', padding: '8px 10px', borderRadius: '6px' }}>
+                                    <div style={{ fontSize: '18px', marginRight: '10px' }}>{item.emoji || '📦'}</div>
+                                    <div style={{ flex: 1 }}>
+                                        <div style={{ fontSize: '14px', fontWeight: '500', color: '#333' }}>{item.name}</div>
+                                        {(item.description || item.effect) && (
+                                            <div style={{ fontSize: '11px', color: '#888', marginTop: '2px' }}>
+                                                {item.description || item.effect}
+                                            </div>
+                                        )}
+                                    </div>
+                                    <div style={{ fontSize: '13px', fontWeight: '600', color: '#666' }}>
+                                        x{item.quantity}
+                                    </div>
+                                </div>
+                            ))}
+                        </div>
+                    </div>
+                )}
 
                 {/* Inter-character Relationships (char-to-char impressions) */}
                 <div style={{ marginTop: '10px', backgroundColor: '#fff', padding: '15px', borderTop: '1px solid #eee', borderBottom: '1px solid #eee' }}>
@@ -121,7 +562,7 @@ function ChatSettingsDrawer({ contact, apiUrl, onClose, onClearHistory }) {
                         relationships.map(rel => (
                             <div key={rel.targetId} style={{ marginBottom: '12px', padding: '10px', background: '#f8f9fa', borderRadius: '8px' }}>
                                 <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '6px' }}>
-                                    <img src={rel.targetAvatar || `https://api.dicebear.com/7.x/shapes/svg?seed=${rel.targetName}`} alt=""
+                                    <img src={resolveAvatarUrl(rel.targetAvatar, apiUrl) || `https://api.dicebear.com/7.x/shapes/svg?seed=${rel.targetName}`} alt=""
                                         style={{ width: 28, height: 28, borderRadius: '50%', objectFit: 'cover' }} />
                                     <div style={{ flex: 1 }}>
                                         <span style={{ fontWeight: '500', fontSize: '13px' }}>{rel.targetName}</span>
@@ -140,6 +581,34 @@ function ChatSettingsDrawer({ contact, apiUrl, onClose, onClearHistory }) {
                                         "{rel.impression}"
                                     </div>
                                 )}
+                                <div style={{ marginTop: '8px', borderTop: '1px dashed #ddd', paddingTop: '6px' }}>
+                                    <button
+                                        onClick={() => toggleHistory(rel.targetId)}
+                                        style={{ background: 'none', border: 'none', color: '#aaa', fontSize: '11px', cursor: 'pointer', padding: '0', display: 'flex', alignItems: 'center', gap: '4px' }}
+                                    >
+                                        {expandedHistory[rel.targetId] ? (lang === 'en' ? 'Hide History ▲' : '隐藏历史 ▲') : (lang === 'en' ? 'Show History ▼' : '查看历史 ▼')}
+                                    </button>
+
+                                    {expandedHistory[rel.targetId] && (
+                                        <div style={{ marginTop: '8px', display: 'flex', flexDirection: 'column', gap: '6px' }}>
+                                            {!impressionHistories[rel.targetId] ? (
+                                                <div style={{ fontSize: '11px', color: '#ccc' }}>Loading...</div>
+                                            ) : impressionHistories[rel.targetId].length === 0 ? (
+                                                <div style={{ fontSize: '11px', color: '#ccc' }}>{lang === 'en' ? 'No detailed history.' : '暂无详细历史。'}</div>
+                                            ) : (
+                                                impressionHistories[rel.targetId].map((h, i) => (
+                                                    <div key={i} style={{ fontSize: '11px', background: '#fff', padding: '6px', borderRadius: '4px', borderLeft: '2px solid var(--accent-color)' }}>
+                                                        <div style={{ color: '#999', marginBottom: '2px', display: 'flex', justifyContent: 'space-between' }}>
+                                                            <span>[{h.trigger_event}]</span>
+                                                            <span>{new Date(h.timestamp).toLocaleDateString()}</span>
+                                                        </div>
+                                                        <div style={{ color: '#555', fontStyle: 'italic' }}>"{h.impression}"</div>
+                                                    </div>
+                                                ))
+                                            )}
+                                        </div>
+                                    )}
+                                </div>
                             </div>
                         ))
                     )}
@@ -160,8 +629,9 @@ function ChatSettingsDrawer({ contact, apiUrl, onClose, onClearHistory }) {
                     </div>
                 </div>
             </div>
-        </div>
+        </div >
     );
 }
 
 export default ChatSettingsDrawer;
+

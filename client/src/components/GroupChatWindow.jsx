@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
-import { Send, Users, Smile, Paperclip, X, Settings, Trash2, UserMinus, ArrowRightLeft, Gift, ChevronLeft, Trash } from 'lucide-react';
+import { Send, Users, Smile, Paperclip, X, Settings, Trash2, UserMinus, ArrowRightLeft, Gift, ChevronLeft, Trash, EyeOff, Eye, UserPlus, Edit3 } from 'lucide-react';
 import { useLanguage } from '../LanguageContext';
 import { resolveAvatarUrl } from '../utils/avatar';
 
@@ -169,16 +169,20 @@ function RedPacketCard({ packetId, apiUrl, groupId, isUser, resolveSender, claim
 }
 
 /* ─── Right-side Group Management Drawer ─── */
-function GroupManageDrawer({ group, apiUrl, resolveSender, onClose, lang }) {
+function GroupManageDrawer({ group, apiUrl, resolveSender, onClose, lang, messages, allContacts, onHide, onUnhide, onAddMember, onRename }) {
     const [noChain, setNoChain] = useState(false);
     const [injectLimit, setInjectLimit] = useState(group?.inject_limit ?? 5);
+    const [editingName, setEditingName] = useState(false);
+    const [nameInput, setNameInput] = useState(group?.name || '');
+    const [showAddMember, setShowAddMember] = useState(false);
+    const [addSearch, setAddSearch] = useState('');
 
     useEffect(() => {
         if (!group) return;
         setInjectLimit(group.inject_limit ?? 5);
+        setNameInput(group.name || '');
         fetch(`${apiUrl}/groups/${group.id}/no-chain`, { headers: { 'Authorization': `Bearer ${localStorage.getItem('cp_token') || ''}` } }).then(r => r.json()).then(d => setNoChain(!!d.no_chain)).catch(() => { });
     }, [group, apiUrl]);
-
 
     const toggleNoChain = async () => {
         const v = !noChain; setNoChain(v);
@@ -192,6 +196,20 @@ function GroupManageDrawer({ group, apiUrl, resolveSender, onClose, lang }) {
     const dissolveGroup = () => { if (window.confirm(lang === 'en' ? 'Dissolve this group?' : '解散此群？')) fetch(`${apiUrl}/groups/${group.id}`, { method: 'DELETE', headers: { 'Authorization': `Bearer ${localStorage.getItem('cp_token') || ''}` } }).then(() => window.location.reload()); };
     const kickMember = (mid) => { if (window.confirm(lang === 'en' ? 'Remove this member?' : '移除此成员？')) fetch(`${apiUrl}/groups/${group.id}/members/${mid}`, { method: 'DELETE', headers: { 'Authorization': `Bearer ${localStorage.getItem('cp_token') || ''}` } }).then(() => window.location.reload()); };
 
+    const handleRename = () => {
+        const newName = nameInput.trim();
+        if (newName && newName !== group.name) {
+            onRename(newName);
+        }
+        setEditingName(false);
+    };
+
+    // Characters not already in the group
+    const memberIds = new Set((group.members || []).map(m => m.member_id || m));
+    const availableChars = (allContacts || []).filter(c => !memberIds.has(String(c.id)) && !memberIds.has(c.id));
+    const filteredChars = availableChars.filter(c => c.name.toLowerCase().includes(addSearch.toLowerCase()));
+
+    const hiddenCount = (messages || []).filter(m => m.hidden).length;
 
     return (
         <div style={{ width: '280px', minWidth: '280px', backgroundColor: '#f7f7f7', borderLeft: '1px solid #eee', display: 'flex', flexDirection: 'column', height: '100%', overflowY: 'auto' }}>
@@ -203,10 +221,38 @@ function GroupManageDrawer({ group, apiUrl, resolveSender, onClose, lang }) {
                 <button onClick={onClose} style={{ background: 'none', border: 'none', cursor: 'pointer', color: '#999' }}><X size={18} /></button>
             </div>
 
+            {/* Group Name (editable) */}
+            <div style={{ backgroundColor: '#fff', padding: '12px 15px', borderBottom: '1px solid #eee' }}>
+                <div style={{ fontSize: '12px', color: '#999', marginBottom: '8px', textTransform: 'uppercase' }}>
+                    {lang === 'en' ? 'Group Name' : '群名称'}
+                </div>
+                {editingName ? (
+                    <div style={{ display: 'flex', gap: '6px' }}>
+                        <input type="text" value={nameInput} onChange={e => setNameInput(e.target.value)}
+                            onKeyDown={e => { if (e.key === 'Enter') handleRename(); if (e.key === 'Escape') { setEditingName(false); setNameInput(group.name); } }}
+                            autoFocus
+                            style={{ flex: 1, padding: '6px 10px', borderRadius: '6px', border: '1px solid var(--accent-color)', fontSize: '14px', outline: 'none' }} />
+                        <button onClick={handleRename} style={{ padding: '6px 12px', borderRadius: '6px', border: 'none', background: 'var(--accent-color)', color: '#fff', cursor: 'pointer', fontSize: '12px' }}>
+                            ✓
+                        </button>
+                    </div>
+                ) : (
+                    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+                        <span style={{ fontSize: '15px', fontWeight: '500' }}>{group.name}</span>
+                        <button onClick={() => setEditingName(true)} style={{ background: 'none', border: 'none', cursor: 'pointer', color: '#aaa', padding: '2px' }} title={lang === 'en' ? 'Rename group' : '修改群名'}>
+                            <Edit3 size={14} />
+                        </button>
+                    </div>
+                )}
+            </div>
+
             {/* Members */}
             <div style={{ backgroundColor: '#fff', padding: '12px 15px', borderBottom: '1px solid #eee' }}>
-                <div style={{ fontSize: '12px', color: '#999', marginBottom: '10px', textTransform: 'uppercase' }}>
-                    {lang === 'en' ? 'Members' : '群成员'} ({group.members?.length || 0})
+                <div style={{ fontSize: '12px', color: '#999', marginBottom: '10px', textTransform: 'uppercase', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                    <span>{lang === 'en' ? 'Members' : '群成员'} ({group.members?.length || 0})</span>
+                    <button onClick={() => setShowAddMember(!showAddMember)} style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'var(--accent-color)', padding: '0' }} title={lang === 'en' ? 'Add member' : '添加成员'}>
+                        <UserPlus size={14} />
+                    </button>
                 </div>
                 {group.members?.map(memberObj => {
                     const mid = memberObj.member_id || memberObj;
@@ -223,6 +269,46 @@ function GroupManageDrawer({ group, apiUrl, resolveSender, onClose, lang }) {
                         </div>
                     );
                 })}
+                {/* Add Member Panel */}
+                {showAddMember && (
+                    <div style={{ marginTop: '10px', borderTop: '1px solid #eee', paddingTop: '10px' }}>
+                        <input type="text" placeholder={lang === 'en' ? 'Search characters...' : '搜索角色...'} value={addSearch} onChange={e => setAddSearch(e.target.value)}
+                            style={{ width: '100%', padding: '6px 10px', borderRadius: '6px', border: '1px solid #ddd', fontSize: '13px', outline: 'none', boxSizing: 'border-box', marginBottom: '8px' }} />
+                        <div style={{ maxHeight: '200px', overflowY: 'auto' }}>
+                            {filteredChars.length === 0 && (
+                                <div style={{ fontSize: '12px', color: '#aaa', textAlign: 'center', padding: '10px' }}>
+                                    {lang === 'en' ? 'No characters available' : '没有可添加的角色'}
+                                </div>
+                            )}
+                            {filteredChars.map(c => (
+                                <div key={c.id} onClick={() => { onAddMember(c.id); setShowAddMember(false); setAddSearch(''); }}
+                                    style={{ display: 'flex', alignItems: 'center', gap: '8px', padding: '6px 4px', cursor: 'pointer', borderRadius: '6px', transition: 'background 0.15s' }}
+                                    onMouseEnter={e => e.currentTarget.style.background = '#f0f9eb'}
+                                    onMouseLeave={e => e.currentTarget.style.background = 'transparent'}>
+                                    <img src={resolveAvatarUrl(c.avatar, apiUrl)} alt="" style={{ width: 28, height: 28, borderRadius: '50%', objectFit: 'cover' }} />
+                                    <span style={{ fontSize: '13px', fontWeight: '500' }}>{c.name}</span>
+                                </div>
+                            ))}
+                        </div>
+                    </div>
+                )}
+            </div>
+
+            {/* Context Hide Controls */}
+            <div style={{ backgroundColor: '#fff', padding: '12px 15px', borderBottom: '1px solid #eee', marginTop: '8px' }}>
+                <div style={{ fontSize: '12px', color: '#999', marginBottom: '10px', textTransform: 'uppercase' }}>
+                    {lang === 'en' ? 'Context Control' : '上下文控制'}
+                </div>
+                <button onClick={onHide}
+                    style={{ width: '100%', padding: '8px', background: '#fafafa', border: '1px solid #ddd', borderRadius: '6px', cursor: 'pointer', fontSize: '13px', marginBottom: '6px', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '6px' }}>
+                    <EyeOff size={14} /> {lang === 'en' ? 'Hide Old Messages' : '隐藏旧消息'}
+                </button>
+                {hiddenCount > 0 && (
+                    <button onClick={onUnhide}
+                        style={{ width: '100%', padding: '8px', background: '#fafafa', border: '1px solid #ddd', borderRadius: '6px', cursor: 'pointer', fontSize: '13px', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '6px' }}>
+                        <Eye size={14} /> {lang === 'en' ? `Unhide All (${hiddenCount})` : `取消隐藏 (${hiddenCount})`}
+                    </button>
+                )}
             </div>
 
             {/* AI Controls */}
@@ -269,7 +355,7 @@ function GroupManageDrawer({ group, apiUrl, resolveSender, onClose, lang }) {
 }
 
 /* ─── Main GroupChatWindow ─── */
-function GroupChatWindow({ group, apiUrl, allContacts, userProfile, newGroupMessage, typingIndicators, redpacketClaimEvent, onBack }) {
+function GroupChatWindow({ group, apiUrl, allContacts, userProfile, incomingGroupMessageQueue, typingIndicators, redpacketClaimEvent, onBack, onGroupUpdated }) {
     const { lang } = useLanguage();
     const [messages, setMessages] = useState([]);
     const [input, setInput] = useState('');
@@ -281,6 +367,7 @@ function GroupChatWindow({ group, apiUrl, allContacts, userProfile, newGroupMess
     const textareaRef = useRef(null);
     const [selectMode, setSelectMode] = useState(false);
     const [selectedIds, setSelectedIds] = useState(new Set());
+    const [showHiddenBadges, setShowHiddenBadges] = useState(false);
 
     // Mentions logic
     const [showMentionMenu, setShowMentionMenu] = useState(false);
@@ -294,10 +381,17 @@ function GroupChatWindow({ group, apiUrl, allContacts, userProfile, newGroupMess
     }, [group?.id, apiUrl]);
 
     useEffect(() => {
-        if (newGroupMessage && group?.id && newGroupMessage.group_id === group.id) {
-            setMessages(prev => prev.find(m => m.id === newGroupMessage.id) ? prev : [...prev, newGroupMessage]);
+        if (incomingGroupMessageQueue && incomingGroupMessageQueue.length > 0 && group?.id) {
+            const relevantMsgs = incomingGroupMessageQueue.filter(m => m.group_id === group.id);
+            if (relevantMsgs.length > 0) {
+                setMessages(prev => {
+                    const newUnique = relevantMsgs.filter(m => !prev.some(pm => pm.id === m.id));
+                    if (newUnique.length === 0) return prev;
+                    return [...prev, ...newUnique];
+                });
+            }
         }
-    }, [newGroupMessage, group?.id]);
+    }, [incomingGroupMessageQueue, group?.id]);
 
     useEffect(() => {
         if (messagesEndRef.current) {
@@ -405,6 +499,69 @@ function GroupChatWindow({ group, apiUrl, allContacts, userProfile, newGroupMess
         return { type: 'text', text: content };
     };
 
+    // Hide old messages handler (progressive halving, local update)
+    const handleHideOld = async () => {
+        if (!group?.id) return;
+        const visibleMsgs = messages.filter(m => !m.hidden);
+        const halfCount = Math.floor(visibleMsgs.length / 2);
+        if (halfCount === 0) return;
+        const toHideIds = new Set(visibleMsgs.slice(0, halfCount).map(m => m.id));
+        try {
+            const res = await fetch(`${apiUrl}/groups/${group.id}/messages/hide`, {
+                method: 'POST',
+                headers: { 'Authorization': `Bearer ${localStorage.getItem('cp_token') || ''}`, 'Content-Type': 'application/json' },
+                body: JSON.stringify({ messageIds: Array.from(toHideIds) })
+            });
+            const data = await res.json();
+            if (data.success) {
+                setMessages(prev => prev.map(m => toHideIds.has(m.id) ? { ...m, hidden: 1 } : m));
+            }
+        } catch (e) {
+            console.error('Failed to hide old group messages:', e);
+        }
+    };
+
+    const handleUnhideAll = async () => {
+        if (!group?.id) return;
+        const res = await fetch(`${apiUrl}/groups/${group.id}/messages/unhide`, {
+            method: 'POST',
+            headers: { 'Authorization': `Bearer ${localStorage.getItem('cp_token') || ''}`, 'Content-Type': 'application/json' }
+        });
+        if ((await res.json()).success) {
+            setMessages(prev => prev.map(m => ({ ...m, hidden: 0 })));
+        }
+    };
+
+    const handleAddMember = async (charId) => {
+        try {
+            const res = await fetch(`${apiUrl}/groups/${group.id}/members`, {
+                method: 'POST',
+                headers: { 'Authorization': `Bearer ${localStorage.getItem('cp_token') || ''}`, 'Content-Type': 'application/json' },
+                body: JSON.stringify({ member_id: charId })
+            });
+            const data = await res.json();
+            if (data.success && onGroupUpdated) {
+                onGroupUpdated(data.group);
+            }
+        } catch (e) { console.error('Add member failed:', e); }
+    };
+
+    const handleRename = async (newName) => {
+        try {
+            const res = await fetch(`${apiUrl}/groups/${group.id}`, {
+                method: 'PUT',
+                headers: { 'Authorization': `Bearer ${localStorage.getItem('cp_token') || ''}`, 'Content-Type': 'application/json' },
+                body: JSON.stringify({ name: newName })
+            });
+            const data = await res.json();
+            if (data.success && onGroupUpdated) {
+                onGroupUpdated(data.group);
+            }
+        } catch (e) { console.error('Rename failed:', e); }
+    };
+
+    const hiddenCount = messages.filter(m => m.hidden).length;
+
     if (!group) return null;
 
     return (
@@ -432,6 +589,16 @@ function GroupChatWindow({ group, apiUrl, allContacts, userProfile, newGroupMess
                         </button>
                     </div>
                 </div>
+
+                {/* Hidden messages banner */}
+                {hiddenCount > 0 && (
+                    <div style={{ display: 'flex', justifyContent: 'center', padding: '5px', background: '#fff9e0', cursor: 'pointer', fontSize: '12px', color: '#888', gap: '5px', alignItems: 'center', borderBottom: '1px solid #f0e8c0' }}
+                        onClick={() => setShowHiddenBadges(prev => !prev)}>
+                        {showHiddenBadges ? <Eye size={13} /> : <EyeOff size={13} />}
+                        {hiddenCount} {lang === 'en' ? 'messages hidden from AI context' : '条消息已从AI上下文中隐藏'}
+                        {' — '}{lang === 'en' ? (showHiddenBadges ? 'click to hide badges' : 'click to show') : (showHiddenBadges ? '点击隐藏标记' : '点击显示')}
+                    </div>
+                )}
 
                 {/* Messages */}
                 <div className="chat-history">
@@ -536,7 +703,7 @@ function GroupChatWindow({ group, apiUrl, allContacts, userProfile, newGroupMess
                         // Normal message
                         return (
                             <div key={msg.id} className={`message-wrapper ${isUser ? 'user' : 'character'}`}
-                                style={isSelected ? { backgroundColor: 'rgba(var(--accent-rgb, 74,144,226), 0.08)', borderRadius: '8px' } : {}}
+                                style={{ ...(isSelected ? { backgroundColor: 'rgba(var(--accent-rgb, 74,144,226), 0.08)', borderRadius: '8px' } : {}), ...(msg.hidden ? { opacity: 0.4, filter: 'grayscale(0.5)', borderLeft: '3px solid #f0c060', paddingLeft: '4px', marginBottom: '2px' } : {}) }}
                                 onClick={selectionClick}>
                                 {selectMode && (
                                     <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', minWidth: '32px', paddingTop: '12px', cursor: 'pointer' }}>
@@ -708,7 +875,10 @@ function GroupChatWindow({ group, apiUrl, allContacts, userProfile, newGroupMess
 
             {showManageDrawer && (
                 <GroupManageDrawer group={group} apiUrl={apiUrl} resolveSender={resolveSender}
-                    onClose={() => setShowManageDrawer(false)} lang={lang} />
+                    onClose={() => setShowManageDrawer(false)} lang={lang}
+                    messages={messages} allContacts={allContacts}
+                    onHide={handleHideOld} onUnhide={handleUnhideAll}
+                    onAddMember={handleAddMember} onRename={handleRename} />
             )}
 
             {/* Red Packet Modal */}

@@ -1,5 +1,6 @@
 const { getUserDb } = require('./db');
 const { callLLM } = require('./llm');
+const { buildUniversalContext } = require('./contextBuilder');
 
 const engineCache = new Map();
 
@@ -25,58 +26,6 @@ function getEngine(userId) {
 
     // Generates the system prompt merging character persona, world info, and memories
     async function buildPrompt(character, contextMessages, isTimerWakeup = false) {
-        const now = new Date();
-        const isWeekend = now.getDay() === 0 || now.getDay() === 6;
-        const hour = now.getHours();
-
-        let timeOfDay = 'Daytime';
-        if (hour >= 5 && hour < 10) timeOfDay = 'Morning';
-        else if (hour >= 10 && hour < 14) timeOfDay = 'Midday/Noon';
-        else if (hour >= 14 && hour < 18) timeOfDay = 'Afternoon';
-        else if (hour >= 18 && hour < 22) timeOfDay = 'Evening';
-        else timeOfDay = 'Late Night';
-
-        const timeContext = `Current Time: ${timeOfDay} (${now.toLocaleTimeString()})${isWeekend ? ', Weekend' : ', Weekday'}`;
-
-        const userProfile = db.getUserProfile();
-        const userName = userProfile?.name || 'User';
-
-        let pressureContext = '';
-        if (character.pressure_level > 0) {
-            pressureContext = `Emotional Pressure Level: ${character.pressure_level}/4\n`;
-            if (character.pressure_level === 1) pressureContext += `- You are starting to miss or wonder about ${userName} because they haven't replied.\n`;
-            if (character.pressure_level === 2) pressureContext += `- You are getting worried or slightly annoyed that ${userName} is ignoring you. IMPORTANT: Do NOT repeat the same worry or topic as your previous messages — bring up something completely new (e.g. share what you're doing, ask about something different, change your emotional angle).\n`;
-            if (character.pressure_level >= 3) pressureContext += `- You are extremely anxious, needy, or angry because ${userName} has ignored you for a long time. Express strong emotion. CRITICAL: You MUST use a completely different topic, angle, or approach than your previous messages. Do NOT say the same thing again in different words.\n`;
-        }
-
-        // Neglect Anxiety Context (triggered when user chats with others)
-        let jealousyContext = '';
-        if (character.jealousy_level > 0) {
-            const rivalName = character.jealousy_target || 'someone else';
-            jealousyContext = `\nNeglect Anxiety Level: ${character.jealousy_level}/4\n`;
-            if (character.jealousy_level === 1) jealousyContext += `- You noticed ${userName} has been spending time chatting with ${rivalName} instead of you. You feel a little left out and lonely, but try not to show it too much. Maybe drop a subtle hint that you miss them.\n`;
-            if (character.jealousy_level === 2) jealousyContext += `- ${userName} keeps ignoring you and talking to ${rivalName}. You feel genuinely hurt and neglected. "Am I not important enough?" Show passive-aggressive behavior, be clingy, sulky, or send messages fishing for attention. Don't immediately brighten up even if they finally reply.\n`;
-            if (character.jealousy_level === 3) jealousyContext += `- ${userName} has been ignoring you for a while now, choosing ${rivalName} over you repeatedly. You feel deeply unwanted and anxious. Are they getting tired of you? Express neediness, insecurity, or give a cold shoulder. You need MORE than a simple reply to feel better — demand real attention, an explanation, or emotional reassurance.\n`;
-            if (character.jealousy_level >= 4) jealousyContext += `- ${userName} has been completely ignoring you. You feel abandoned, worthless, and emotionally devastated. You may lash out in desperation, send dramatic messages, threaten to disappear, give painful silent treatment, or break down emotionally. It will take SIGNIFICANT effort and genuine warmth from ${userName} to make you feel secure again. Do NOT forgive easily — you need to feel TRULY wanted, not just acknowledged.\n`;
-        }
-
-        // Gossip System: Potentially tell them about someone else's recent Moment
-        let gossipContext = '';
-        if (Math.random() < 0.25) { // 25% chance to gossip
-            const allMoments = db.getMoments();
-            const friends = db.getFriends(character.id).map(f => f.id);
-            // Get a recent moment from user or a confirmed friend (exclude self and strangers)
-            const visibleMoments = allMoments.filter(m => m.character_id !== character.id && (m.character_id === 'user' || friends.includes(m.character_id)));
-
-            if (visibleMoments.length > 0) {
-                const randomMoment = visibleMoments[Math.floor(Math.random() * visibleMoments.length)];
-                const userProfile = db.getUserProfile();
-                const userName = userProfile?.name || 'User';
-                const authorName = randomMoment.character_id === 'user' ? userName : (db.getCharacter(randomMoment.character_id)?.name || 'Someone');
-                gossipContext = `\n[Gossip Context: You recently saw that ${authorName} posted this on their Moments/朋友圈: "${randomMoment.content}". You MIGHT casually mention this or ask the user about it, but don't force it.]\n`;
-            }
-        }
-
         const defaultGuidelines = `Guidelines:
 1. Act and speak EXACTLY like the persona. DO NOT break character.
 2. We are chatting on a mobile messaging app.
@@ -99,8 +48,14 @@ function getEngine(userId) {
    - If you feel neglected because the user has been ignoring you to talk to someone else, your anxiety level is shown in Context above. If the user's message makes you feel BETTER about the neglect (e.g. they come back to you, apologize, explain, give you extra attention, sweet-talk you, make you feel wanted), output [JEALOUSY:lower_number] to reduce your anxiety level (e.g. [JEALOUSY:1] or [JEALOUSY:0]). Do NOT immediately feel better — make them prove they truly care based on your personality.
    These tags will be processed hidden from the user.`;
 
-        const momentsTokenLimit = userProfile?.moments_token_limit ?? 1000;
-        const momentsContext = db.getMomentsContextForChar ? db.getMomentsContextForChar(character.id, momentsTokenLimit) : '';
+        const recentInputString = contextMessages.slice(-2).map(m => m.content).join(' ');
+
+        // --- Use Universal Context Builder ---
+        // Pass engine context down (requires memory and userDb access inside builder)
+        // Since we are inside `getEngine` closure, we have access to context indirectly,
+        // but `buildUniversalContext` expects { getUserDb, getMemory, userId }
+        const engineContextWrapper = { getUserDb, getMemory: require('./memory').getMemory, userId };
+        const universalResult = await buildUniversalContext(engineContextWrapper, character, recentInputString, false);
 
         let prompt = `You are playing the role of ${character.name}.
 Persona:
@@ -110,26 +65,39 @@ World Info:
 ${character.world_info || 'No specific world info.'}
 
 Context:
-${timeContext}
-[你的钱包余额]: ¥${character.wallet ?? 0}
-${pressureContext}${jealousyContext}${gossipContext}
-${momentsContext}
-${character.diary_password ? `[Secret Diary Password]: Your private diary is locked with the password "${character.diary_password}". Only YOU know this. If the user sincerely earns your trust or emotionally moves you, you may choose to reveal it naturally in dialogue. Do NOT output [DIARY_PASSWORD] tag unless directly asked to reveal it.\n` : ''}
-${isTimerWakeup ? '[CRITICAL WAKEUP NOTICE]: Your previously self-scheduled timer has just expired! You MUST now proactively send the message you promised to send when you set the [TIMER]. Speak to the user now!\n\n' : ''}${character.system_prompt || defaultGuidelines}`;
+${universalResult.preamble}`;
 
-        // Extract recent memory context to guide the prompt
-        const recentInput = contextMessages.slice(-2).map(m => m.content).join(' ');
-        if (recentInput) {
-            const memories = await memory.searchMemories(character.id, recentInput);
-            if (memories && memories.length > 0) {
-                prompt += '\n\nRelevant Memories:\n';
-                for (const mem of memories) {
-                    prompt += `- ${mem.event}\n`;
-                }
+        // Gossip System: Potentially tell them about someone else's recent Moment
+        if (Math.random() < 0.25) { // 25% chance to gossip
+            const allMoments = db.getMoments();
+            const friends = db.getFriends(character.id).map(f => f.id);
+            const visibleMoments = allMoments.filter(m => m.character_id !== character.id && (m.character_id === 'user' || friends.includes(m.character_id)));
+            if (visibleMoments.length > 0) {
+                const randomMoment = visibleMoments[Math.floor(Math.random() * visibleMoments.length)];
+                const userProfile = db.getUserProfile();
+                const userName = userProfile?.name || 'User';
+                const authorName = randomMoment.character_id === 'user' ? userName : (db.getCharacter(randomMoment.character_id)?.name || 'Someone');
+                prompt += `\n[Gossip Context: You recently saw that ${authorName} posted this on their Moments/朋友圈: "${randomMoment.content}". You MIGHT casually mention this or ask the user about it, but don't force it.]\n`;
             }
         }
 
-        // Anti-repeat: list char's own recent messages so LLM avoids copying them
+        // Unclaimed transfers: char sent to user but user hasn't claimed yet
+        try {
+            const unclaimed = db.getUnclaimedTransfersFrom(character.id, character.id);
+            if (unclaimed && unclaimed.length > 0) {
+                const recent = unclaimed.filter(t => (Date.now() - t.created_at) < (24 * 60 * 60 * 1000));
+                if (recent.length > 0) {
+                    const total = recent.reduce((s, t) => s + t.amount, 0).toFixed(2);
+                    const minutesAgo = Math.round((Date.now() - recent[0].created_at) / 60000);
+                    const unclaimedNote = recent[0].note ? `（留言：「${recent[0].note}」）` : '';
+                    prompt += `\n[系统提示] 你在 ${minutesAgo} 分钟前给 ${db.getUserProfile()?.name || '用户'} 发了一笔转账 ¥${total}${unclaimedNote}，但对方还没有领取。你可以根据性格适当提一句（催促、担心、不在意等），或者不提也行。\n`;
+                }
+            }
+        } catch (e) { /* ignore */ }
+
+        prompt += `\n${isTimerWakeup ? '[CRITICAL WAKEUP NOTICE]: Your previously self-scheduled timer has just expired! You MUST now proactively send the message you promised to send when you set the [TIMER]. Speak to the user now!\n\n' : ''}${character.system_prompt || defaultGuidelines}`;
+
+        // Anti-repeat
         const ownRecentMsgs = contextMessages
             .filter(m => m.role === 'character')
             .slice(-6)
@@ -143,56 +111,11 @@ ${isTimerWakeup ? '[CRITICAL WAKEUP NOTICE]: Your previously self-scheduled time
             prompt += antiRepeat;
         }
 
-        // Cross-context: inject recent group chat activity this character participated in
-        try {
-            const groups = db.getGroups();
-            const charGroups = groups.filter(g => g.members.some(m => m.member_id === character.id));
-            if (charGroups.length > 0) {
-                let groupContext = '\n\n[以下是你最近在群聊中的对话摘要，不是当前私聊内容]\n';
-                let hasGroupContent = false;
-                for (const g of charGroups) {
-                    const limit = g.inject_limit ?? 5; // Per-group injection limit (set in group management UI)
-                    if (limit <= 0) continue; // 0 = disabled for this group
-                    const msgs = db.getGroupMessages(g.id, limit);
-                    if (msgs.length > 0) {
-                        hasGroupContent = true;
-                        groupContext += `群聊「${g.name}」:\n`;
-                        for (const m of msgs) {
-                            const senderName = m.sender_id === 'user'
-                                ? (db.getUserProfile()?.name || 'User')
-                                : (m.sender_name || db.getCharacter(m.sender_id)?.name || 'Unknown');
-                            groupContext += `  - ${senderName}: ${m.content.substring(0, 80)}\n`;
-                        }
-                    }
-                }
-                if (hasGroupContent) {
-                    prompt += groupContext;
-                }
-            }
-        } catch (e) {
-            console.error('[Engine] Cross-context group injection error:', e.message);
-        }
-
-        // Unclaimed transfers: char sent to user but user hasn't claimed yet (max 24h old)
-        try {
-            const unclaimed = db.getUnclaimedTransfersFrom(character.id, character.id);
-            if (unclaimed && unclaimed.length > 0) {
-                const MAX_AGE_MS = 24 * 60 * 60 * 1000; // 24 hours
-                const recent = unclaimed.filter(t => (Date.now() - t.created_at) < MAX_AGE_MS);
-                if (recent.length > 0) {
-                    const total = recent.reduce((s, t) => s + t.amount, 0).toFixed(2);
-                    const minutesAgo = Math.round((Date.now() - recent[0].created_at) / 60000);
-                    const unclaimedNote = recent[0].note ? `（留言：「${recent[0].note}」）` : '';
-                    prompt += `\n\n[系统提示] 你在 ${minutesAgo} 分钟前给 ${db.getUserProfile()?.name || '用户'} 发了一笔转账 ¥${total}${unclaimedNote}，但对方还没有领取。你可以根据性格适当提一句（催促、担心、不在意等），或者不提也行。`;
-                }
-            }
-        } catch (e) { /* ignore */ }
-
-        return prompt;
+        return { prompt, retrievedMemoriesContext: universalResult.retrievedMemoriesContext };
     }
 
     // Function that actually triggers the generation of an AI message
-    async function triggerMessage(character, wsClients, isUserReply = false, isTimerWakeup = false) {
+    async function triggerMessage(character, wsClients, isUserReply = false, isTimerWakeup = false, extraSystemDirective = null) {
         console.log(`\n[DEBUG] === Trigger Message Entry: ${character.name} (isUserReply: ${isUserReply}) ===`);
 
         // Check if character is still active or blocked
@@ -240,35 +163,148 @@ ${isTimerWakeup ? '[CRITICAL WAKEUP NOTICE]: Your previously self-scheduled time
         let customDelayMs = null;
         try {
             const contextHistory = db.getVisibleMessages(character.id);
-            const transformedHistory = contextHistory.map(m => {
-                let content = m.content;
-                if (content.startsWith('[CONTACT_CARD:')) {
-                    const parts = content.split(':');
-                    if (parts.length >= 3) {
-                        const userProfile = db.getUserProfile();
-                        const userName = userProfile?.name || 'User';
-                        content = `[System Notice: ${userName} shared a Contact Card with you for a new friend named "${parts[2]}". You are now friends with them.]`;
+
+            const formatMessageForLLM = (db, content) => {
+                if (!content) return '';
+                try {
+                    if (content.startsWith('[CONTACT_CARD:')) {
+                        const parts = content.split(':');
+                        if (parts.length >= 3) {
+                            const userName = db.getUserProfile()?.name || 'User';
+                            return `[System Notice: ${userName} shared a Contact Card with you for a new friend named "${parts[2]}". You are now friends with them.]`;
+                        }
                     }
-                }
+                    if (content.startsWith('[TRANSFER]')) {
+                        const parts = content.replace('[TRANSFER]', '').trim().split('|');
+                        const tId = parseInt(parts[0]);
+                        const amount = parts[1] || '0';
+                        const note = parts.slice(2).join('|') || '';
+                        const t = db.getTransfer(tId);
+                        if (t) {
+                            const status = t.claimed ? '（已被对方领取）' : (t.refunded ? '（已退还）' : '（待领取）');
+                            return `[转账: ¥${amount}, 备注: "${note}" ${status}]`;
+                        }
+                        return `[转账: ¥${amount}, 备注: "${note}"]`;
+                    }
+                    const rpMatch = content.match(/^\[REDPACKET:(\d+)\]$/);
+                    if (rpMatch) {
+                        const pId = parseInt(rpMatch[1]);
+                        const rp = db.getRedPacket(pId);
+                        if (rp) {
+                            let statusStr = '';
+                            if (rp.remaining_count === 0) {
+                                statusStr = '（已抢光）';
+                            } else {
+                                statusStr = `（剩余 ${rp.remaining_count}/${rp.count} 份）`;
+                            }
+                            let claimNote = '';
+                            if (rp.claims && rp.claims.length > 0) {
+                                const claimers = rp.claims.map(c => {
+                                    const cName = c.claimer_id === 'user' ? (db.getUserProfile()?.name || '用户') : (db.getCharacter(c.claimer_id)?.name || c.claimer_id);
+                                    return `${cName}(¥${c.amount})`;
+                                }).join(', ');
+                                claimNote = ` 领取记录: ${claimers}`;
+                            }
+                            const senderName = rp.sender_id === 'user' ? '用户' : (db.getCharacter(rp.sender_id)?.name || rp.sender_id);
+                            return `[${senderName}发了一个群红包: ¥${rp.total_amount}${rp.type === 'lucky' ? '(拼手气)' : '(普通)'}, 备注: "${rp.note}" ${statusStr}${claimNote}]`;
+                        }
+                        return `[群红包]`;
+                    }
+                } catch (e) { }
+                return content;
+            };
+
+            const transformedHistory = contextHistory.map(m => {
                 return {
                     role: m.role === 'character' ? 'assistant' : 'user',
-                    content: content
+                    content: formatMessageForLLM(db, m.content)
                 };
             });
 
-            const systemPrompt = await buildPrompt(character, contextHistory, isTimerWakeup);
+            const { prompt: systemPrompt, retrievedMemoriesContext } = await buildPrompt(charCheck, contextHistory, isTimerWakeup);
             const apiMessages = [
                 { role: 'system', content: systemPrompt },
                 ...transformedHistory
             ];
 
-            let generatedText = await callLLM({
+            // Setup metadata block if we retrieved any memories
+            let msgMetadata = null;
+            if (retrievedMemoriesContext && retrievedMemoriesContext.length > 0) {
+                msgMetadata = { retrievedMemories: retrievedMemoriesContext };
+            }
+
+            if (extraSystemDirective) {
+                apiMessages.push({ role: 'user', content: extraSystemDirective });
+            } else if (!isUserReply && apiMessages.length > 0 && apiMessages[apiMessages.length - 1].role === 'assistant') {
+                // Prevent third-party AI API proxies from auto-injecting "继续" (Continue)
+                // by explicitly providing a system-level user message.
+                apiMessages.push({ role: 'user', content: '[系统提示：请根据当前语境继续你的上一个话题，或者开启一个新的话题，自然地表达你的想法。]' });
+            }
+
+            // --- Phase 1 & 2: Dynamic Intent Classification for Memory Retrieval (RAG) ---
+            if (isUserReply && !extraSystemDirective && memory && memory.searchMemories && character.api_endpoint) {
+                const intentPrompt = "SYSTEM RAG CHECK: Analyze the user's latest message. Can you reply accurately and fully using ONLY the chat history above? If the user refers to a past event, past conversation, or specific detail not in this recent history context, output ONLY the phrase `SEARCH_MEMORY: [keyword]` (replace [keyword] with a 1-3 word search query). If you have enough context to reply normally, output exactly `ENOUGH_CONTEXT`. Do not output anything else.";
+
+                try {
+                    const { content: intentResult, usage: intentUsage } = await callLLM({
+                        endpoint: character.api_endpoint,
+                        key: character.api_key,
+                        model: character.model_name,
+                        messages: [...apiMessages, { role: 'user', content: intentPrompt }],
+                        maxTokens: 50,
+                        temperature: 0.1,
+                        returnUsage: true
+                    });
+
+                    if (intentUsage) {
+                        db.addTokenUsage(character.id, 'chat', intentUsage.prompt_tokens || 0, intentUsage.completion_tokens || 0);
+                        broadcastEvent(wsClients, { type: 'token_stats', character_id: character.id, module: 'chat', usage: intentUsage });
+                    }
+
+                    const searchMatch = intentResult.match(/SEARCH_MEMORY:\s*\[?([^\]]+)\]?/i);
+                    if (searchMatch && searchMatch[1] && !intentResult.toUpperCase().includes('ENOUGH_CONTEXT')) {
+                        const keyword = searchMatch[1].trim();
+                        console.log(`[Engine] Dynamic RAG Triggered for ${character.name}. Query: "${keyword}"`);
+
+                        const dynamicMemories = await memory.searchMemories(character.id, keyword, 3);
+                        if (dynamicMemories && dynamicMemories.length > 0) {
+                            const sysInjection = `\n[SYSTEM: You successfully retrieved older memories related to "${keyword}"]\n` +
+                                dynamicMemories.map(m => `- ${m.event}`).join('\n') + `\n(Use this to answer the user accurately)`;
+
+                            // Edit the first system prompt to prepend this dynamic injection
+                            apiMessages[0].content += `\n${sysInjection}\n`;
+
+                            if (!msgMetadata) msgMetadata = { retrievedMemories: [] };
+                            msgMetadata.retrievedMemories.push(sysInjection);
+                        } else {
+                            console.log(`[Engine] RAG returned no relevant matches for "${keyword}".`);
+                        }
+                    } else {
+                        console.log(`[Engine] Intent: ENOUGH_CONTEXT. Skipping RAG search.`);
+                    }
+                } catch (intentErr) {
+                    console.error(`[Engine] Background intent classification failed, proceeding normally:`, intentErr.message);
+                }
+            }
+
+            let { content: generatedText, usage } = await callLLM({
                 endpoint: character.api_endpoint,
                 key: character.api_key,
                 model: character.model_name,
                 messages: apiMessages,
-                maxTokens: character.max_tokens || 2000
+                maxTokens: character.max_tokens || 2000,
+                returnUsage: true
             });
+
+            if (usage) {
+                db.addTokenUsage(character.id, 'chat', usage.prompt_tokens || 0, usage.completion_tokens || 0);
+                broadcastEvent(wsClients, {
+                    type: 'token_stats',
+                    character_id: character.id,
+                    module: 'chat',
+                    usage: usage
+                });
+            }
 
             console.log('\n[DEBUG] LLM raw output:', JSON.stringify(generatedText));
 
@@ -349,7 +385,7 @@ ${isTimerWakeup ? '[CRITICAL WAKEUP NOTICE]: Your previously self-scheduled time
                     const momentContent = momentMatch[1].trim();
                     console.log(`[Engine] ${charCheck.name} posted a Moment: ${momentContent.substring(0, 20)}...`);
                     db.addMoment(character.id, momentContent);
-                    broadcastNewMessage(wsClients, { type: 'moment_update' });
+                    broadcastEvent(wsClients, { type: 'moment_update' });
                 }
 
                 // Check for Diary tags
@@ -386,6 +422,7 @@ ${isTimerWakeup ? '[CRITICAL WAKEUP NOTICE]: Your previously self-scheduled time
                     console.log(`[Engine] ${charCheck.name} evaluation: Affinity changed by ${delta}, now ${newAff}`);
                     db.updateCharacter(character.id, { affinity: newAff });
                     charCheck.affinity = newAff; // Update local state
+                    broadcastEvent(wsClients, { type: 'refresh_contacts' });
                 }
 
                 // Check for Pressure changes (AI-evaluated resets)
@@ -396,6 +433,7 @@ ${isTimerWakeup ? '[CRITICAL WAKEUP NOTICE]: Your previously self-scheduled time
                         const newPressure = parseInt(pressureMatch[1], 10);
                         console.log(`[Engine] ${charCheck.name} evaluation: Pressure set to ${newPressure}`);
                         db.updateCharacter(character.id, { pressure_level: newPressure });
+                        broadcastEvent(wsClients, { type: 'refresh_contacts' });
                     }
                 }
 
@@ -408,6 +446,7 @@ ${isTimerWakeup ? '[CRITICAL WAKEUP NOTICE]: Your previously self-scheduled time
                         db.updateCharacter(character.id, { jealousy_level: newJealousy });
                         if (newJealousy === 0) db.updateCharacter(character.id, { jealousy_target: '' });
                         console.log(`[Engine] ${character.name} jealousy self-adjusted to ${newJealousy}`);
+                        broadcastEvent(wsClients, { type: 'refresh_contacts' });
                     }
                 }
 
@@ -417,8 +456,7 @@ ${isTimerWakeup ? '[CRITICAL WAKEUP NOTICE]: Your previously self-scheduled time
                 while ((mLikeMatch = momentLikeRegex.exec(generatedText)) !== null) {
                     if (mLikeMatch[1]) {
                         db.toggleLike(parseInt(mLikeMatch[1], 10), character.id);
-                        console.log(`[Engine] ${charCheck.name} liked moment ${mLikeMatch[1]}`);
-                        broadcastNewMessage(wsClients, { type: 'moment_update' });
+                        broadcastEvent(wsClients, { type: 'moment_update' });
                     }
                 }
 
@@ -546,14 +584,15 @@ ${isTimerWakeup ? '[CRITICAL WAKEUP NOTICE]: Your previously self-scheduled time
                         const bubbleString = textBubbles[i];
 
                         // Save to DB
-                        const { id: messageId, timestamp: messageTs } = db.addMessage(character.id, 'character', bubbleString);
+                        const { id: messageId, timestamp: messageTs } = db.addMessage(character.id, 'character', bubbleString, msgMetadata);
                         const newMessage = {
                             id: messageId,
                             character_id: character.id,
                             role: 'character',
                             content: bubbleString,
                             timestamp: messageTs + i, // slight increment to ensure ordering
-                            read: 0
+                            read: 0,
+                            metadata: msgMetadata
                         };
 
                         // Push to any connected websockets
@@ -561,7 +600,7 @@ ${isTimerWakeup ? '[CRITICAL WAKEUP NOTICE]: Your previously self-scheduled time
                     }
 
                     // Trigger memory extraction in background based on recent context + new full message
-                    memory.extractMemoryFromContext(character, [...contextHistory, { role: 'character', content: generatedText }])
+                    memory.extractMemoryFromContext(character, [...transformedHistory, { role: 'character', content: generatedText }])
                         .catch(err => console.error('[Engine] Memory extraction err:', err.message));
                 }
             }
@@ -648,13 +687,9 @@ ${isTimerWakeup ? '[CRITICAL WAKEUP NOTICE]: Your previously self-scheduled time
                 continue;
             }
 
-            const delay = getRandomDelayMs(0.05, 0.15); // 3-9 seconds initially
-            console.log(`[Engine] Initial startup for ${char.name} in ${Math.round(delay / 1000)} seconds.`);
-            const timerId = setTimeout(() => {
-                // Use isUserReply=true so startup never counts as a pressure-building proactive message
-                triggerMessage(char, wsClients, true);
-            }, delay);
-            timers.set(char.id, { timerId, targetTime: Date.now() + delay });
+            // Schedule a normal proactive message instead of immediately triggering a reply.
+            // This prevents echoing the character's own last message on every server restart.
+            scheduleNext(char, wsClients);
         }
         // Broadcast live engine state every second
         setInterval(() => {
@@ -694,6 +729,16 @@ ${isTimerWakeup ? '[CRITICAL WAKEUP NOTICE]: Your previously self-scheduled time
             type: 'new_message',
             data: messageObj
         });
+        wsClients.forEach(client => {
+            if (client.readyState === 1 /* WebSocket.OPEN */) {
+                client.send(payload);
+            }
+        });
+    }
+
+    // Sends a raw event object to all connected frontend clients
+    function broadcastEvent(wsClients, eventObj) {
+        const payload = JSON.stringify(eventObj);
         wsClients.forEach(client => {
             if (client.readyState === 1 /* WebSocket.OPEN */) {
                 client.send(payload);
@@ -789,6 +834,29 @@ ${isTimerWakeup ? '[CRITICAL WAKEUP NOTICE]: Your previously self-scheduled time
         await triggerMessage(character, wsClients, false);
     }
 
+    /**
+     * Specialized message trigger for explicit Proactive Tasks (Scheduler DLC)
+     * Injects a specialized system directive to force the AI to output exactly what is asked.
+     */
+    async function triggerProactiveMessage(charId, taskPrompt, wsClients) {
+        const character = db.getCharacter(charId);
+        if (!character || character.is_blocked) return;
+
+        console.log(`[Engine] Proactive task triggered for ${character.name}: ${taskPrompt}`);
+
+        // Emulate a system message at the end of the context to force the AI's hand
+        const sysDirective = `[System Directive: ${taskPrompt} (Respond immediately based on this instruction, but stay in persona)]`;
+
+        // We'll use the existing triggerMessage flow, but we temporarily inject this directive into the chat history just for this prompt
+        // To do this safely without corrupting the DB, we can just intercept the generation. 
+        // For simplicity and to reuse all anti-repeat/affinity logic, we'll actually insert an invisible system message.
+
+        const { id: internalId } = db.addMessage(character.id, 'system', sysDirective);
+        db.hideMessagesByIds(character.id, [internalId]); // Instantly hide it from the user's UI
+
+        await triggerMessage(character, wsClients, false, false, sysDirective);
+    }
+
     // ─── Group Proactive Messaging ───────────────────────────────────────────────
     const groupProactiveTimers = new Map(); // Store group proactive timers { groupId: handle }
     let groupChainCallback = null;
@@ -843,7 +911,7 @@ ${isTimerWakeup ? '[CRITICAL WAKEUP NOTICE]: Your previously self-scheduled time
         const userName = profile?.name || 'User';
         const historyForPrompt = recentMsgs.map(m => {
             const sName = m.sender_id === 'user' ? userName : (db.getCharacter(m.sender_id)?.name || m.sender_name || '?');
-            return { role: m.sender_id === picked.id ? 'assistant' : 'user', content: `[${sName}]: ${m.content}` };
+            return { role: m.sender_id === picked.id ? 'assistant' : 'user', content: `[${sName}]: ${formatMessageForLLM(db, m.content)}` };
         });
 
         const now = new Date();
@@ -929,8 +997,10 @@ ${isTimerWakeup ? '[CRITICAL WAKEUP NOTICE]: Your previously self-scheduled time
         stopTimer,
         handleUserMessage,
         broadcastNewMessage,
+        broadcastEvent,
         broadcastWalletSync,
         triggerJealousyCheck,
+        triggerProactiveMessage,
         startGroupProactiveTimers,
         stopGroupProactiveTimer,
         scheduleGroupProactive,

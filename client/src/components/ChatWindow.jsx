@@ -5,6 +5,7 @@ import TransferModal from './TransferModal';
 import RecommendModal from './RecommendModal';
 import { Send, Smile, Paperclip, Bell, Users, EyeOff, ShieldBan, Trash, BookOpen, Brain, MoreHorizontal, UserPlus, Gift, Heart, UserMinus, ShieldAlert, BadgeInfo, Eye, ChevronLeft } from 'lucide-react';
 import { useLanguage } from '../LanguageContext';
+import { resolveAvatarUrl } from '../utils/avatar';
 
 // Parse /hide 0-xx, /hide xx, /unhide commands
 function parseHideCommand(text) {
@@ -30,7 +31,11 @@ function SystemMessage({ text }) {
     );
 }
 
-function ChatWindow({ contact, allContacts, apiUrl, newIncomingMessage, engineState, onToggleMemo, onToggleDiary, onToggleSettings, userAvatar, onBack }) {
+function ChatWindow({
+    contact, allContacts, apiUrl, incomingMessageQueue, engineState,
+    onToggleMemo, onToggleDiary, onToggleSettings, userAvatar, onBack,
+    onSwitchTab, isGeneratingSchedule, onMessagesChange
+}) {
     const { t, lang } = useLanguage();
     const [messages, setMessages] = useState([]);
     const [isTransferModalOpen, setIsTransferModalOpen] = useState(false);
@@ -70,7 +75,8 @@ function ChatWindow({ contact, allContacts, apiUrl, newIncomingMessage, engineSt
         const oldest = messages[0];
         try {
             const data = await fetch(
-                `${apiUrl} /messages/${contactRef.current?.id}?limit = ${PAGE_SIZE}& before=${oldest.id} `
+                `${apiUrl}/messages/${contactRef.current?.id}?limit=${PAGE_SIZE}&before=${oldest.id}`,
+                { headers: { 'Authorization': `Bearer ${localStorage.getItem('cp_token') || ''}` } }
             ).then(r => r.json());
             if (data.length > 0) {
                 setMessages(prev => [...data, ...prev]);
@@ -84,15 +90,19 @@ function ChatWindow({ contact, allContacts, apiUrl, newIncomingMessage, engineSt
         setLoadingMore(false);
     };
 
-    // Handle new incoming WS messages
+    // Handle new incoming WS messages Queue
     useEffect(() => {
-        if (newIncomingMessage && contact?.id && newIncomingMessage.character_id === contact.id) {
-            setMessages(prev => {
-                if (prev.some(m => m.id === newIncomingMessage.id)) return prev;
-                return [...prev, newIncomingMessage];
-            });
+        if (incomingMessageQueue && incomingMessageQueue.length > 0 && contact?.id) {
+            const relevantMsgs = incomingMessageQueue.filter(m => m.character_id === contact.id);
+            if (relevantMsgs.length > 0) {
+                setMessages(prev => {
+                    const newUnique = relevantMsgs.filter(m => !prev.some(pm => pm.id === m.id));
+                    if (newUnique.length === 0) return prev;
+                    return [...prev, ...newUnique];
+                });
+            }
         }
-    }, [newIncomingMessage, contact?.id]);
+    }, [incomingMessageQueue, contact?.id]);
 
     // Detect when a character goes from unblocked -> blocked mid-session and inject a system message
     useEffect(() => {
@@ -114,6 +124,14 @@ function ChatWindow({ contact, allContacts, apiUrl, newIncomingMessage, engineSt
             messagesEndRef.current.scrollIntoView({ behavior: 'smooth', block: 'end' });
         }
     }, [messages]);
+
+    useEffect(() => {
+        if (onMessagesChange) {
+            const count = messages.filter(m => m.hidden).length;
+            console.log('ChatWindow reporting hidden count:', count);
+            onMessagesChange(count);
+        }
+    }, [messages, onMessagesChange]);
 
     const handleSend = async (text) => {
         const currentContactId = contactRef.current?.id;
@@ -223,6 +241,10 @@ function ChatWindow({ contact, allContacts, apiUrl, newIncomingMessage, engineSt
             alert(lang === 'en' ? 'Network error.' : '网络错误。');
         }
     };
+
+    // No-op string replacement to remove handleClearMemory
+
+
 
     if (!contact) {
         return (
@@ -340,22 +362,29 @@ function ChatWindow({ contact, allContacts, apiUrl, newIncomingMessage, engineSt
                                 <MessageBubble
                                     message={msg}
                                     characterName={contact.name}
-                                    avatar={msg.role === 'character' ? contact.avatar : (userAvatar || 'https://api.dicebear.com/7.x/shapes/svg?seed=User')}
+                                    avatar={msg.role === 'user' ? (userAvatar || 'https://api.dicebear.com/7.x/shapes/svg?seed=User') : (contact.avatar || `https://api.dicebear.com/7.x/shapes/svg?seed=${contact.id}`)}
                                     apiUrl={apiUrl}
                                     onRetry={handleRetry}
+                                    contacts={allContacts}
                                 />
                             </div>
                         </div>
                     );
                 })}
                 {engineState?.[contact.id]?.countdownMs > 0 && engineState?.[contact.id]?.isBlocked !== 1 && (
-                    <div className="message-wrapper character" style={{ marginTop: '10px' }}>
-                        <div className="message-avatar" style={{ visibility: 'hidden' }}>
-                            <img src={contact.avatar} alt="Avatar" />
+                    <div className="message-wrapper character" style={{ marginTop: '10px', opacity: 0.7, transition: 'opacity 0.2s' }}>
+                        <div className="message-avatar">
+                            <img
+                                src={resolveAvatarUrl(contact.avatar, apiUrl)}
+                                style={{ objectFit: 'cover' }}
+                                alt="Avatar"
+                                onError={(e) => { e.target.onerror = null; e.target.src = 'https://api.dicebear.com/7.x/shapes/svg?seed=' + encodeURIComponent(contact.id || 'User'); }}
+                            />
                         </div>
                         <div className="message-content">
-                            <div className="message-bubble" style={{ background: 'transparent', color: '#bbb', boxShadow: 'none', fontStyle: 'italic', padding: 0 }}>
-                                {t('Thinking')} ⏱ {Math.ceil(engineState[contact.id].countdownMs / 1000)}s
+                            <div className="message-bubble" style={{ fontStyle: 'italic', display: 'flex', alignItems: 'center', gap: '8px' }}>
+                                <span style={{ display: 'inline-block', width: '12px', height: '12px', boxSizing: 'border-box', border: '2px solid #ddd', borderTopColor: '#888', borderRadius: '50%', animation: 'spin 1s linear infinite' }}></span>
+                                <span>{t('Thinking')} {Math.ceil(engineState[contact.id].countdownMs / 1000)}s</span>
                             </div>
                         </div>
                     </div>
@@ -441,21 +470,21 @@ function ChatWindow({ contact, allContacts, apiUrl, newIncomingMessage, engineSt
                         const visibleMsgs = messages.filter(m => !m.hidden);
                         const halfCount = Math.floor(visibleMsgs.length / 2);
                         if (halfCount === 0) return;
-                        // Find the indices of the visible messages we want to hide (first half)
-                        // We need to map back to the index in the FULL messages array for the API
-                        const toHideIds = visibleMsgs.slice(0, halfCount).map(m => m.id);
-                        // Find the max index in the full ordered message list for these messages
-                        const lastHideId = toHideIds[toHideIds.length - 1];
-                        const endIdx = messages.findIndex(m => m.id === lastHideId);
-                        if (endIdx < 0) return;
-                        const res = await fetch(`${apiUrl}/messages/${cid}/hide`, {
-                            method: 'POST',
-                            headers: { 'Authorization': `Bearer ${localStorage.getItem('cp_token') || ''}`, 'Content-Type': 'application/json' },
-                            body: JSON.stringify({ startIdx: 0, endIdx })
-                        });
-                        if ((await res.json()).success && contactRef.current?.id === cid) {
-                            const updated = await fetch(`${apiUrl}/messages/${cid}`, { headers: { 'Authorization': `Bearer ${localStorage.getItem('cp_token') || ''}` } }).then(r => r.json());
-                            setMessages(updated);
+                        // Get IDs of messages to hide (first half of visible msgs)
+                        const toHideIds = new Set(visibleMsgs.slice(0, halfCount).map(m => m.id));
+                        try {
+                            const res = await fetch(`${apiUrl}/messages/${cid}/hide`, {
+                                method: 'POST',
+                                headers: { 'Authorization': `Bearer ${localStorage.getItem('cp_token') || ''}`, 'Content-Type': 'application/json' },
+                                body: JSON.stringify({ messageIds: Array.from(toHideIds) })
+                            });
+                            const data = await res.json();
+                            if (data.success && contactRef.current?.id === cid) {
+                                // Update locally instead of refetching — preserves hasMore and pagination
+                                setMessages(prev => prev.map(m => toHideIds.has(m.id) ? { ...m, hidden: 1 } : m));
+                            }
+                        } catch (e) {
+                            console.error('Failed to hide old messages:', e);
                         }
                     }}
                 />

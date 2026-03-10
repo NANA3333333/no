@@ -313,10 +313,22 @@ app.get('/api/characters', authMiddleware, (req, res) => {
     const wsClients = getWsClients(req.user.id);
     try {
         const characters = db.getCharacters();
+
+        // Ensure city DB is attached for inventory queries
+        if (!db.city) {
+            try {
+                const initCityDb = require('./plugins/city/cityDb');
+                db.city = initCityDb(typeof db.getRawDb === 'function' ? db.getRawDb() : db);
+            } catch (e) {
+                // City DLC not found or failed to load
+            }
+        }
+
         // Attach unread_count so the frontend can initialise badges correctly on load/refresh
         const enriched = characters.map(c => ({
             ...c,
-            unread_count: db.getUnreadCount(c.id)
+            unread_count: db.getUnreadCount(c.id),
+            inventory: typeof db.city?.getInventory === 'function' ? db.city.getInventory(c.id) : []
         }));
         res.json(enriched);
     } catch (e) {
@@ -335,11 +347,26 @@ app.post('/api/characters', authMiddleware, (req, res) => {
         if (!data.id || !data.name) return res.status(400).json({ error: 'Missing ID or Name' });
 
         db.updateCharacter(data.id, data);
-        // Restart their engine timer by mimicking a user interaction / simple restart
+        // Reset proactive timer after settings change (do NOT call handleUserMessage —
+        // that would echo the character's own last message back to the AI as user input)
         engine.stopTimer(data.id);
-        engine.handleUserMessage(data.id, wsClients);
 
         res.json({ success: true, character: db.getCharacter(data.id) });
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
+// 2.1 Update Character Fields (Partial)
+app.put('/api/characters/:id', authMiddleware, (req, res) => {
+    const db = req.db;
+    try {
+        const id = req.params.id;
+        const data = req.body;
+        if (!id) return res.status(400).json({ error: 'Missing ID' });
+
+        db.updateCharacter(id, data);
+        res.json({ success: true, character: db.getCharacter(id) });
     } catch (e) {
         res.status(500).json({ error: e.message });
     }
@@ -951,6 +978,20 @@ app.get('/api/diaries/:characterId', authMiddleware, (req, res) => {
     }
 });
 
+// 9.5 Delete a Diary Entry
+app.delete('/api/diaries/:id', authMiddleware, (req, res) => {
+    const db = req.db;
+    try {
+        if (typeof db.deleteDiary !== 'function') {
+            return res.status(501).json({ error: 'Not implemented' });
+        }
+        db.deleteDiary(req.params.id);
+        res.json({ success: true });
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
 // 10. Unlock Diaries for a Character (Password-lock mechanic)
 app.post('/api/diaries/:characterId/unlock', authMiddleware, (req, res) => {
     const db = req.db;
@@ -971,19 +1012,22 @@ app.post('/api/diaries/:characterId/unlock', authMiddleware, (req, res) => {
     }
 });
 
-// 10.5 Hide a range of messages for a character (context hide mechanic)
-// Body: { startIdx: 0, endIdx: 10 } — 0-based indices from oldest message
+// 10.5 Hide an array of messages for a character (context hide mechanic)
 app.post('/api/messages/:characterId/hide', authMiddleware, (req, res) => {
     const db = req.db;
     const engine = req.engine;
     const memory = req.memory;
     const wsClients = getWsClients(req.user.id);
     try {
-        const { startIdx, endIdx } = req.body;
-        if (startIdx === undefined || endIdx === undefined) {
-            return res.status(400).json({ error: 'Missing startIdx or endIdx' });
+        const { messageIds, startIdx, endIdx } = req.body;
+        let count = 0;
+        if (messageIds && Array.isArray(messageIds)) {
+            count = db.hideMessagesByIds(req.params.characterId, messageIds);
+        } else if (startIdx !== undefined && endIdx !== undefined) {
+            count = db.hideMessagesByRange(req.params.characterId, Number(startIdx), Number(endIdx));
+        } else {
+            return res.status(400).json({ error: 'Missing startIdx/endIdx or messageIds' });
         }
-        const count = db.hideMessagesByRange(req.params.characterId, Number(startIdx), Number(endIdx));
         res.json({ success: true, hidden: count });
     } catch (e) {
         res.status(500).json({ error: e.message });
@@ -1039,6 +1083,58 @@ app.put('/api/user', authMiddleware, (req, res) => {
 // 11.5 Theme Generation Helper & 11.6 AI Theme Generation
 // ── MOVED TO DLC: server/plugins/theme/index.js ──
 
+// 11.8 Context Token Stats
+app.get('/api/characters/:id/context-stats', authMiddleware, async (req, res) => {
+    const db = req.db;
+    try {
+        const charId = req.params.id;
+        const character = db.getCharacter(charId);
+        if (!character) return res.status(404).json({ error: 'Character not found' });
+
+        const { getUserDb } = require('./db');
+        const { getMemory } = require('./memory');
+        const engineContextWrapper = { getUserDb, getMemory, userId: req.user.id };
+
+        // relationships exist in the DLC, so fallback to just friends or a raw DB query if method doesn't exist
+        const isDlcActive = typeof db.getCharRelationships === 'function';
+        const relationships = isDlcActive ? db.getCharRelationships(charId) : db.getCharacters().filter(c => c.id !== charId);
+        const activeTargets = relationships.map(r => isDlcActive ? db.getCharacter(r.target_id || r.targetId) : r).filter(Boolean).slice(0, 5);
+
+        // Initialize City DLC if not already attached to this request's db instance
+        if (!db.city) {
+            try {
+                const initCityDb = require('./plugins/city/cityDb');
+                db.city = initCityDb(typeof db.getRawDb === 'function' ? db.getRawDb() : db);
+            } catch (e) { }
+        }
+
+        const { buildUniversalContext } = require('./contextBuilder');
+        const { breakdown } = await buildUniversalContext(engineContextWrapper, character, '', false, activeTargets);
+
+        // Calculate X (Recent Chat History - default 20)
+        // Filter out hidden messages matching the engine's behavior
+        const recentMsgs = db.getMessages(charId, 20).filter(m => m.hidden !== 1 && m.hidden !== true);
+        let x_chat_len = 0;
+        recentMsgs.forEach(m => x_chat_len += (m.content || '').length);
+        breakdown.x_chat = Math.ceil(x_chat_len / 2);
+
+        // Include W sweep limit info M
+        const unsummarizedCount = db.countUnsummarizedMessages ? db.countUnsummarizedMessages(charId, 0) : 0;
+
+        res.json({
+            success: true,
+            stats: {
+                ...breakdown,
+                w_unsummarized_count: unsummarizedCount,
+                w_sweep_limit: character.sweep_limit || 30
+            }
+        });
+    } catch (e) {
+        console.error('[API] Context Stats error:', e.message);
+        res.status(500).json({ error: e.message });
+    }
+});
+
 // 12. Delete Character
 app.delete('/api/characters/:id', authMiddleware, async (req, res) => {
     const db = req.db;
@@ -1079,8 +1175,7 @@ app.delete('/api/characters/:id', authMiddleware, async (req, res) => {
         db.deleteCharacter(charId);
 
         // 5. Notify frontend
-        engine.broadcastNewMessage(wsClients, { type: 'character_deleted', characterId: charId });
-
+        engine.broadcastEvent?.(wsClients, { type: 'character_deleted', characterId: charId });
         res.json({ success: true });
     } catch (e) {
         console.error('[Delete] Error deleting character:', e.message);
@@ -1098,7 +1193,7 @@ app.delete('/api/characters/:id', authMiddleware, async (req, res) => {
 // ─────────────────────────────────────────────────────────────
 // Serve React Frontend (Production)
 // ─────────────────────────────────────────────────────────────
-const clientDistPath = path.join(__dirname, '../client/dist');
+const clientDistPath = path.join(__dirname, 'public');
 app.use(express.static(clientDistPath));
 
 // Catch-all route to serve the React app for any unhandled paths (client-side routing)

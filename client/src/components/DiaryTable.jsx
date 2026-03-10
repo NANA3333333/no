@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { BookOpen, X, Lock, KeyRound, Eye } from 'lucide-react';
+import { BookOpen, X, Lock, KeyRound, Eye, Trash2 } from 'lucide-react';
 import { useLanguage } from '../LanguageContext';
 
 function DiaryTable({ contact, apiUrl, onClose }) {
@@ -53,6 +53,21 @@ function DiaryTable({ contact, apiUrl, onClose }) {
             setPwError('Network error. Try again.');
         }
         setPwLoading(false);
+    };
+
+    const handleDelete = async (diaryId) => {
+        if (!confirm(lang === 'en' ? 'Delete this diary entry?' : '确认删除这篇日记吗？')) return;
+        try {
+            const res = await fetch(`${apiUrl}/diaries/${diaryId}`, {
+                method: 'DELETE',
+                headers: { 'Authorization': `Bearer ${localStorage.getItem('token')}` }
+            });
+            if (res.ok) {
+                setDiaries(prev => prev.filter(d => d.id !== diaryId));
+            }
+        } catch (e) {
+            console.error('Failed to delete diary:', e);
+        }
     };
 
     return (
@@ -130,9 +145,18 @@ function DiaryTable({ contact, apiUrl, onClose }) {
                                 backgroundColor: '#fff', border: '1px solid #eee', borderRadius: '8px',
                                 padding: '15px', marginBottom: '15px', boxShadow: '0 2px 5px rgba(0,0,0,0.02)'
                             }}>
-                                <div className="diary-meta" style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '10px', color: '#999', fontSize: '13px' }}>
-                                    <span>{dateStr} {timeStr}</span>
-                                    {diary.emotion && <span style={{ textTransform: 'capitalize' }}>{diary.emotion}</span>}
+                                <div className="diary-meta" style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '10px', color: '#999', fontSize: '13px', alignItems: 'center' }}>
+                                    <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
+                                        <span>{dateStr} {timeStr}</span>
+                                        {diary.emotion && <span style={{ textTransform: 'capitalize' }}>{diary.emotion}</span>}
+                                    </div>
+                                    <button
+                                        onClick={() => handleDelete(diary.id)}
+                                        style={{ background: 'none', border: 'none', cursor: 'pointer', color: '#ccc', padding: '2px', display: 'flex' }}
+                                        title={lang === 'en' ? 'Delete' : '删除'}
+                                    >
+                                        <Trash2 size={14} />
+                                    </button>
                                 </div>
                                 <div className="diary-content" style={{ color: '#333', lineHeight: '1.6', fontSize: '15px', whiteSpace: 'pre-wrap' }}>
                                     {diary.content}

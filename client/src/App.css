@@ -414,6 +414,15 @@ body {
   background-size: 24px 24px;
 }
 
+.message-info {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 5px;
+  margin-bottom: 5px;
+  max-width: 80%;
+}
+
 .message-wrapper {
   display: flex;
   align-items: flex-start;
@@ -1226,6 +1235,7 @@ body {
     display: flex;
   }
 }
+
 /*  Modals  */
 .modal-overlay {
   position: fixed;
@@ -1251,4 +1261,3 @@ body {
   display: flex;
   flex-direction: column;
 }
-

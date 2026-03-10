@@ -29,7 +29,18 @@ function MemoTable({ contact, apiUrl, onClose }) {
 
     useEffect(() => {
         fetchMemories();
-    }, [fetchMemories]);
+
+        const handleMemoryUpdate = (event) => {
+            if (contact && event.detail.characterId === contact.id) {
+                console.log(`[MemoTable] Real-time memory update for ${contact.name}`);
+                fetchMemories();
+            }
+        };
+
+        window.addEventListener('memory_update', handleMemoryUpdate);
+
+        return () => window.removeEventListener('memory_update', handleMemoryUpdate);
+    }, [contact, fetchMemories]);
 
     const handleDelete = async (id) => {
         try {

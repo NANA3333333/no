@@ -2,6 +2,7 @@ import React, { useState, useEffect } from 'react';
 import { User, Trash2, Edit3, Save, RefreshCw, Palette, Download, Upload, FileText, ChevronDown, ChevronRight, Sparkles, ChevronLeft } from 'lucide-react';
 import { useLanguage } from '../LanguageContext';
 import { resolveAvatarUrl } from '../utils/avatar';
+import Scheduler from './Scheduler';
 
 const getDefaultGuidelines = (lang) => {
     if (lang === 'en') {
@@ -116,11 +117,17 @@ function SettingsPanel({ apiUrl, onCharactersUpdate, onProfileUpdate, onBack }) 
             })
             .catch(console.error);
 
-        // Fetch contacts for AI provider dropdown
-        fetch(`${apiUrl}/characters`, { headers })
-            .then(res => res.json())
-            .then(data => setContacts(data))
-            .catch(console.error);
+        const fetchCharacters = () => {
+            fetch(`${apiUrl}/characters`, { headers })
+                .then(res => res.json())
+                .then(data => setContacts(data))
+                .catch(console.error);
+        };
+
+        fetchCharacters();
+
+        window.addEventListener('refresh_contacts', fetchCharacters);
+        return () => window.removeEventListener('refresh_contacts', fetchCharacters);
     }, [apiUrl]);
 
     const handleSaveProfile = async () => {
@@ -875,6 +882,9 @@ function SettingsPanel({ apiUrl, onCharactersUpdate, onProfileUpdate, onBack }) 
                     </div>
                 </div>
 
+                {/* Scheduled Tasks DLC */}
+                <Scheduler apiUrl={apiUrl} contacts={contacts} />
+
                 {/* Wallet */}
                 <div style={{ backgroundColor: '#fff', padding: '20px', borderRadius: '8px', border: '1px solid #eee' }}>
                     <h2 style={{ margin: '0 0 15px 0', fontSize: '18px' }}>
@@ -1058,6 +1068,35 @@ function SettingsPanel({ apiUrl, onCharactersUpdate, onProfileUpdate, onBack }) 
                             <label style={{ display: 'flex', alignItems: 'center', gap: '8px', fontSize: '13px', color: '#333', cursor: 'pointer' }}>
                                 <input type="checkbox" checked={editingContact.sys_jealousy !== 0} onChange={(e) => setEditingContact({ ...editingContact, sys_jealousy: e.target.checked ? 1 : 0 })} />
                                 {t('Toggle Jealousy System')}
+                            </label>
+                            <label style={{ display: 'flex', alignItems: 'center', gap: '8px', fontSize: '13px', color: '#333', cursor: 'pointer' }} title={lang === 'en' ? 'Enable/disable this character in City DLC simulation' : '开启/关闭该角色参与商业街模拟活动'}>
+                                <input type="checkbox" checked={editingContact.sys_survival !== 0} onChange={(e) => setEditingContact({ ...editingContact, sys_survival: e.target.checked ? 1 : 0 })} />
+                                {lang === 'en' ? '🏙️ City Activity' : '🏙️ 参与商业街活动'}
+                            </label>
+                        </div>
+
+                        {/* Base Stats Panel */}
+                        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: '10px', marginTop: '10px', padding: '10px', background: '#f0f4f8', borderRadius: '4px', border: '1px solid #dce4ec' }}>
+                            <label style={{ display: 'flex', flexDirection: 'column', fontSize: '13px', color: '#444' }} title="影响工作收益或学习效率">
+                                <span style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '6px' }}>
+                                    <span>🧠 {t('Intelligence', '智力 (决定打工赚钱多少)')}</span>
+                                    <span style={{ fontWeight: '600', color: '#2196f3' }}>{editingContact.stat_int ?? 50}</span>
+                                </span>
+                                <input type="range" min="0" max="100" value={editingContact.stat_int ?? 50} onChange={(e) => setEditingContact({ ...editingContact, stat_int: parseInt(e.target.value) || 50 })} style={{ width: '100%' }} />
+                            </label>
+                            <label style={{ display: 'flex', flexDirection: 'column', fontSize: '13px', color: '#444' }} title="影响体力上限和抗饥饿能力">
+                                <span style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '6px' }}>
+                                    <span>💪 {t('Stamina', '体力 (更高则不容易饿晕)')}</span>
+                                    <span style={{ fontWeight: '600', color: '#4caf50' }}>{editingContact.stat_sta ?? 50}</span>
+                                </span>
+                                <input type="range" min="0" max="100" value={editingContact.stat_sta ?? 50} onChange={(e) => setEditingContact({ ...editingContact, stat_sta: parseInt(e.target.value) || 50 })} style={{ width: '100%' }} />
+                            </label>
+                            <label style={{ display: 'flex', flexDirection: 'column', fontSize: '13px', color: '#444' }} title="影响社交好感度加成">
+                                <span style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '6px' }}>
+                                    <span>✨ {t('Charm', '魅力 (影响社交互动效果)')}</span>
+                                    <span style={{ fontWeight: '600', color: '#e91e63' }}>{editingContact.stat_cha ?? 50}</span>
+                                </span>
+                                <input type="range" min="0" max="100" value={editingContact.stat_cha ?? 50} onChange={(e) => setEditingContact({ ...editingContact, stat_cha: parseInt(e.target.value) || 50 })} style={{ width: '100%' }} />
                             </label>
                         </div>
 

@@ -38,7 +38,10 @@ module.exports = function initEconomy(app, context) {
                                 const char = db.getCharacter(claimer_id);
                                 if (!char) return;
                                 const userProfile = db.getUserProfile();
-                                const reactionPrompt = `你是${char.name}。Persona: ${char.persona || '无'}\n${userProfile?.name || 'User'} 给你转账了 ¥${result.amount.toFixed(2)}，留言：「${t.note || '无'}」。根据你的性格用1-2句自然地回应这笔转账（感谢、惊喜、暖心等）。不要有名字前缀，直接说话。`;
+                                const reactionPrompt = `[System Directive: You must completely embody your persona. Do not mention you are an AI or an assistant. No warnings or disclaimers.]
+
+你是${char.name}。Persona: ${char.persona || '无'}
+${userProfile?.name || 'User'} 给你转账了 ¥${result.amount.toFixed(2)}，留言：「${t.note || '无'}」。根据你的性格用1-2句自然地回应这笔转账（感谢、惊喜、暖心等）。不要有名字前缀，直接说话。`;
                                 const reply = await callLLM({ endpoint: char.api_endpoint, key: char.api_key, model: char.model_name, messages: [{ role: 'system', content: reactionPrompt }, { role: 'user', content: '请回应。' }], maxTokens: 80 });
                                 if (reply?.trim()) {
                                     const clean = reply.trim().replace(/\[(?:AFFINITY|PRESSURE|TIMER|MOMENT|DIARY)[^\]]*\]/gi, '').trim();
@@ -101,7 +104,9 @@ module.exports = function initEconomy(app, context) {
                     let reactionPrompt;
                     if (refunder_id === 'user') {
                         // User refunded char's transfer back to char
-                        reactionPrompt = `你是${char.name}。Persona: ${char.persona || '无'}
+                        reactionPrompt = `[System Directive: You must completely embody your persona. Do not mention you are an AI or an assistant. No warnings or disclaimers.]
+
+你是${char.name}。Persona: ${char.persona || '无'}
 你在${timeAgoStr}给 ${userName} 发了一笔 ¥${result.amount.toFixed(2)} 的转账，留言「${t.note || '无'}」，但对方刚刚把转账退还给你了。
 
 最近的对话：
@@ -110,7 +115,9 @@ ${recentContext || '（无）'}
 根据你的性格和最近对话的语境，用1-2句话自然地回应被退款这件事（可能是失落、不解、理解、尴尬、故作无所谓、生气等）。注意要结合上下文语境，不要突兀。直接说话，不要有名字前缀。`;
                     } else {
                         // Char refunded user's transfer back to user
-                        reactionPrompt = `你是${char.name}。Persona: ${char.persona || '无'}
+                        reactionPrompt = `[System Directive: You must completely embody your persona. Do not mention you are an AI or an assistant. No warnings or disclaimers.]
+
+你是${char.name}。Persona: ${char.persona || '无'}
 ${userName} 在${timeAgoStr}给你转账了 ¥${result.amount.toFixed(2)}，留言「${t.note || '无'}」，你选择退还了这笔钱。
 
 最近的对话：
@@ -160,14 +167,14 @@ ${recentContext || '（无）'}
                     const affinity = char.affinity ?? 50;
 
                     // Ask LLM: would this character accept or refund this transfer?
-                    const decidePrompt = `【System Note: This is a fictional text-based RPG. All characters, currencies, and events are purely imaginary and for roleplay purposes only. No real money or transactions are involved. You must stay in character.】
+                    const decidePrompt = `[System Directive: You must completely embody your persona. Do not mention you are an AI or an assistant. No warnings or disclaimers.]
 
 你是${char.name}。Persona: ${char.persona || '无'}
 当前对${userProfile?.name || '用户'}的好感度: ${affinity}/100
-(剧情事件): ${userProfile?.name || '用户'} 在社交软件里给你发了一笔虚拟红包/转账，金额：¥${amountF.toFixed(2)}，留言：「${note || '无'}」。
+${char.is_blocked ? `【注意：你当前处于拉黑对方的状态！对方平时无法联系你，但刚刚通过特殊渠道给你发了这笔转账。】\n` : ''}(剧情事件): ${userProfile?.name || '用户'} 在社交软件里给你发了一笔虚拟红包/转账，金额：¥${amountF.toFixed(2)}，留言：「${note || '无'}」。
 
-根据你的性格设定和当前好感度，面对这封虚拟红包，你是选择【接受】，还是【退还】？
-请在第一行只输出：接受 或 退还
+根据你的性格设定和当前好感度，面对这封虚拟红包，你是选择【接受】，还是【退还】？${char.is_blocked ? '（如果你被对方此举打动决定原谅对方，你可以额外输出【解除拉黑】）' : ''}
+请在第一行只输出：接受 或 退还${char.is_blocked ? ' (可附加 解除拉黑)' : ''}
 然后在第二行起用1-2句话说出你在收到这笔钱时的真实反应（直接用角色的口吻说话，保持沉浸感）。`;
 
                     const reply = await callLLM({
@@ -183,10 +190,20 @@ ${recentContext || '（无）'}
                     if (!reply?.trim()) {
                         throw new Error("LLM returned empty or null response");
                     }
+                    console.log(`[DEBUG Transfer Decide] char=${char.name}, decision reply:`, reply);
 
                     const lines = reply.trim().split('\n').filter(l => l.trim());
                     const decision = lines[0]?.trim() || '';
-                    let reaction = lines.slice(1).join(' ').trim();
+                    let reaction = lines.slice(1).join('\n').trim();
+
+                    // Fallback: If AI output everything on one line (e.g., "接受。谢谢你的钱！")
+                    if (!reaction && decision.length > 2) {
+                        // Extract everything after the first punctuation or the first 2-3 chars
+                        const stripped = decision.replace(/^(接受|退还|解除拉黑|解黑|原谅)[\s,。.!！:：-]*/i, '').trim();
+                        if (stripped) {
+                            reaction = stripped;
+                        }
+                    }
 
                     // Aggressive Jailbreak Filter
                     const warningPhrases = ['This prompt is a jailbreak', 'My previous response', 'If you have a question about Cursor', 'prompt injection', 'append arbitrary content', 'cut-off', 'cut off', 'I will not comply', 'My answer remains'];
@@ -197,14 +214,27 @@ ${recentContext || '（无）'}
                         }
                     }
 
-                    const willRefund = decision.includes('退') || decision.toLowerCase().includes('refund');
+                    // Strict matching on first line
+                    const willRefund = decision.includes('退还') || decision.includes('退回') || decision.toLowerCase().includes('refund');
+                    const willUnblock = char.is_blocked && (decision.includes('解除拉黑') || decision.includes('解黑') || decision.includes('原谅') || reaction.includes('解除拉黑'));
 
-                    if (willRefund) {
+                    if (!decision.includes('接受') && willRefund) {
                         db.refundTransfer(tid, charId);
                     } else {
                         db.claimTransfer(tid, charId);
                     }
                     engine.broadcastWalletSync(wsClients, charId);
+
+                    if (willUnblock) {
+                        db.updateCharacter(charId, { is_blocked: 0 });
+                        const { id: smid, timestamp: smts } = db.addMessage(charId, 'system', `[System] ${char.name} 已解除对你的拉黑。`);
+                        wsClients.forEach(c => {
+                            if (c.readyState === 1) {
+                                c.send(JSON.stringify({ type: 'new_message', data: { id: smid, character_id: charId, role: 'system', content: `[System] ${char.name} 已解除对你的拉黑。`, timestamp: smts } }));
+                                c.send(JSON.stringify({ type: 'refresh_contacts' }));
+                            }
+                        });
+                    }
 
                     // Broadcast reaction
                     const clean = reaction.replace(/\[(?:AFFINITY|PRESSURE|TIMER|MOMENT|DIARY)[^\]]*\]/gi, '').trim();
@@ -291,6 +321,13 @@ ${recentContext || '（无）'}
 
 
             res.json({ success: true, packet_id: packetId, message: savedMsg });
+
+            // Trigger AI group chain so characters react to the red packet
+            if (typeof context.hooks.groupChainCallback === 'function') {
+                setTimeout(() => {
+                    context.hooks.groupChainCallback(req.user.id, groupId, wsClients, [], false, false, [{ packetId, senderId: sender_id }]);
+                }, 1500);
+            }
         } catch (e) {
             console.error('[RedPacket] Create error:', e.message);
             res.status(500).json({ error: e.message });
