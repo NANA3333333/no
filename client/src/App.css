@@ -1181,30 +1181,60 @@ body {
   }
 
   .sidebar-nav {
-    flex-direction: row;
     width: 100%;
+    min-height: 55px;
     height: 55px;
-    padding: 0 15px;
-    justify-content: space-between;
+    padding: 0 8px;
+    justify-content: flex-start;
     align-items: center;
     order: 2;
+    gap: 10px;
+    overflow-x: auto;
+    overflow-y: hidden;
+    -ms-overflow-style: none;
+    scrollbar-width: none;
+  }
+
+  .sidebar-nav::-webkit-scrollbar {
+    display: none;
   }
 
   .nav-icons {
     flex-direction: row;
-    gap: 20px;
+    gap: 8px;
     margin: 0;
+    width: auto;
+    flex-wrap: nowrap;
+    align-items: center;
+    flex: 0 0 auto;
   }
 
-  .nav-icons-bottom,
-  .my-avatar img {
+  .nav-icons-bottom {
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    gap: 8px;
     margin: 0;
-    margin-bottom: 0;
+    margin-left: 2px;
+    flex: 0 0 auto;
+  }
+
+  .nav-icon {
+    flex: 0 0 auto;
+    min-width: 40px;
+    min-height: 40px;
+    padding: 8px;
+  }
+
+  .my-avatar {
+    flex: 0 0 auto;
   }
 
   .my-avatar img {
     width: 35px;
     height: 35px;
+    margin: 0;
+    margin-bottom: 0;
   }
 
   /* When viewing the list (Contacts / Chat List) */
@@ -1237,6 +1267,70 @@ body {
 
   .mobile-back-btn {
     display: flex;
+  }
+
+  .chat-header {
+    padding: 0 10px;
+    gap: 8px;
+  }
+
+  .chat-header-name {
+    font-size: 14px;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .chat-header-actions {
+    gap: 4px;
+    flex-shrink: 0;
+  }
+
+  .chat-header-actions button {
+    padding: 4px;
+  }
+
+  .middle-column {
+    min-width: 0;
+  }
+
+  .contact-item {
+    padding: 10px 12px;
+  }
+
+  .contact-name {
+    font-size: 13px;
+  }
+
+  .contact-last-msg {
+    font-size: 11px;
+  }
+
+  .moments-cover {
+    height: 180px;
+  }
+
+  .moments-cover-user {
+    right: 12px;
+    bottom: -14px;
+  }
+
+  .moments-cover-name {
+    font-size: 14px;
+    max-width: 140px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .moments-cover-avatar {
+    width: 46px;
+    height: 46px;
+  }
+
+  .moments-list {
+    padding: 12px;
   }
 }
 
