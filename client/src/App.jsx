@@ -49,6 +49,8 @@ function App() {
   const [hasNewMoments, setHasNewMoments] = useState(false); // Moments notification
   const [generatingSchedules, setGeneratingSchedules] = useState({});
   const [hiddenMessagesCount, setHiddenMessagesCount] = useState(0);
+  const effectiveUser = { ...(authUser || {}), ...(userProfile || {}) };
+  const visiblePlugins = plugins.filter(p => !p.condition || p.condition(effectiveUser));
 
   console.log('App render hiddenCount:', hiddenMessagesCount);
 
@@ -351,6 +353,13 @@ function App() {
     }
   }, [userProfile]);
 
+  useEffect(() => {
+    const activePlugin = plugins.find(p => p.id === activeTab);
+    if (activePlugin && activePlugin.condition && !activePlugin.condition(effectiveUser)) {
+      setActiveTab('chats');
+    }
+  }, [activeTab, effectiveUser]);
+
   const isViewingList = (activeTab === 'contacts' || (activeTab === 'chats' && !activeContactId && !activeGroupId));
 
   if (!token) {
@@ -377,7 +386,7 @@ function App() {
       {/* 1. Very Left Sidebar (Navigation) */}
       <nav className="sidebar-nav">
         <div className="my-avatar" onClick={() => setActiveTab('settings')} style={{ cursor: 'pointer' }}>
-          <img src={resolveAvatarUrl(userProfile?.avatar, API_URL) || "https://api.dicebear.com/7.x/shapes/svg?seed=User"} alt="Me" />
+          <img src={resolveAvatarUrl(effectiveUser?.avatar, API_URL) || "https://api.dicebear.com/7.x/shapes/svg?seed=User"} alt="Me" />
         </div>
         <div className="nav-icons">
           <button className={`nav-icon ${activeTab === 'chats' ? 'active' : ''}`} onClick={() => setActiveTab('chats')} title={lang === 'en' ? 'Chats — View conversations' : '聊天 — 查看会话列表'}>
@@ -399,7 +408,7 @@ function App() {
           <button className={`nav-icon ${activeTab === 'settings' ? 'active' : ''}`} onClick={() => setActiveTab('settings')} title={lang === 'en' ? 'Settings — Global configuration' : '设置 — 全局设置'}>
             <Settings size={24} />
           </button>
-          {plugins.filter(p => !p.condition || p.condition(userProfile)).map(Plugin => {
+          {visiblePlugins.map(Plugin => {
             const Icon = Plugin.icon;
             return (
               <button key={Plugin.id} className={`nav-icon ${activeTab === Plugin.id ? 'active' : ''}`} onClick={() => setActiveTab(Plugin.id)} title={lang === 'en' ? Plugin.name_en : Plugin.name_zh} style={{ color: Plugin.color || 'inherit' }}>
@@ -553,12 +562,12 @@ function App() {
       {/* 3. Right Column (Chat Area / Content) — hidden on contacts tab */}
       {activeTab !== 'contacts' && (
         <div className="right-column" style={{ flexDirection: 'row', backgroundColor: activeTab === 'settings' ? '#f5f5f5' : '#fff' }}>
-          {(plugins.find(p => p.id === activeTab) && (!plugins.find(p => p.id === activeTab).condition || plugins.find(p => p.id === activeTab).condition(userProfile))) ? (() => {
-            const Plugin = plugins.find(p => p.id === activeTab);
+          {(visiblePlugins.find(p => p.id === activeTab)) ? (() => {
+            const Plugin = visiblePlugins.find(p => p.id === activeTab);
             const PluginComponent = Plugin.component;
             return (
               <div style={{ flex: 1, height: '100%', overflowY: 'auto', minWidth: 0, minHeight: 0 }}>
-                <PluginComponent apiUrl={API_URL} userProfile={userProfile} />
+                <PluginComponent apiUrl={API_URL} userProfile={effectiveUser} />
               </div>
             );
           })() : activeTab === 'settings' ? (
@@ -575,7 +584,7 @@ function App() {
             </div>
           ) : activeTab === 'discover' ? (
             <div style={{ flex: 1, height: '100%', overflowY: 'auto', minWidth: 0, minHeight: 0 }}>
-              <MomentsFeed apiUrl={API_URL} userProfile={userProfile} onBack={() => setActiveTab('chats')} />
+              <MomentsFeed apiUrl={API_URL} userProfile={effectiveUser} onBack={() => setActiveTab('chats')} />
             </div>
           ) : activeContactId && activeTab === 'chats' ? (
             <div style={{ flex: 1, display: 'flex', flexDirection: 'row', height: '100%', minWidth: 0 }}>
@@ -583,7 +592,7 @@ function App() {
                 <ChatWindow
                   contact={contacts.find(c => c.id === activeContactId) || activeContactSnapshot}
                   allContacts={contacts}
-                  userAvatar={userProfile?.avatar}
+                  userAvatar={effectiveUser?.avatar}
                   apiUrl={API_URL}
                   incomingMessageQueue={incomingMessageQueue}
                   engineState={engineState}
@@ -630,7 +639,7 @@ function App() {
                 group={groups.find(g => g.id === activeGroupId)}
                 apiUrl={API_URL}
                 allContacts={contacts}
-                userProfile={userProfile}
+                userProfile={effectiveUser}
                 incomingGroupMessageQueue={incomingGroupMessageQueue}
                 typingIndicators={groupTyping[activeGroupId] || []}
                 redpacketClaimEvent={redpacketClaimEvent}

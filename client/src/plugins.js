@@ -11,7 +11,7 @@ export const plugins = [
         icon: Shield,
         component: AdminDashboard,
         color: 'var(--accent-color)',
-        condition: (userProfile) => userProfile?.username === 'Nana',
+        condition: (userProfile) => userProfile?.role === 'root' || userProfile?.role === 'admin',
         position: 'bottom'
     },
     {

@@ -178,7 +178,23 @@ const authMiddleware = (req, res, next) => {
     const token = authHeader.split(' ')[1];
     try {
         const decoded = jwt.verify(token, JWT_SECRET);
-        req.user = decoded;
+        const authUser = authDb.getUserById(decoded.id);
+        if (!authUser) {
+            return res.status(401).json({ error: 'Invalid token' });
+        }
+        if (authUser.status === 'banned') {
+            return res.status(403).json({ error: 'Account banned' });
+        }
+        if (Number(decoded.tokenVersion ?? 0) !== Number(authUser.token_version ?? 0)) {
+            return res.status(401).json({ error: 'Session expired' });
+        }
+        req.user = {
+            id: authUser.id,
+            username: authUser.username,
+            role: authUser.role || decoded.role || 'user',
+            status: authUser.status || 'active',
+            tokenVersion: authUser.token_version || 0
+        };
         authDb.updateLastActive(req.user.id);
         req.db = getUserDb(req.user.id);
         req.engine = getEngine(req.user.id);
@@ -221,7 +237,7 @@ app.post('/api/auth/register', authLimiter, (req, res) => {
         if (!username || !password) return res.status(400).json({ error: 'Missing username or password' });
         const result = authDb.createUser(username, password, inviteCode);
         if (!result.success) return res.status(400).json({ error: result.error });
-        const token = jwt.sign({ id: result.user.id, username: result.user.username }, JWT_SECRET, { expiresIn: '30d' });
+        const token = jwt.sign({ id: result.user.id, username: result.user.username, role: result.user.role, tokenVersion: result.user.tokenVersion || 0 }, JWT_SECRET, { expiresIn: '30d' });
         getUserDb(result.user.id);
         res.json({ success: true, token, user: result.user });
     } catch (e) {
@@ -234,7 +250,7 @@ app.post('/api/auth/login', authLimiter, (req, res) => {
         const { username, password } = req.body;
         const result = authDb.verifyUser(username, password);
         if (!result.success) return res.status(401).json({ error: result.error });
-        const token = jwt.sign({ id: result.user.id, username: result.user.username }, JWT_SECRET, { expiresIn: '30d' });
+        const token = jwt.sign({ id: result.user.id, username: result.user.username, role: result.user.role, tokenVersion: result.user.tokenVersion || 0 }, JWT_SECRET, { expiresIn: '30d' });
         getUserDb(result.user.id);
         res.json({ success: true, token, user: result.user });
     } catch (e) {
@@ -296,7 +312,7 @@ app.get('/api/user', authMiddleware, (req, res) => {
     const db = req.db;
     try {
         const profile = typeof db.getUserProfile === 'function' ? db.getUserProfile() : null;
-        res.json({ ...(profile || { name: req.user.username }), username: req.user.username });
+        res.json({ ...(profile || { name: req.user.username }), username: req.user.username, role: req.user.role || 'user' });
     } catch (e) {
         res.status(500).json({ error: e.message });
     }
@@ -310,7 +326,7 @@ app.post('/api/user', authMiddleware, (req, res) => {
             db.updateUserProfile(req.body);
         }
         const updatedProfile = typeof db.getUserProfile === 'function' ? db.getUserProfile() : null;
-        res.json({ success: true, profile: { ...(updatedProfile || { name: req.user.username }), username: req.user.username } });
+        res.json({ success: true, profile: { ...(updatedProfile || { name: req.user.username }), username: req.user.username, role: req.user.role || 'user' } });
     } catch (e) {
         res.status(500).json({ error: e.message });
     }
@@ -1085,7 +1101,7 @@ app.put('/api/user', authMiddleware, (req, res) => {
         if (proactiveKeys.some(k => k in req.body)) {
             engine.startGroupProactiveTimers(wsClients);
         }
-        res.json({ success: true, profile: db.getUserProfile() });
+        res.json({ success: true, profile: { ...(db.getUserProfile() || {}), username: req.user.username, role: req.user.role || 'user' } });
     } catch (e) {
         res.status(500).json({ error: e.message });
     }

@@ -50,7 +50,7 @@ function Login({ apiUrl }) {
                         </svg>
                     </div>
                     <h1>ChatPulse</h1>
-                    <p className="login-subtitle">次世代 AI 沉浸式社交模拟</p>
+                    <p className="login-subtitle">Immersive AI social simulation.</p>
                 </div>
 
                 <form className="login-form" onSubmit={handleSubmit}>
@@ -62,7 +62,7 @@ function Login({ apiUrl }) {
                             autoFocus
                             value={username}
                             onChange={(e) => setUsername(e.target.value.trim())}
-                            placeholder="输入您的账号"
+                            placeholder="输入你的账号"
                         />
                     </div>
                     <div className="input-group">
@@ -83,8 +83,8 @@ function Login({ apiUrl }) {
                                 type="text"
                                 value={inviteCode}
                                 onChange={(e) => setInviteCode(e.target.value.trim())}
-                                placeholder="输入防挂机邀请码 (Nana免填)"
-                                required={username !== 'Nana'}
+                                placeholder="输入邀请码"
+                                required
                             />
                         </div>
                     )}
@@ -92,13 +92,13 @@ function Login({ apiUrl }) {
                     {error && <div className="login-error">{error}</div>}
 
                     <button type="submit" className="login-submit-btn" disabled={loading}>
-                        {loading ? <div className="btn-spinner"></div> : (isRegistering ? '注册专属通行证 / Register' : '登 录 / Login')}
+                        {loading ? <div className="btn-spinner"></div> : (isRegistering ? '注册 / Register' : '登录 / Login')}
                     </button>
                 </form>
 
                 <div className="login-footer">
                     <button className="text-btn toggle-mode-btn" type="button" onClick={() => { setIsRegistering(!isRegistering); setError(''); }}>
-                        {isRegistering ? '已有通行证？立即接入' : '流浪者？点击这里注册专属赛博身份'}
+                        {isRegistering ? '已有账号？立即登录' : '没有账号？使用邀请码注册'}
                     </button>
                 </div>
             </div>
