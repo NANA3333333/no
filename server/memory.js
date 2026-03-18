@@ -48,10 +48,29 @@ async function getVectorIndex(userId, characterId) {
         return indices.get(key);
     }
     const dir = path.join(__dirname, '..', 'data', 'vectors', String(userId), String(characterId));
+    const indexPath = path.join(dir, 'index.json');
     if (!fs.existsSync(dir)) {
         fs.mkdirSync(dir, { recursive: true });
     }
-    const index = new LocalIndex(dir);
+    if (fs.existsSync(indexPath)) {
+        try {
+            const stat = fs.statSync(indexPath);
+            if (stat.isDirectory()) {
+                const legacyIndexFile = path.join(indexPath, 'index.json');
+                const tempIndexFile = path.join(dir, '__index_migrated__.json');
+                if (fs.existsSync(legacyIndexFile) && fs.statSync(legacyIndexFile).isFile()) {
+                    fs.copyFileSync(legacyIndexFile, tempIndexFile);
+                }
+                fs.rmSync(indexPath, { recursive: true, force: true });
+                if (fs.existsSync(tempIndexFile)) {
+                    fs.renameSync(tempIndexFile, indexPath);
+                }
+            }
+        } catch (e) {
+            try { fs.rmSync(indexPath, { recursive: true, force: true }); } catch (err) { }
+        }
+    }
+    const index = new LocalIndex(indexPath);
     // Create if not exists OR if it exists but is corrupted
     try {
         const isCreated = await index.isIndexCreated();
@@ -65,7 +84,7 @@ async function getVectorIndex(userId, characterId) {
     } catch (err) {
         // If it throws "Index does not exist" or "Unexpected end of JSON input", recreate it
         console.warn(`[Memory] Vector index corrupted/missing for ${characterId}, recreating...`, err.message);
-        try { fs.rmSync(dir, { recursive: true, force: true }); } catch (e) { }
+        try { fs.rmSync(indexPath, { recursive: true, force: true }); } catch (e) { }
         fs.mkdirSync(dir, { recursive: true });
         await index.createIndex({
             version: 1,
@@ -699,6 +718,138 @@ Output exactly in this JSON format (and nothing else):
                 sweep_last_error: '',
                 sweep_last_saved_count: 0
             });
+            return 0;
+        }
+
+        const activityEntries = [];
+        privateMsgs.forEach((m) => {
+            activityEntries.push({
+                kind: 'private',
+                text: `${m.role === 'user' ? 'User' : character.name}: ${m.content}`
+            });
+        });
+        if (groupText) {
+            activityEntries.push({ kind: 'group', text: groupText.trim() });
+        }
+
+        const batchSize = Math.max(12, Math.min(30, Math.ceil(sweepLimit / 3)));
+        const totalBatches = Math.ceil(activityEntries.length / batchSize);
+        const parsedMemories = [];
+
+        try {
+            for (let batchIndex = 0; batchIndex < totalBatches; batchIndex++) {
+                const batchEntries = activityEntries.slice(batchIndex * batchSize, (batchIndex + 1) * batchSize);
+                const batchPrivateText = batchEntries
+                    .filter(entry => entry.kind === 'private')
+                    .map(entry => entry.text)
+                    .join('\n') || 'No private messages.';
+                const batchGroupText = batchEntries
+                    .filter(entry => entry.kind === 'group')
+                    .map(entry => entry.text)
+                    .join('\n\n') || 'No group messages.';
+
+                const extractionPrompt = `You are a memory aggregation assistant. Analyze batch ${batchIndex + 1} of ${totalBatches} from ${character.name}'s overflowed chat logs.
+Identify noteworthy events, facts, relationship developments, or emotional shifts.
+Return a structured JSON ARRAY of memory objects.
+
+CRITICAL:
+- Output only valid JSON.
+- Prefer 0 to 4 strong memories for this batch, not an exhaustive list.
+- Score each memory on a "surprise" factor from 1 to 10.
+- Surprise 1-3: Routine, completely expected.
+- Surprise 4-6: Mildly interesting, personal details.
+- Surprise 7-8: Emotional, unexpected events.
+- Surprise 9-10: Mind-blowing, life-changing completely unexpected twists.
+
+Activities:
+---
+[Private Chats]
+${batchPrivateText}
+
+[Group Chats]
+${batchGroupText}
+---
+
+Output exactly in this JSON format (and nothing else):
+[
+  {
+    "time": "recent past",
+    "location": "chat",
+    "people": "...",
+    "event": "...",
+    "relationships": "...",
+    "items": "...",
+    "importance": <number 1-10>,
+    "surprise_score": <number 1-10>
+  }
+]
+`;
+
+                const { content: responseText, usage } = await callLLM({
+                    endpoint: memoryConfig.endpoint,
+                    key: memoryConfig.key,
+                    model: memoryConfig.model,
+                    messages: [
+                        { role: 'system', content: 'You extract structured JSON arrays of facts from chat logs, including a surprise_score.' },
+                        { role: 'user', content: extractionPrompt }
+                    ],
+                    maxTokens: 2200,
+                    temperature: 0.2,
+                    returnUsage: true
+                });
+                recordMemoryTokenUsage(character.id, 'memory_sweep', usage);
+
+                const startIdx = responseText.indexOf('[');
+                const endIdx = responseText.lastIndexOf(']');
+                if (startIdx === -1 || endIdx === -1 || endIdx <= startIdx) {
+                    updateSweepStatus(character.id, {
+                        sweep_last_error: `小模型第 ${batchIndex + 1}/${totalBatches} 批返回结果无法解析，未完成长时记忆整理。`,
+                        sweep_last_saved_count: 0
+                    });
+                    return 0;
+                }
+
+                let parsed = [];
+                try {
+                    parsed = JSON.parse(responseText.slice(startIdx, endIdx + 1));
+                } catch (e) {
+                    updateSweepStatus(character.id, {
+                        sweep_last_error: `小模型第 ${batchIndex + 1}/${totalBatches} 批返回了截断或脏 JSON，未完成长时记忆整理。`,
+                        sweep_last_saved_count: 0
+                    });
+                    return 0;
+                }
+
+                if (Array.isArray(parsed)) {
+                    parsedMemories.push(...parsed);
+                }
+            }
+
+            let savedCount = 0;
+            for (const mem of parsedMemories) {
+                if (mem && mem.importance >= 3 && mem.event) {
+                    mem.surprise_score = mem.surprise_score || 5;
+                    await saveExtractedMemory(character.id, mem, null);
+                    savedCount++;
+                }
+            }
+
+            if (privateMsgs.length > 0) db.markMessagesSummarized(privateMsgs.map(m => m.id));
+            if (groupMsgIds.length > 0) db.markGroupMessagesSummarized(groupMsgIds);
+
+            updateSweepStatus(character.id, {
+                sweep_last_error: savedCount > 0 ? '' : '本次整理未提取出有效长期记忆。',
+                sweep_last_success_at: savedCount > 0 ? Date.now() : character.sweep_last_success_at || 0,
+                sweep_last_saved_count: savedCount
+            });
+            console.log(`[Memory] Sweep completed for ${character.name}, saved ${savedCount} memories across ${totalBatches} batch(es).`);
+            return savedCount;
+        } catch (e) {
+            updateSweepStatus(character.id, {
+                sweep_last_error: e.message || '长时记忆整理失败。',
+                sweep_last_saved_count: 0
+            });
+            console.error(`[Memory] Sweep failed for ${character.id}:`, e.message);
             return 0;
         }
 
