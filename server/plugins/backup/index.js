@@ -7,6 +7,7 @@ const unzipper = require('unzipper');
 
 module.exports = function (app, pluginContext) {
     const { getMemory, getUserDb, getEngine, getWsClients, authMiddleware, JWT_SECRET } = pluginContext;
+    const { clearMemoryCache } = require('../../memory');
 
     // Resolve path to the shared uploads directory (server/public/uploads)
     const uploadsDir = path.join(__dirname, '..', '..', 'public', 'uploads');
@@ -129,6 +130,7 @@ module.exports = function (app, pluginContext) {
 
             const { userDbCache } = require('../../db');
             userDbCache.delete(userId);
+            clearMemoryCache(userId);
 
             // Also clear engine cache so stale DB references are purged
             const { engineCache } = require('../../engine');
@@ -235,6 +237,7 @@ module.exports = function (app, pluginContext) {
 
             const { userDbCache } = require('../../db');
             userDbCache.delete(userId);
+            clearMemoryCache(userId);
 
             // Also clear engine cache so stale DB references are purged
             const { engineCache } = require('../../engine');

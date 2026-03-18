@@ -1,7 +1,7 @@
 const fs = require('fs');
 const path = require('path');
 const Database = require('better-sqlite3');
-const { getMemory } = require('../../memory');
+const { getMemory, clearMemoryCache } = require('../../memory');
 const { userDbCache } = require('../../db');
 
 module.exports = function initAdminDashboard(app, context) {
@@ -197,6 +197,7 @@ module.exports = function initAdminDashboard(app, context) {
                 db.close();
                 userDbCache.delete(targetId);
             }
+            clearMemoryCache(targetId);
 
             // Delete memory index
             try {

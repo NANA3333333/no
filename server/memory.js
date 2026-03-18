@@ -79,11 +79,16 @@ async function getVectorIndex(userId, characterId) {
 
 const memoryCache = new Map();
 
-function getMemory(userId) {
-    if (memoryCache.has(userId)) return memoryCache.get(userId);
+function clearMemoryCache(userId) {
+    if (!userId) return;
+    memoryCache.delete(String(userId));
+}
 
-    // Instantiates this user's specific sqlite DB instance
-    const db = getUserDb(userId);
+function getMemory(userId) {
+    const cacheKey = String(userId);
+    if (memoryCache.has(cacheKey)) return memoryCache.get(cacheKey);
+
+    const getDb = () => getUserDb(userId);
 
     function resolveMemoryModelConfig(character) {
         return {
@@ -94,6 +99,7 @@ function getMemory(userId) {
     }
 
     function updateSweepStatus(characterId, patch = {}) {
+        const db = getDb();
         if (!characterId || typeof db.rawRun !== 'function') return;
         const fields = [];
         const values = [];
@@ -119,6 +125,7 @@ function getMemory(userId) {
     }
 
     function recordMemoryTokenUsage(characterId, contextType, usage) {
+        const db = getDb();
         if (!usage || !characterId || !db?.addTokenUsage) return;
         db.addTokenUsage(characterId, contextType, usage.prompt_tokens || 0, usage.completion_tokens || 0);
     }
@@ -138,6 +145,7 @@ function getMemory(userId) {
 
     async function rebuildIndex(characterId) {
         await wipeIndex(characterId);
+        const db = getDb();
         const rows = db.getMemories ? db.getMemories(characterId) : [];
         if (!rows || rows.length === 0) return;
 
@@ -178,6 +186,7 @@ function getMemory(userId) {
             for (const res of weightedResults.slice(0, limit)) {
                 // Threshold filtering
                 if (res.score > 0.35 && res.item.metadata && res.item.metadata.memory_id) {
+                    const db = getDb();
                     const memRow = db.getMemory(res.item.metadata.memory_id);
                     if (memRow) {
                         memRow._search_score = res.finalScore.toFixed(3);
@@ -185,6 +194,7 @@ function getMemory(userId) {
                     }
                 }
             }
+            const db = getDb();
             if (memories.length > 0 && db.markMemoriesRetrieved) {
                 db.markMemoriesRetrieved(memories.map(m => m.id));
             }
@@ -320,6 +330,7 @@ Output only the summary sentence, without quotes or extra explanation.
 
             const hiddenState = responseText.trim();
             if (hiddenState && hiddenState.length > 0 && hiddenState.length < 200) {
+                const db = getDb();
                 db.updateCharacterHiddenState(character.id, hiddenState);
                 console.log(`[Memory] Extracted hidden state for ${character.name}: ${hiddenState}`);
                 return hiddenState;
@@ -351,6 +362,7 @@ Output only the summary sentence, without quotes or extra explanation.
         const sinceMs = Date.now() - hoursAgo * 60 * 60 * 1000;
         const batchSize = Math.max(10, Math.min(500, Number(options.batchSize) || 80));
         const activityEntries = [];
+        const db = getDb();
 
         const privateMsgs = db.getVisibleMessagesSince(character.id, sinceMs);
         privateMsgs.forEach((m) => {
@@ -490,6 +502,7 @@ Output exactly in this JSON format (and nothing else):
 
         const sinceMs = Date.now() - hoursAgo * 60 * 60 * 1000;
         const batchSize = Math.max(10, Math.min(500, Number(options.batchSize) || 80));
+        const db = getDb();
 
         // 1. Private messages
         const privateMsgs = db.getVisibleMessagesSince(character.id, sinceMs);
@@ -664,6 +677,7 @@ Output exactly in this JSON format (and nothing else):
 
         const sweepLimit = character.sweep_limit || 30;
         const privateWindow = character.context_msg_limit || 60;
+        const db = getDb();
         const privateMsgs = db.getOverflowMessages(character.id, privateWindow, sweepLimit);
         let groupText = '';
         let groupMsgIds = [];
@@ -793,6 +807,7 @@ Output exactly in this JSON format (and nothing else):
             memoryData.embedding = embeddingBuffer;
 
             // 2. Save to SQLite (with optional group_id for cleanup)
+            const db = getDb();
             const memoryId = db.addMemory(characterId, memoryData, groupId);
 
             // 3. Save to Vectra store
@@ -831,7 +846,7 @@ Output exactly in this JSON format (and nothing else):
         saveExtractedMemory
     };
 
-    memoryCache.set(userId, instance);
+    memoryCache.set(cacheKey, instance);
     return instance;
 }
-module.exports = { getMemory, setWsClientsResolver };
+module.exports = { getMemory, clearMemoryCache, setWsClientsResolver };
