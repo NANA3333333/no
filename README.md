@@ -1,6 +1,4 @@
-<p align="center">
-  <img src="chatpulse_logo.png" width="120" />
-</p>
+
 
 <h1 align="center">ChatPulse</h1>
 
