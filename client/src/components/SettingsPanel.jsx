@@ -1,5 +1,5 @@
-﻿import React, { useState, useEffect } from 'react';
-import { User, Trash2, Edit3, Save, RefreshCw, Palette, Download, Upload, FileText, ChevronDown, ChevronRight, Sparkles, ChevronLeft } from 'lucide-react';
+﻿import React, { useState, useEffect, useCallback } from 'react';
+import { User, Trash2, Edit3, Save, RefreshCw, Palette, Download, Upload, FileText, ChevronDown, ChevronRight, Sparkles, ChevronLeft, Database } from 'lucide-react';
 import { useLanguage } from '../LanguageContext';
 import { resolveAvatarUrl } from '../utils/avatar';
 import Scheduler from './Scheduler';
@@ -52,6 +52,7 @@ function SettingsPanel({ apiUrl, onCharactersUpdate, onProfileUpdate, onBack }) 
     const [editBio, setEditBio] = useState('');
     const [editMomentsTokenLimit, setEditMomentsTokenLimit] = useState(500);
     const [editMomentsReactionRate, setEditMomentsReactionRate] = useState(30);
+    const [memoryStatus, setMemoryStatus] = useState(null);
 
     // Theme Editor states
     const [editThemeConfig, setEditThemeConfig] = useState({});
@@ -73,6 +74,68 @@ function SettingsPanel({ apiUrl, onCharactersUpdate, onProfileUpdate, onBack }) 
     const [memModels, setMemModels] = useState([]);
     const [memModelFetching, setMemModelFetching] = useState(false);
     const [memModelError, setMemModelError] = useState('');
+
+    const formatCount = (value) => Number(value || 0).toLocaleString();
+    const formatTime = (value) => {
+        const ts = Number(value || 0);
+        if (!ts) return lang === 'en' ? 'No record yet' : '暂无记录';
+        return new Date(ts).toLocaleString();
+    };
+
+    const getMemoryBackendLabel = (backend) => {
+        const labels = {
+            'qdrant-primary-with-vectra-fallback': { en: 'Qdrant primary / vectra fallback', zh: 'Qdrant 主检索 / vectra 兜底' },
+            'vectra-fallback-only': { en: 'vectra fallback only', zh: '仅使用 vectra 兜底' },
+            'qdrant-online-collection-pending': { en: 'Qdrant online / collection pending', zh: 'Qdrant 在线 / 集合待建立' },
+            'vectra-fallback-active': { en: 'vectra fallback active', zh: 'vectra 兜底中' },
+        };
+        return labels[backend]?.[lang] || backend || '-';
+    };
+
+    const getMemoryStatusNote = (status) => {
+        const code = status?.statusNoteCode || '';
+        const notes = {
+            'collection_pending_existing_memories': {
+                en: 'Qdrant is online, but this account has not built its vector collection yet.',
+                zh: 'Qdrant 已在线，但这个账号的向量集合还没有建立。'
+            },
+            'collection_pending_first_memory': {
+                en: 'Qdrant is online. Your vector collection will appear after the first memory is written or indexed.',
+                zh: 'Qdrant 已在线。等第一批记忆被写入或建立索引后，你的向量集合就会出现。'
+            }
+        };
+        if (notes[code]) return notes[code][lang];
+        return status?.statusNote || '';
+    };
+
+    const searchableMemories = Number(memoryStatus?.indexedPoints || 0);
+    const recalledMemories = Number(memoryStatus?.everRetrievedMemoriesCount || 0);
+    const ragRecallRate = searchableMemories > 0
+        ? Math.round((recalledMemories / searchableMemories) * 100)
+        : 0;
+    const ragRecallTitle = searchableMemories > 0
+        ? `${ragRecallRate}%`
+        : (lang === 'en' ? 'Waiting for data' : '等待数据');
+    const ragRecallDetail = searchableMemories > 0
+        ? (lang === 'en'
+            ? `${formatCount(recalledMemories)} of ${formatCount(searchableMemories)} searchable memories have been recalled at least once.`
+            : `${formatCount(searchableMemories)} 条可检索记忆里，已经有 ${formatCount(recalledMemories)} 条至少被想起来过一次。`)
+        : (lang === 'en'
+            ? 'Once memories start being retrieved, this will show the recall rate.'
+            : '等记忆开始被检索后，这里会显示召回率。');
+
+    const loadMemoryStatus = useCallback(async () => {
+        try {
+            const headers = { 'Authorization': `Bearer ${localStorage.getItem('cp_token') || ''}` };
+            const res = await fetch(`${apiUrl}/user/memory-status`, { headers });
+            const data = await res.json();
+            if (data.success) {
+                setMemoryStatus(data.status || null);
+            }
+        } catch (e) {
+            console.error('Failed to fetch memory status:', e);
+        }
+    }, [apiUrl]);
 
     const fetchModels = async (endpoint, key, setList, setFetching, setError) => {
         if (!endpoint || !key) { setError('请先填写 Endpoint 和 Key'); return; }
@@ -125,10 +188,11 @@ function SettingsPanel({ apiUrl, onCharactersUpdate, onProfileUpdate, onBack }) 
         };
 
         fetchCharacters();
+        loadMemoryStatus();
 
         window.addEventListener('refresh_contacts', fetchCharacters);
         return () => window.removeEventListener('refresh_contacts', fetchCharacters);
-    }, [apiUrl]);
+    }, [apiUrl, loadMemoryStatus]);
 
     const handleSaveProfile = async () => {
         const updated = { ...profile, name: editName, avatar: editAvatar, banner: editBanner, bio: editBio };
@@ -946,6 +1010,67 @@ function SettingsPanel({ apiUrl, onCharactersUpdate, onProfileUpdate, onBack }) 
                                 : '当你给角色的朋友圈点赞或评论时，该角色在私聊里主动来找你互动的概率。'}
                         </div>
                     </div>
+                </div>
+
+                <div style={{ backgroundColor: '#fff', padding: '20px', borderRadius: '8px', border: '1px solid #eee', marginTop: '20px' }}>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '12px', marginBottom: '16px' }}>
+                        <h2 style={{ margin: 0, fontSize: '18px', display: 'flex', alignItems: 'center', gap: '8px' }}>
+                            <Database size={20} /> {lang === 'en' ? 'Memory Engine Status' : '记忆引擎状态'}
+                        </h2>
+                        <button
+                            onClick={loadMemoryStatus}
+                            style={{ display: 'flex', alignItems: 'center', gap: '6px', padding: '8px 12px', backgroundColor: '#f7f7f7', color: '#333', border: '1px solid #ddd', borderRadius: '6px', cursor: 'pointer', fontSize: '13px' }}
+                        >
+                            <RefreshCw size={15} /> {lang === 'en' ? 'Refresh' : '刷新'}
+                        </button>
+                    </div>
+
+                    <div style={{ padding: '18px', borderRadius: '12px', background: '#f8fafc', border: '1px solid #e5e7eb' }}>
+                        <div style={{ display: 'flex', justifyContent: 'space-between', gap: '12px', marginBottom: '12px', paddingBottom: '12px', borderBottom: '1px solid #e5e7eb' }}>
+                            <div>
+                                <div style={{ fontSize: '12px', color: '#666', marginBottom: '4px' }}>
+                                    {lang === 'en' ? 'Backend mode' : '后端模式'}
+                                </div>
+                                <div style={{ fontSize: '14px', fontWeight: 700, color: '#111827' }}>
+                                    {memoryStatus ? getMemoryBackendLabel(memoryStatus.backend) : (lang === 'en' ? 'Loading...' : '加载中...')}
+                                </div>
+                            </div>
+                            <div style={{ textAlign: 'right' }}>
+                                <div style={{ fontSize: '12px', color: '#666', marginBottom: '4px' }}>
+                                    {lang === 'en' ? 'Reachability' : '连接状态'}
+                                </div>
+                                <div style={{ fontSize: '14px', fontWeight: 700, color: memoryStatus?.reachable ? '#16a34a' : '#dc2626' }}>
+                                    {memoryStatus?.enabled === false ? (lang === 'en' ? 'Disabled' : '已关闭') : memoryStatus?.reachable ? (lang === 'en' ? 'Online' : '在线') : (lang === 'en' ? 'Offline' : '离线')}
+                                </div>
+                            </div>
+                        </div>
+                        <div style={{ fontSize: '12px', color: '#666', marginBottom: '8px' }}>
+                            {lang === 'en' ? 'RAG recall rate' : 'RAG 召回率'}
+                        </div>
+                        <div style={{ fontSize: '36px', fontWeight: 800, color: '#111827', lineHeight: 1.1, marginBottom: '8px' }}>
+                            {ragRecallTitle}
+                        </div>
+                        <div style={{ fontSize: '14px', color: '#4b5563', lineHeight: 1.6 }}>
+                            {ragRecallDetail}
+                        </div>
+                        <div style={{ fontSize: '12px', color: '#6b7280', lineHeight: 1.6, marginTop: '8px' }}>
+                            {lang === 'en'
+                                ? 'This metric is strict: it counts how many memories in the whole library have ever been retrieved at least once.'
+                                : '这个口径比较严：它看的是整个记忆库里，有多少条记忆至少被检索出来过一次。'}
+                        </div>
+                    </div>
+
+                    {getMemoryStatusNote(memoryStatus) && (
+                        <div style={{ marginTop: '12px', fontSize: '12px', color: '#92400e', background: '#fffbeb', border: '1px solid #fde68a', padding: '10px 12px', borderRadius: '8px' }}>
+                            {lang === 'en' ? 'Status note:' : '状态说明：'} {getMemoryStatusNote(memoryStatus)}
+                        </div>
+                    )}
+
+                    {memoryStatus?.lastError && (
+                        <div style={{ marginTop: '12px', fontSize: '12px', color: '#b91c1c', background: '#fef2f2', border: '1px solid #fecaca', padding: '10px 12px', borderRadius: '8px' }}>
+                            {lang === 'en' ? 'Latest status note:' : '最近状态说明：'} {memoryStatus.lastError}
+                        </div>
+                    )}
                 </div>
 
                 {/* Data Management */}

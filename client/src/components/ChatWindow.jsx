@@ -6,6 +6,7 @@ import RecommendModal from './RecommendModal';
 import { Send, Smile, Paperclip, Bell, Users, ShieldBan, Trash, BookOpen, Brain, MoreHorizontal, UserPlus, Gift, Heart, UserMinus, ShieldAlert, BadgeInfo, ChevronLeft } from 'lucide-react';
 import { useLanguage } from '../LanguageContext';
 import { resolveAvatarUrl } from '../utils/avatar';
+import { deriveEmotion } from '../utils/emotion';
 
 function normalizeMessages(list = []) {
     const byId = new Map();
@@ -60,6 +61,7 @@ function ChatWindow({
     useEffect(() => { contactRef.current = contact; }, [contact]);
 
     const isCurrentlyBlocked = engineState?.[contact?.id]?.isBlocked === 1;
+    const emotion = deriveEmotion(contact || {});
 
     // Fetch most recent messages when contact changes
     useEffect(() => {
@@ -244,7 +246,15 @@ function ChatWindow({
                     <button className="mobile-back-btn" onClick={onBack} title="Back">
                         <ChevronLeft size={24} />
                     </button>
-                    {contact.name}
+                    <img
+                        src={resolveAvatarUrl(contact.avatar, apiUrl) || `https://api.dicebear.com/7.x/shapes/svg?seed=${contact.id || 'User'}`}
+                        alt={contact.name}
+                        style={{ width: '32px', height: '32px', borderRadius: '50%', objectFit: 'cover' }}
+                    />
+                    <span style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
+                        <span>{contact.name}</span>
+                        <span style={{ fontSize: '12px', color: emotion.color, fontWeight: '600' }}>{emotion.emoji} {emotion.label}</span>
+                    </span>
                     {engineState?.[contact.id]?.isBlocked === 1 && <span style={{ color: 'var(--danger)', fontSize: '14px', fontWeight: 'bold' }}>(Blocked) 🚫</span>}
                 </div>
                 <div className="chat-header-actions">

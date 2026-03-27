@@ -1,5 +1,6 @@
 import React from 'react';
 import { resolveAvatarUrl } from '../utils/avatar';
+import { deriveEmotion } from '../utils/emotion';
 
 function ContactList({ apiUrl, contacts, activeId, onSelect, engineState = {} }) {
     return (
@@ -7,6 +8,7 @@ function ContactList({ apiUrl, contacts, activeId, onSelect, engineState = {} })
             {contacts.map((contact) => {
                 const state = engineState[contact.id];
                 const countdown = state?.countdownMs ? Math.ceil(state.countdownMs / 1000) : null;
+                const emotion = deriveEmotion(contact);
 
                 return (
                     <div
@@ -25,7 +27,10 @@ function ContactList({ apiUrl, contacts, activeId, onSelect, engineState = {} })
                         </div>
                         <div className="contact-info">
                             <div className="contact-header">
-                                <span className="contact-name">{contact.name}</span>
+                                <span className="contact-name" style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                                    <span>{contact.name}</span>
+                                    <span style={{ fontSize: '11px', color: emotion.color, whiteSpace: 'nowrap' }}>{emotion.emoji} {emotion.label}</span>
+                                </span>
                                 <span className="contact-time" style={{ color: countdown ? (state?.isThinking ? '#ff9800' : 'var(--accent-color)') : undefined, fontWeight: countdown ? 'bold' : 'normal' }}>
                                     {countdown ? (state?.isThinking ? '✍️...' : `⏱ ${countdown}s`) : contact.time}
                                 </span>

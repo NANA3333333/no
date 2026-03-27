@@ -2,8 +2,11 @@ $ErrorActionPreference = 'Stop'
 
 $root = Split-Path -Parent $PSScriptRoot
 $runtimeDir = Join-Path $root '.runtime'
+$qdrantPidFile = Join-Path $runtimeDir 'qdrant.pid'
 $serverPidFile = Join-Path $runtimeDir 'server.pid'
 $clientPidFile = Join-Path $runtimeDir 'client.pid'
+$dockerComposeFile = Join-Path $root 'docker-compose.yml'
+$localQdrantExe = Join-Path $root 'tools\qdrant\current\qdrant.exe'
 
 function Stop-TrackedProcess($pidFile) {
     if (-not (Test-Path $pidFile)) { return }
@@ -25,9 +28,20 @@ function Stop-PortListener($port) {
     }
 }
 
+Stop-TrackedProcess $qdrantPidFile
 Stop-TrackedProcess $serverPidFile
 Stop-TrackedProcess $clientPidFile
+Stop-PortListener 6333
+Stop-PortListener 6334
 Stop-PortListener 8000
 Stop-PortListener 5173
 
-Write-Host '[stack] stopped ports 8000 and 5173'
+if ((-not (Test-Path $localQdrantExe)) -and (Test-Path $dockerComposeFile)) {
+    try {
+        docker compose -f $dockerComposeFile stop qdrant | Out-Host
+    } catch {
+        Write-Host '[stack] failed to stop Qdrant via docker compose'
+    }
+}
+
+Write-Host '[stack] stopped qdrant, backend, and frontend'

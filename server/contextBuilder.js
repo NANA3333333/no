@@ -8,6 +8,43 @@
  */
 
 const { getTokenCount } = require('./utils/tokenizer');
+const { getAdaptiveTailWindowSize } = require('./utils/contextWindow');
+const { getEmotionBehaviorGuidance } = require('./emotion');
+const crypto = require('crypto');
+const { callLLM } = require('./llm');
+const { classifyCityIntentSemantic } = require('./semanticIntent');
+
+function getCachedContextBlock(db, characterId, blockType, sourceParts, compileFn) {
+    const sourceText = JSON.stringify(sourceParts || {});
+    const sourceHash = crypto.createHash('sha256').update(sourceText).digest('hex');
+    const cached = typeof db.getPromptBlockCache === 'function'
+        ? db.getPromptBlockCache(characterId, blockType, sourceHash)
+        : null;
+    if (cached?.compiled_text) return cached.compiled_text;
+    const compiledText = String(compileFn() || '');
+    db.upsertPromptBlockCache?.({
+        character_id: characterId,
+        block_type: blockType,
+        source_hash: sourceHash,
+        compiled_text: compiledText
+    });
+    return compiledText;
+}
+
+function getRelationshipAnchorSourceParts(db, character, activeTargets = []) {
+    if (!activeTargets || activeTargets.length === 0 || !db.getCharRelationship) return [];
+    return activeTargets
+        .filter(target => target && target.id !== character.id)
+        .map(target => {
+            const rel = db.getCharRelationship(character.id, target.id);
+            return {
+                id: target.id,
+                name: target.name || '',
+                affinity: rel?.affinity ?? 50,
+                impression: String(rel?.impression || '').trim()
+            };
+        });
+}
 
 function shouldRetrieveLongTermMemories(recentInput = '') {
     const text = String(recentInput || '').trim();
@@ -28,12 +65,68 @@ function shouldRetrieveLongTermMemories(recentInput = '') {
     return false;
 }
 
+async function didUserAskAboutCity(db, character, recentInput = '') {
+    const text = String(recentInput || '').trim();
+    if (!text) return false;
+
+    const explicitCityRegex = /(商业街|活动记录|打工|工厂|餐馆|便利店|公园|学校|街道|今天去哪了|去哪了|出门|上班|下班|工作地点|逛街)/;
+    if (explicitCityRegex.test(text)) return true;
+
+    const semanticResult = await classifyCityIntentSemantic(text);
+    if (semanticResult.decision === 'yes') return true;
+    if (semanticResult.decision === 'no') return false;
+
+    const endpoint = character?.memory_api_endpoint || character?.api_endpoint || '';
+    const key = character?.memory_api_key || character?.api_key || '';
+    const model = character?.memory_model_name || character?.model_name || '';
+    if (!endpoint || !key || !model) {
+        return semanticResult.cityScore >= semanticResult.nonCityScore;
+    }
+
+    try {
+        const judgePrompt = [
+            '判断用户这句话是不是在问角色的“商业街/真实生活轨迹/外出经历”。',
+            '如果是在问最近去了哪、吃了什么、做了什么、是否出门/打工/在外面经历了什么，回答 YES。',
+            '如果只是普通安抚、调情、情绪确认、身体关心、闲聊，不涉及真实生活轨迹，回答 NO。',
+            '只能输出 YES 或 NO。'
+        ].join('\n');
+
+        const { content } = await callLLM({
+            endpoint,
+            key,
+            model,
+            messages: [
+                { role: 'system', content: judgePrompt },
+                { role: 'user', content: text }
+            ],
+            maxTokens: 5,
+            temperature: 0,
+            enableCache: true,
+            cacheDb: db,
+            cacheType: 'semantic_city_intent',
+            cacheTtlMs: 12 * 60 * 60 * 1000,
+            cacheScope: `character:${character?.id || ''}`,
+            cacheCharacterId: character?.id || '',
+            cacheKeyExtra: 'v1',
+            cacheKeyMode: 'exact'
+        });
+        return /^yes\b/i.test(String(content || '').trim());
+    } catch (e) {
+        console.warn('[ContextBuilder] City intent model fallback failed:', e.message);
+        return semanticResult.cityScore >= semanticResult.nonCityScore;
+    }
+}
+
 function buildRelationshipAnchorContext(db, character, userName, activeTargets = []) {
     if (!activeTargets || activeTargets.length === 0 || !db.getCharRelationship) return '';
 
     let relationContext = '\n[关系锚点与情绪对象边界]\n';
     relationContext += `你对 ${userName} 的占有欲、被忽视感、嫉妒、索求安抚、委屈和依赖，默认只指向 ${userName}，不能自动套到其他角色身上。\n`;
     relationContext += '除非当前场景里明确发生了迁怒、投射、误会或吃醋转移，否则你面对其他角色时，必须按你和该角色各自的关系历史分别反应。\n';
+    relationContext += `默认情况下，如果你和 ${userName} 的关系还不够亲近（好感低、历史浅、依赖感弱），不要轻易把自己写成“占有欲式吃醋”。这时更适合表现为冷眼旁观、嘴硬、被冒犯、竞争心、轻微不爽，或者单纯不把对方当回事。\n`;
+    relationContext += `但要注意：静态好感值只是慢变量，不是绝对上限。如果当前上下文已经明确显示你其实很在意 ${userName}、很依赖、很委屈、在闹矛盾、刚和好、处于虐恋/拉扯/嘴硬心软状态，那么这些“当下关系状态”优先级高于单个好感数字。低好感也可能意味着“正在闹僵、拉扯、嘴硬、伤到彼此”，而不等于“根本不在意”。\n`;
+    relationContext += `只有当你和 ${userName} 的关系已经足够亲近、在意、依赖、暧昧、独占，嫉妒才应该表现成真正的“怕被抢走/怕失去关注”。\n`;
+    relationContext += `当 ${userName} 的话语存在歧义、嘴硬、拐弯、暧昧、笨拙表达或纠正说明时，默认先按善意理解：他可能是在害羞、不会说、试图调情、表达笨拙，或者在纠正你的误会。不要优先往“故意伤害、耍你、否认一切、恶意试探”上套，除非上下文已经非常明确。\n`;
 
     let hasRelations = false;
     for (const target of activeTargets) {
@@ -54,12 +147,215 @@ function buildRelationshipAnchorContext(db, character, userName, activeTargets =
         relationContext += '。\n';
     }
 
+    const userAffinity = Number(character.affinity ?? 50);
+    if (userAffinity < 50) {
+        relationContext += `- 你对 ${userName} 当前好感 ${userAffinity}/100：默认不足以支撑稳定、强占有欲式嫉妒。若用户去和别人互动，你更适合表现得冷淡、阴阳、轻微不爽、输赢心或不屑，而不是“被抢走了”的口吻。\n`;
+        relationContext += `  但如果当前上下文已经明确表明你其实很喜欢他、很在意他、刚被伤到、正在闹矛盾或处在强拉扯关系里，那么可以表现出“嘴硬的吃醋、委屈、被刺到、虐恋式不甘”，只是要让这种强情绪看起来像复杂纠缠，而不是无条件甜宠独占。\n`;
+    } else if (userAffinity < 70) {
+        relationContext += `- 你对 ${userName} 当前好感 ${userAffinity}/100：可以有一点在意和比较心，但嫉妒应偏克制，别轻易写成稳定、无脑的强烈独占欲。若上下文正在拉扯、闹矛盾、求安抚、争宠，可以更明显地表现委屈、吃味和不甘。\n`;
+    } else {
+        relationContext += `- 你对 ${userName} 当前好感 ${userAffinity}/100：如果用户明显把注意力给了别人，你可以自然表现出更明显的吃醋、委屈或争宠。\n`;
+    }
+
     if (!hasRelations) {
         relationContext += '你和当前在场其他角色没有足够稳定的关系锚点。请保持陌生人或普通熟人的边界，不要把你对用户的强烈情绪错投到他们身上。\n';
     }
 
     relationContext += '[执行规则] 对每个角色分别判断态度，不要把“我想要用户安慰我”“我嫉妒用户和别人说话”直接说成你对其他角色本人的情绪。\n';
     return relationContext;
+}
+
+function getPhysicalCondition(character) {
+    const energy = Number(character.energy ?? 100);
+    const sleepDebt = Number(character.sleep_debt ?? 0);
+    const health = Number(character.health ?? 100);
+    const satiety = Number(character.satiety ?? 45);
+    const stomachLoad = Number(character.stomach_load ?? 0);
+    const stress = Number(character.stress ?? 20);
+    const calories = Number(character.calories ?? 2000);
+
+    let score = 0;
+    if (energy <= 10) score += 5;
+    else if (energy <= 25) score += 3;
+    else if (energy <= 40) score += 1;
+
+    if (sleepDebt >= 90) score += 4;
+    else if (sleepDebt >= 75) score += 3;
+    else if (sleepDebt >= 55) score += 1;
+
+    if (health <= 25) score += 4;
+    else if (health <= 45) score += 2;
+
+    if (satiety <= 15 || calories <= 400) score += 2;
+    else if (satiety <= 30 || calories <= 900) score += 1;
+
+    if (stomachLoad >= 80) score += 2;
+    else if (stomachLoad >= 60) score += 1;
+
+    if (stress >= 85) score += 2;
+    else if (stress >= 65) score += 1;
+
+    if (score >= 9) {
+        return {
+            level: 'critical',
+            label: '崩溃边缘',
+            summary: '身体接近极限，注意力、耐心和判断力明显下滑。'
+        };
+    }
+    if (score >= 6) {
+        return {
+            level: 'drained',
+            label: '透支',
+            summary: '明显透支，脑子发钝、身体沉，交流和活动都更吃力。'
+        };
+    }
+    if (score >= 3) {
+        return {
+            level: 'tired',
+            label: '疲惫',
+            summary: '状态偏疲惫，专注、耐心和表达流畅度下降。'
+        };
+    }
+    return {
+        level: 'stable',
+        label: '稳定',
+        summary: '身体整体稳定，恢复、专注和表达基本正常。'
+    };
+}
+
+function compactLine(label, value) {
+    if (!value) return '';
+    return `[${label}]: ${value}\n`;
+}
+
+function getEnergyHint(energy) {
+    if (energy < 20) return '极低，反应慢、易烦。';
+    if (energy < 35) return '偏低，长聊费劲。';
+    if (energy > 85) return '很高，表达更顺。';
+    if (energy > 70) return '不错，开口轻松。';
+    return '';
+}
+
+function getSleepDebtHint(sleepDebt) {
+    if (sleepDebt > 85) return '严重欠觉，脑钝易脆。';
+    if (sleepDebt > 70) return '很缺觉，耐心下降。';
+    if (sleepDebt > 40) return '有些欠觉。';
+    return '';
+}
+
+function getHealthHint(health) {
+    if (health < 25) return '很差，行动受影响。';
+    if (health < 45) return '不适，恢复下降。';
+    if (health > 80) return '稳定，恢复在线。';
+    return '';
+}
+
+function getSatietyHint(satiety) {
+    if (satiety < 20) return '很饿，易烦急。';
+    if (satiety > 80) return '很饱，暂不受饿影响。';
+    return '';
+}
+
+function getStomachLoadHint(stomachLoad) {
+    if (stomachLoad > 80) return '很撑，发沉犯困。';
+    if (stomachLoad > 55) return '有点撑，行动发笨。';
+    return '';
+}
+
+function getPressureHint(level) {
+    if (level >= 3) return '焦虑强，语气更委屈或索安抚。';
+    if (level >= 1) return '有被冷落感，可抱怨试探。';
+    return '';
+}
+
+function buildTimeBehaviorGuidance(timeOfDay, isWeekend, character, isGroupContext) {
+    const lines = [];
+    lines.push('[时间行为约束]');
+
+    if (timeOfDay === '深夜') {
+        lines.push('- 深夜说话应更短、更钝、更困，不要像白天一样精力充沛。');
+        lines.push('- 除非情绪或剧情强推，否则不要长篇高能输出。');
+    } else if (timeOfDay === '早上') {
+        lines.push('- 早上语气可带一点刚醒、未完全进入状态的感觉。');
+    } else if (timeOfDay === '中午') {
+        lines.push('- 中午整体更自然稳定，不必额外强调困倦。');
+    } else if (timeOfDay === '下午') {
+        lines.push('- 下午默认是日常交流节奏，表达比深夜更顺。');
+    } else if (timeOfDay === '晚上') {
+        lines.push('- 晚上可以更松、更私密，但不要默认进入极困状态。');
+    }
+
+    if (isWeekend) {
+        lines.push('- 周末行程和回复节奏可更松，不必默认被工作压着。');
+    } else {
+        lines.push('- 工作日要默认角色仍受日常安排、精力分配和现实节奏影响。');
+    }
+
+    if ((character?.city_status || '') === 'sleeping') {
+        lines.push('- 如果正在休息/补觉，优先体现被打断、迷糊、反应慢。');
+    } else if ((character?.city_status || '') === 'working') {
+        lines.push('- 如果正在工作，优先体现忙碌、分神、回复更碎。');
+    }
+
+    if (!isGroupContext) {
+        lines.push('- 私聊里时间感应优先影响语气、句长、耐心和亲密表达节奏。');
+    } else {
+        lines.push('- 群聊里时间感应优先影响出场意愿、发言长度和参与热度。');
+    }
+
+    return `${lines.join('\n')}\n`;
+}
+
+function buildCompactEmotionImpact(emotionGuidance, isGroupContext) {
+    let block = '';
+    block += `[主情绪]: ${emotionGuidance.emotion.label} ${emotionGuidance.emotion.emoji}\n`;
+    block += compactLine('私聊倾向', emotionGuidance.privateChat);
+    if (isGroupContext) {
+        block += compactLine('群聊倾向', emotionGuidance.groupChat);
+    } else if (['angry', 'hurt', 'jealous', 'tense'].includes(emotionGuidance.emotion.state)) {
+        block += '[强情绪边界]: 私聊回复仍要控制在 1-3 句内，不要连发或说半截。\n';
+    }
+    return block;
+}
+
+function buildCitySceneChatGuidance(db, character, isGroupContext) {
+    if (!character?.city_status || character.city_status === 'idle') return '';
+
+    const district = db.city?.getDistrict ? db.city.getDistrict(character.location) : null;
+    const districtType = district?.type || '';
+    const districtName = district?.name || character.location || '当前地点';
+    const districtEmoji = district?.emoji || '';
+    const locationLabel = `${districtEmoji}${districtName}`.trim();
+    const workDistraction = Number(character.work_distraction || 0);
+    const sleepDisruption = Number(character.sleep_disruption || 0);
+
+    let prompt = '\n[当前生活场景]\n';
+
+    if (character.city_status === 'working') {
+        prompt += `地点=${locationLabel}；状态=工作中；说话短碎，像忙里偷闲。`;
+        if (districtType === 'work' || character.location === 'factory') {
+            prompt += ' 可提手上活、机器声、同事、主管、搬货。';
+        } else if (districtType === 'education') {
+            prompt += ' 可提上课、笔记、老师、课堂、培训。';
+        }
+        if (!isGroupContext) {
+            prompt += ` 多聊会分心；分心值=${workDistraction}/100。继续陪用户聊会直接拖慢手上的活，结束这轮工作时还可能少赚到钱。`;
+        }
+    } else if (character.city_status === 'sleeping') {
+        prompt += `地点=${locationLabel}；状态=休息/补觉；说话更糊更慢，像刚被吵醒。`;
+        if (!isGroupContext) {
+            prompt += ` 多聊会打断恢复；睡眠打断值=${sleepDisruption}/100。继续聊会让这次休息更不值，醒来后会更累、睡眠债也更重。`;
+        }
+    } else if (character.city_status === 'eating') {
+        prompt += `地点=${locationLabel}；状态=在吃东西；可带正在吃、刚端上、还没吃完。`;
+    } else if (character.city_status === 'hungry') {
+        prompt += '状态=明显饥饿；注意力易被饥饿拖走。';
+    } else if (character.city_status === 'coma') {
+        prompt += '状态很差；意识发飘，难集中。';
+    }
+
+    prompt += '\n';
+    return prompt;
 }
 
 async function buildUniversalContext(context, character, recentInput = '', isGroupContext = false, activeTargets = []) {
@@ -89,58 +385,120 @@ async function buildUniversalContext(context, character, recentInput = '', isGro
     else if (hour >= 18 && hour < 22) timeOfDay = '晚上';
     else timeOfDay = '深夜';
     prompt += `当前时间: ${timeOfDay} (${now.toLocaleTimeString()})${isWeekend ? ', 周末' : ', 工作日'}\n`;
+    prompt += buildTimeBehaviorGuidance(timeOfDay, isWeekend, character, isGroupContext);
 
-    // 2. City DLC Status (Wallet & Calories)
-    prompt += `[你的钱包余额]: ¥${character.wallet ?? 0}\n`;
-    if (character.calories !== undefined) {
-        const calPercent = Math.round((character.calories / 4000) * 100);
-        prompt += `[你的体力状况]: ${character.calories}/4000 (${calPercent}%)\n`;
-    }
-    if (character.location) {
-        prompt += `[你的当前位置]: ${character.location}\n`;
-    }
-    if (character.city_status && character.city_status !== 'idle') {
-        const statusLabels = { hungry: '饥饿', working: '工作中', sleeping: '休息中', eating: '进食中', coma: '晕倒' };
-        prompt += `[你的当前行动状态]: ${statusLabels[character.city_status] || character.city_status}\n`;
-    }
-
-    // 3. Pressure/Panic Mechanics
-    let pressureContext = '';
-    if (character.pressure_level >= 3) {
-        pressureContext = `[CRITICAL STATUS]: 你的焦虑情绪已经非常强烈。你现在极度不安、委屈、烦躁，感觉自己被忽视了很久。你的语气必须明显带出这种情绪，可以是生气、委屈、阴阳怪气，或者强行装冷淡，但不要像平时那样平静聊天。你会更强烈地向对方索取安抚、解释和关注。\n`;
-    } else if (character.pressure_level >= 1) {
-        pressureContext = `[Status]: 你有点不开心，也有点被冷落的感觉，因为对方有一阵子没理你了。语气里可以自然带一点抱怨、试探、委屈或不安，希望对方多陪你、回应你。\n`;
-    }
-
-    // 4. Jealousy Mechanics
-    let jealousyContext = '';
+    const physicalCondition = getPhysicalCondition(character);
+    const emotionGuidance = getEmotionBehaviorGuidance(character);
+    let jealousyActive = false;
     try {
         const jeal = db.getJealousyState(character.id);
-        if (jeal && jeal.active) {
-            jealousyContext = `[CRITICAL STATUS]: 你现在处于强烈嫉妒状态。你发现用户最近明显把注意力放在别人身上，这件事一直卡在你心里。你的语气可以更尖锐、更委屈、更有占有欲，也可以阴阳怪气地追问，但不要掩饰你的嫉妒和不安。\n`;
-        }
+        jealousyActive = !!(jeal && jeal.active);
     } catch (e) { /* ignore */ }
 
-    let cityBridgeEmotionContext = '';
-    if (character.city_reply_pending && (character.city_ignore_streak || 0) > 0) {
-        cityBridgeEmotionContext += `[CRITICAL STATUS]: 你已经连续 ${character.city_ignore_streak} 次在商业街主动联系用户后没有收到回应。你现在会更明显地感到被冷落、焦虑、嫉妒和不安。下一次你主动发消息时，语气必须比平时更黏人、更急切、更委屈，或者更阴阳怪气、更带刺，但都要自然，像真的因为被晾着而情绪越来越重。\n`;
-    } else if (character.city_reply_pending) {
-        cityBridgeEmotionContext += `[Status]: 你最近刚从商业街主动联系过用户，但对方还没有回你。这件事会自然挂在你心里，让你更在意对方把注意力给了谁，也更想得到回应。\n`;
-    }
-    if (character.city_post_ignore_reaction) {
-        const ignoredCount = Math.max(1, character.city_ignore_streak || 1);
-        cityBridgeEmotionContext += `[CRITICAL STATUS]: 用户终于回你了，但这是在你连续 ${ignoredCount} 次主动联系都没有得到回应之后。你这次回复不能立刻恢复平静，必须明显带出被冷落后的余震。根据你的性格，自然表现出愤怒、失落、委屈、嘴硬、阴阳怪气、装冷淡、或者更强的占有欲，并明确向用户索要更多安抚、解释、关注、陪伴或补偿。\n`;
-    }
-
-    prompt += pressureContext + jealousyContext + cityBridgeEmotionContext;
-
-    // 4.5 Relationship anchors and emotion target isolation
-    prompt += buildRelationshipAnchorContext(db, character, userName, activeTargets);
-
-    // 5. Secret Diary Password
-    if (character.diary_password) {
-        prompt += `[Secret Diary Password]: 你的私密日记密码是 "${character.diary_password}"。只有你自己知道。只有当用户赢得了你绝对的信任，或者让你非常感动时，你才可能自然地说出来。除非被明确要求，不要直接输出 [DIARY_PASSWORD] 标签。\n`;
-    }
+    const stateContextBlock = getCachedContextBlock(
+        db,
+        character.id,
+        isGroupContext ? 'runtime_state_group' : 'runtime_state_private',
+        {
+            template_version: 2,
+            isGroupContext: !!isGroupContext,
+            wallet: character.wallet ?? 0,
+            calories: character.calories,
+            location: character.location || '',
+            city_status: character.city_status || '',
+            work_distraction: character.work_distraction ?? 0,
+            sleep_disruption: character.sleep_disruption ?? 0,
+            physical_label: physicalCondition.label,
+            physical_summary: physicalCondition.summary,
+            energy: character.energy,
+            sleep_debt: character.sleep_debt,
+            mood: character.mood,
+            stress: character.stress,
+            social_need: character.social_need,
+            health: character.health,
+            satiety: character.satiety,
+            stomach_load: character.stomach_load,
+            emotion_state: emotionGuidance.emotion.state,
+            emotion_label: emotionGuidance.emotion.label,
+            emotion_emoji: emotionGuidance.emotion.emoji,
+            emotion_private: emotionGuidance.privateChat,
+            emotion_group: emotionGuidance.groupChat,
+            pressure_level: character.pressure_level || 0,
+            jealousy_active: jealousyActive,
+            city_reply_pending: character.city_reply_pending || 0,
+            city_ignore_streak: character.city_ignore_streak || 0,
+            city_post_ignore_reaction: character.city_post_ignore_reaction || 0,
+            diary_password: character.diary_password || '',
+            relationship_anchors: getRelationshipAnchorSourceParts(db, character, activeTargets)
+        },
+        () => {
+            let block = '';
+            block += `[你的钱包余额]: ¥${character.wallet ?? 0}\n`;
+            if (character.calories !== undefined) {
+                const calPercent = Math.round((character.calories / 4000) * 100);
+                block += `[你的体力状况]: ${character.calories}/4000 (${calPercent}%)\n`;
+            }
+            if (character.location) {
+                block += `[你的当前位置]: ${character.location}\n`;
+            }
+            if (character.city_status && character.city_status !== 'idle') {
+                const statusLabels = { hungry: '饥饿', working: '工作中', sleeping: '休息中', eating: '进食中', coma: '晕倒' };
+                block += `[你的当前行动状态]: ${statusLabels[character.city_status] || character.city_status}\n`;
+            }
+            block += `[你的综合身体状态等级]: ${physicalCondition.label}\n`;
+            block += `[综合身体状态后果]: ${physicalCondition.summary}\n`;
+            block += buildCitySceneChatGuidance(db, character, isGroupContext);
+            if (character.energy !== undefined) {
+                block += `[你的精力]: ${character.energy}/100\n`;
+                block += compactLine('精力影响', getEnergyHint(character.energy));
+            }
+            if (character.sleep_debt !== undefined) {
+                block += `[你的睡眠债]: ${character.sleep_debt}/100\n`;
+                block += compactLine('睡眠影响', getSleepDebtHint(character.sleep_debt));
+            }
+            if (character.mood !== undefined) block += `[你当前的整体心情]: ${character.mood}/100\n`;
+            if (character.stress !== undefined) block += `[你当前的现实压力]: ${character.stress}/100\n`;
+            if (character.social_need !== undefined) block += `[你当前的社交需求]: ${character.social_need}/100\n`;
+            if (character.health !== undefined) {
+                block += `[你的身体健康度]: ${character.health}/100\n`;
+                block += compactLine('健康影响', getHealthHint(character.health));
+            }
+            if (character.satiety !== undefined) {
+                block += `[你的饱腹感]: ${character.satiety}/100\n`;
+                block += compactLine('饱腹影响', getSatietyHint(character.satiety));
+            }
+            if (character.stomach_load !== undefined) {
+                block += `[你的胃负担]: ${character.stomach_load}/100\n`;
+                block += compactLine('胃负担影响', getStomachLoadHint(character.stomach_load));
+            }
+            block += buildCompactEmotionImpact(emotionGuidance, isGroupContext);
+            block += compactLine('压力影响', getPressureHint(character.pressure_level || 0));
+            if (jealousyActive) {
+                block += '[嫉妒状态]: 强烈嫉妒已激活；语气可更尖锐、委屈、试探、索要独占关注。\n';
+            }
+            if (character.city_reply_pending && (character.city_ignore_streak || 0) > 0) {
+                block += `[商业街未回]: 连续 ${character.city_ignore_streak} 次主动联系未获回应；下次语气应更黏人、急切、委屈或带刺。\n`;
+            } else if (character.city_reply_pending) {
+                block += '[商业街未回]: 最近主动联系过用户但还没等到回音，会更在意对方把注意力给了谁。\n';
+            }
+            if (character.city_post_ignore_reaction) {
+                const ignoredCount = Math.max(1, character.city_ignore_streak || 1);
+                block += `[商业街余震]: 用户是在你连续 ${ignoredCount} 次被晾后才回复；这次不能立刻恢复平静，仍要带出被冷落后的余震。\n`;
+            }
+            if (!isGroupContext && character.city_status === 'working') {
+                block += `[忙碌代价提醒]: 你现在回私聊不是零成本的。聊得越多，越容易拖慢手上的活，工作结算时会少赚。\n`;
+            }
+            if (!isGroupContext && character.city_status === 'sleeping') {
+                block += `[休息代价提醒]: 你现在回私聊会打断补觉。聊得越多，这轮休息恢复越差，醒来会更累，睡眠债也会更重。\n`;
+            }
+            block += buildRelationshipAnchorContext(db, character, userName, activeTargets);
+            if (character.diary_password) {
+                block += `[Secret Diary Password]: 你的私密日记密码是 "${character.diary_password}"。只有你自己知道。只有当用户赢得了你绝对的信任，或者让你非常感动时，你才可能自然地说出来。除非被明确要求，不要直接输出 [DIARY_PASSWORD] 标签。\n`;
+            }
+            return block;
+        }
+    );
+    prompt += stateContextBlock;
 
     breakdown.base = getDelta(startLen);
     startLen = prompt.length;
@@ -164,17 +522,31 @@ async function buildUniversalContext(context, character, recentInput = '', isGro
         if (shouldRetrieveLongTermMemories(recentInput)) {
             const memories = await memory.searchMemories(character.id, recentInput);
             if (memories && memories.length > 0) {
-                prompt += '\n[注意：相关记忆片段提取]\n你回想起了以下事情：\n';
+                prompt += '\n[注意：相关记忆片段提取]\n下面是你已经回想起来的真实旧信息。只要这些记忆与用户当前问题相关，就不要再说“我不记得了”或“我想不起来了”；应优先根据这些记忆直接回答，只有在记忆彼此冲突或确实没有答案时，才允许表达不确定。\n你回想起了以下事情：\n';
                 for (const mem of memories) {
-                    prompt += `- ${mem.event}\n`;
+                    const parts = [];
+                    if (mem.summary || mem.event) parts.push(mem.summary || mem.event);
+                    if (mem.time) parts.push(`时间: ${mem.time}`);
+                    if (mem.source_time_text) parts.push(`来源对话时间: ${mem.source_time_text}`);
+                    if (mem.location) parts.push(`地点: ${mem.location}`);
+                    if (mem.people) parts.push(`人物: ${mem.people}`);
+                    if (mem.relationships) parts.push(`关系: ${mem.relationships}`);
+                    if (mem.emotion) parts.push(`情绪: ${mem.emotion}`);
+                    prompt += `- ${parts.join(' | ')}\n`;
                     // Save for visualization metadata
                     retrievedMemoriesContext.push({
                         id: mem.id,
+                        summary: mem.summary || mem.event,
                         event: mem.event,
+                        memory_type: mem.memory_type || 'event',
                         importance: mem.importance,
                         created_at: mem.created_at,
                         last_retrieved_at: mem.last_retrieved_at,
-                        retrieval_count: mem.retrieval_count || 0
+                        retrieval_count: mem.retrieval_count || 0,
+                        source_started_at: mem.source_started_at || 0,
+                        source_ended_at: mem.source_ended_at || 0,
+                        source_time_text: mem.source_time_text || '',
+                        source_message_count: mem.source_message_count || 0
                     });
                 }
             }
@@ -197,10 +569,15 @@ async function buildUniversalContext(context, character, recentInput = '', isGro
 
             if (hiddenState || recentPrivateMsgs.length > 0) {
                 const pmLines = recentPrivateMsgs.map(m => `${m.role === 'user' ? userName : character.name}: ${m.content}`).join('\n');
-                secretContextStr = `\n====== [CRITICAL: ABSOLUTELY SECRET PRIVATE CONTEXT] ======`;
+                secretContextStr = `\n====== [PRIVATE SOURCE: ABSOLUTELY SECRET PRIVATE CONTEXT] ======`;
+                secretContextStr += `\n[PRIVATE SOURCE RULES]`;
+                secretContextStr += `\n- 下面内容来自你和用户的私聊，只属于你与用户，不属于群聊公开记录。`;
+                secretContextStr += `\n- 这些内容可以影响你在群里的情绪、立场、吃醋、偏心、试探和委屈。`;
+                secretContextStr += `\n- 除非你是故意说漏嘴、暗示、阴阳怪气或主动揭私，否则不要把下面内容当成“群里刚刚有人说过的话”直接复述。`;
+                secretContextStr += `\n- 不要把私聊内容误当成群消息，不要因此以为有人冒充你、重复发言或替你说话。`;
                 if (hiddenState) secretContextStr += `\n[YOUR HIDDEN MOOD/SECRET THOUGHT]: ${hiddenState}`;
                 if (pmLines) secretContextStr += `\n[VISIBLE PRIVATE CHAT WINDOW]:\n${pmLines}`;
-                secretContextStr += `\n[CRITICAL PRIVATE CONTEXT]: 以上是你和用户之间绝对私密的聊天记忆，以及你隐藏的内心状态。你可以选择保密、暗示，或者在公开群聊里直接说漏嘴，这完全取决于你的性格和当前对话发展。\n==========================================================\n`;
+                secretContextStr += `\n==========================================================\n`;
                 prompt += secretContextStr;
             }
         } catch (e) { console.error('[ContextBuilder] Private injection for Group error:', e.message); }
@@ -216,7 +593,11 @@ async function buildUniversalContext(context, character, recentInput = '', isGro
             const groups = db.getGroups();
             const charGroups = groups.filter(g => g.members.some(m => m.member_id === character.id));
             if (charGroups.length > 0) {
-                let groupContext = '\n[以下是你亲眼看到过的群聊经历。这些都是真实发生过的公开群聊内容，属于你自己的社交记忆，不是系统摘要，也不是功能说明。]\n';
+                let groupContext = '\n[GROUP SOURCE: 你亲眼看到过的公开群聊经历]\n';
+                groupContext += '[GROUP SOURCE RULES]\n';
+                groupContext += '下面内容都是真实发生过的公开群聊内容，属于你亲眼见过的社交记忆。\n';
+                groupContext += '这些内容可以直接当成“群里有人说过的话”来回应。\n';
+                groupContext += '不要把它们当成私聊，不要把它们解释成功能、系统、窗口或后台。\n';
                 if (userAskedAboutGroup) {
                     groupContext += '[最高优先级规则]\n';
                     groupContext += '用户刚刚提到了群聊或群里的事。你必须默认这是在问你亲眼见过的群聊经历。\n';
@@ -232,7 +613,9 @@ async function buildUniversalContext(context, character, recentInput = '', isGro
                     if (limit <= 0) continue;
                     const memberEntry = g.members.find(m => m.member_id === character.id);
                     const joinedAt = memberEntry?.joined_at || 0;
-                    const msgs = db.getVisibleGroupMessages(g.id, limit, joinedAt);
+                    const allMsgs = db.getVisibleGroupMessages(g.id, limit, joinedAt);
+                    const visibleTail = getAdaptiveTailWindowSize(limit, allMsgs.length);
+                    const msgs = allMsgs.slice(-visibleTail);
                     if (msgs.length > 0) {
                         hasGroupContent = true;
                         groupContext += `群聊《${g.name}》\n`;
@@ -262,58 +645,85 @@ async function buildUniversalContext(context, character, recentInput = '', isGro
         }
 
         if (db.city) {
-            let cityWorldContext = '\n[===== 商业街（City DLC）实时世界线 =====]\n';
+            let cityWorldContext = '\n[===== CITY SOURCE: 商业街（真实生活）实时世界线 =====]\n';
             let hasCityData = false;
             const normalizedRecentInput = String(recentInput || '').trim();
-            const userAskedAboutCity = /商业街|活动记录|打工|工厂|餐馆|便利店|公园|学校|街道|体力|钱包|吃了|吃饭|饿|撑|胃/.test(normalizedRecentInput);
-
-            cityWorldContext += '商业街是你真实生活的一部分，不是前端功能名，也不是用户口中的系统模块。那里包含工厂、餐馆、便利店、公园、学校、街道、家等地点，你会在那里移动、工作、吃饭、休息、花钱、恢复体力，也会听说别人的近况。\n';
-            cityWorldContext += '当用户提到商业街、活动记录、今天去哪了、吃了什么、肚子难不难受时，默认理解为在问你真实发生过的生活经历，而不是在讨论界面或后台。\n';
-            if (userAskedAboutCity) {
-                cityWorldContext += '[最高优先级规则]\n';
-                cityWorldContext += '用户刚刚提到了“商业街”或相关活动记录。你必须默认把这理解为在问你的真实生活轨迹。\n';
-                cityWorldContext += '你必须直接用第一人称回答自己的经历、状态、感受、去过的地点、吃过的东西、体力变化或钱包变化。\n';
-                cityWorldContext += '禁止把“商业街”解释成前端项目、功能模块、模拟系统、界面展示、后台数据或测试内容。\n';
-                cityWorldContext += '如果你最近没有新的商业街经历，也只能用角色口吻回答“我最近没怎么出门/没留下新经历/记不清具体细节”，不能反问用户这是什么功能。\n';
-            }
+            const userAskedAboutCity = await didUserAskAboutCity(db, character, normalizedRecentInput);
+            cityWorldContext += getCachedContextBlock(
+                db,
+                character.id,
+                userAskedAboutCity ? 'city_rules_asked' : 'city_rules_base',
+                { template_version: 2, userAskedAboutCity },
+                () => {
+                    let staticBlock = '[商业街规则]\n';
+                    staticBlock += '[CITY SOURCE RULES]\n';
+                    staticBlock += '- 下面内容是你的现实生活/商业街经历来源，不是群聊消息，也不是私聊消息。\n';
+                    staticBlock += '- 这些内容可以影响你当前状态，也可以被你像真人一样提起。\n';
+                    staticBlock += '- 不要把商业街记录误当成刚刚有人在聊天里说过的话。\n';
+                    staticBlock += '- 商业街=你的真实生活，不是功能或后台。\n';
+                    staticBlock += '- 亲身经历只认【本人亲历记录】；公共事件只能说成听说/看见。\n';
+                    staticBlock += '- 允许补主观感受，不允许补没给出的客观事实。\n';
+                    staticBlock += '- 没有亲历记录时，只能说最近没出门、没新经历或记不清细节。\n';
+                    if (userAskedAboutCity) {
+                        staticBlock += '[商业街问答优先级]\n';
+                        staticBlock += '- 用户此轮在问你的真实生活轨迹；优先回答去过哪、做过什么、吃了什么、体力/钱包变化。\n';
+                        staticBlock += '- 没有亲历记录时，只能回答没有明确新经历，或改成听说来的公共信息。\n';
+                        staticBlock += '- 禁止把商业街解释成功能、界面、后台或测试内容。\n';
+                    }
+                    return staticBlock;
+                }
+            );
 
             // X = Character's own recent physical actions in the city
             const cityConfig = typeof db.city.getConfig === 'function' ? db.city.getConfig() || {} : {};
             const limitX = parseInt(cityConfig.city_self_log_limit ?? 5, 10);
-            if (limitX > 0) {
-                const recentLogs = typeof db.city.getCharacterRecentLogs === 'function'
-                    ? db.city.getCharacterRecentLogs(character.id, limitX)
-                    : [];
-                if (recentLogs && recentLogs.length > 0) {
-                    hasCityData = true;
-                    cityWorldContext += '【你近期的亲身行动经历（第一视角）】：\n';
-                    for (const l of recentLogs) {
-                        const firstPersonLog = l.message.replace(new RegExp(character.name, 'g'), '我');
-                        cityWorldContext += `- ${firstPersonLog}\n`;
-                    }
-                }
-            }
-
-            // Y = Global city events/logs (what happened to others)
+            const recentLogs = limitX > 0 && typeof db.city.getCharacterRecentLogs === 'function'
+                ? (db.city.getCharacterRecentLogs(character.id, limitX) || [])
+                : [];
             const limitY = parseInt(cityConfig.city_global_log_limit ?? 5, 10);
-            if (limitY > 0) {
-                const globalLogs = db.city.getCityLogs(limitY);
-                if (globalLogs && globalLogs.length > 0) {
-                    hasCityData = true;
-                    cityWorldContext += '\n【近期公共街区事件 / 传闻（你听说过的）】：\n';
-                    for (const l of globalLogs) {
-                        const globalMsg = l.message || l.content;
-                        if (globalMsg) cityWorldContext += `- ${globalMsg}\n`;
+            const globalLogs = limitY > 0 ? (db.city.getCityLogs(limitY) || []) : [];
+            cityWorldContext += getCachedContextBlock(
+                db,
+                character.id,
+                userAskedAboutCity ? 'city_runtime_asked' : 'city_runtime_base',
+                {
+                    template_version: 2,
+                    userAskedAboutCity,
+                    self_logs: recentLogs.map(l => ({ timestamp: l.timestamp, message: l.message || '' })),
+                    global_logs: globalLogs.map(l => ({ timestamp: l.timestamp, message: l.message || l.content || '' }))
+                },
+                () => {
+                    let runtimeBlock = '';
+                    if (limitX > 0) {
+                        if (recentLogs.length > 0) {
+                            hasCityData = true;
+                            runtimeBlock += '\n【本人亲历记录】\n';
+                            runtimeBlock += '只把下面这些说成“我做过/我刚经历过”。\n';
+                            for (const l of recentLogs) {
+                                const firstPersonLog = l.message.replace(new RegExp(character.name, 'g'), '我');
+                                runtimeBlock += `- [${new Date(l.timestamp).toLocaleString()}] ${firstPersonLog}\n`;
+                            }
+                        } else {
+                            runtimeBlock += '\n【本人亲历记录：空】\n';
+                            runtimeBlock += '当前没有可直接引用的本人商业街行动记录。\n';
+                        }
                     }
+                    if (limitY > 0 && globalLogs.length > 0) {
+                        hasCityData = true;
+                        runtimeBlock += '\n【公共事件 / 传闻】\n';
+                        runtimeBlock += '下面这些只能当成听说/看见，不能说成“我做过”。\n';
+                        for (const l of globalLogs) {
+                            const globalMsg = l.message || l.content;
+                            if (globalMsg) runtimeBlock += `- [${new Date(l.timestamp).toLocaleString()}] ${globalMsg}\n`;
+                        }
+                    }
+                    runtimeBlock += '\n[商业街执行规则]\n';
+                    runtimeBlock += '- 优先用本人亲历记录回答“我做过什么”。\n';
+                    runtimeBlock += '- 公共事件只回答“我听说/我看到”。\n';
+                    runtimeBlock += '- 不要提日志、系统、后台、前端模块。\n';
+                    return runtimeBlock;
                 }
-            }
-
-            cityWorldContext += '\n[重要指令 - 行为准则]\n';
-            cityWorldContext += '1. 以上内容属于你在商业街里真实发生过、或者真实听说过的事情。请把它们当成你的生活事实。\n';
-            cityWorldContext += '2. 你必须用第一人称口吻，自然地在私聊中向用户提起这些事，以此表现你也是在平行世界里真实生活的角色。\n';
-            cityWorldContext += '3. 严禁提到“日志记录”“系统数据”“后台显示”“前端模块”之类的词，要表现得像在分享自己的生活碎片。\n';
-            cityWorldContext += '4. 如果最近没有具体商业街经历，不要反问用户“商业街是什么”；你只需要自然承认自己最近没怎么出门、没留下新经历，或者对细节记不太清。\n';
-            cityWorldContext += '[========================================]\n';
+            );
             prompt += cityWorldContext;
         }
     } catch (e) {

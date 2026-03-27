@@ -2,12 +2,19 @@ $ErrorActionPreference = 'Stop'
 
 $root = Split-Path -Parent $PSScriptRoot
 $runtimeDir = Join-Path $root '.runtime'
+$qdrantPidFile = Join-Path $runtimeDir 'qdrant.pid'
 $serverPidFile = Join-Path $runtimeDir 'server.pid'
 $clientPidFile = Join-Path $runtimeDir 'client.pid'
 $serverOut = Join-Path $root 'server-live.out.log'
 $serverErr = Join-Path $root 'server-live.err.log'
 $clientOut = Join-Path $root 'client-live.out.log'
 $clientErr = Join-Path $root 'client-live.err.log'
+$qdrantOut = Join-Path $root 'qdrant-live.out.log'
+$qdrantErr = Join-Path $root 'qdrant-live.err.log'
+$dockerComposeFile = Join-Path $root 'docker-compose.yml'
+$localQdrantExe = Join-Path $root 'tools\qdrant\current\qdrant.exe'
+$localQdrantConfig = Join-Path $root 'config\qdrant.yaml'
+$qdrantStorageDir = Join-Path $root 'data\qdrant\storage'
 
 New-Item -ItemType Directory -Force -Path $runtimeDir | Out-Null
 
@@ -51,7 +58,70 @@ function Wait-ForHttp($url, $timeoutSeconds) {
     return $false
 }
 
+function Reset-QdrantStorage() {
+    if (-not (Test-Path $qdrantStorageDir)) { return }
+    $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+    $backupPath = Join-Path (Split-Path $qdrantStorageDir -Parent) ("storage-corrupt-" + $stamp)
+    try {
+        Move-Item -Path $qdrantStorageDir -Destination $backupPath -Force
+    } catch {
+        if (Test-Path $qdrantStorageDir) {
+            cmd /c "rmdir /s /q `"$qdrantStorageDir`"" | Out-Null
+        }
+    }
+    New-Item -ItemType Directory -Force -Path $qdrantStorageDir | Out-Null
+}
+
+function Try-StartLocalQdrant() {
+    if (Test-Path $qdrantOut) { Remove-Item $qdrantOut -Force -ErrorAction SilentlyContinue }
+    if (Test-Path $qdrantErr) { Remove-Item $qdrantErr -Force -ErrorAction SilentlyContinue }
+    $qdrantProc = Start-Process -FilePath $localQdrantExe `
+        -ArgumentList @('--config-path', $localQdrantConfig) `
+        -WorkingDirectory $root `
+        -RedirectStandardOutput $qdrantOut `
+        -RedirectStandardError $qdrantErr `
+        -WindowStyle Hidden `
+        -PassThru
+    $qdrantProc.Id | Set-Content $qdrantPidFile
+    return Wait-ForHttp 'http://127.0.0.1:6333/collections' 20
+}
+
+function Start-Qdrant() {
+    if (Test-Path $localQdrantExe) {
+        Write-Host '[stack] starting local Qdrant binary on http://127.0.0.1:6333'
+        if (Try-StartLocalQdrant) {
+            return $true
+        }
+        Write-Host '[stack] local Qdrant failed to start, resetting storage and retrying once'
+        Stop-TrackedProcess $qdrantPidFile
+        Stop-PortListener 6333
+        Stop-PortListener 6334
+        Reset-QdrantStorage
+        if (Try-StartLocalQdrant) {
+            return $true
+        }
+        Write-Host '[stack] local Qdrant failed after retry; backend will use vectra fallback'
+        if (Test-Path $qdrantOut) { Get-Content $qdrantOut -Tail 60 }
+        if (Test-Path $qdrantErr) { Get-Content $qdrantErr -Tail 60 }
+        return $false
+    }
+
+    if (Test-Path $dockerComposeFile) {
+        Write-Host '[stack] starting Qdrant via docker compose on http://127.0.0.1:6333'
+        docker compose -f $dockerComposeFile up -d qdrant | Out-Host
+        if (-not (Wait-ForHttp 'http://127.0.0.1:6333/collections' 20)) {
+            Write-Host '[stack] docker Qdrant failed to start or is not reachable'
+            return $false
+        }
+        return $true
+    }
+
+    Write-Host '[stack] no local Qdrant binary or docker-compose.yml found'
+    return $false
+}
+
 Write-Host '[stack] stopping previous tracked processes'
+Stop-TrackedProcess $qdrantPidFile
 Stop-TrackedProcess $serverPidFile
 Stop-TrackedProcess $clientPidFile
 
@@ -60,18 +130,30 @@ Stop-PortListener 8000
 Stop-PortListener 5173
 Start-Sleep -Seconds 1
 
-foreach ($log in @($serverOut, $serverErr, $clientOut, $clientErr)) {
+foreach ($log in @($qdrantOut, $qdrantErr, $serverOut, $serverErr, $clientOut, $clientErr)) {
     if (Test-Path $log) { Remove-Item $log -Force -ErrorAction SilentlyContinue }
 }
 
+$qdrantReady = Start-Qdrant
+
 Write-Host '[stack] starting backend on http://localhost:8000'
-$serverProc = Start-Process -FilePath node `
-    -ArgumentList 'index.js' `
-    -WorkingDirectory (Join-Path $root 'server') `
-    -RedirectStandardOutput $serverOut `
-    -RedirectStandardError $serverErr `
-    -WindowStyle Hidden `
-    -PassThru
+$serverProc = if ($qdrantReady) {
+    Start-Process -FilePath node `
+        -ArgumentList 'index.js' `
+        -WorkingDirectory (Join-Path $root 'server') `
+        -RedirectStandardOutput $serverOut `
+        -RedirectStandardError $serverErr `
+        -WindowStyle Hidden `
+        -PassThru
+} else {
+    Start-Process -FilePath cmd.exe `
+        -ArgumentList @('/c', 'set QDRANT_ENABLED=0&& node index.js') `
+        -WorkingDirectory (Join-Path $root 'server') `
+        -RedirectStandardOutput $serverOut `
+        -RedirectStandardError $serverErr `
+        -WindowStyle Hidden `
+        -PassThru
+}
 $serverProc.Id | Set-Content $serverPidFile
 
 if (-not (Wait-ForHttp 'http://localhost:8000' 20)) {
@@ -96,6 +178,12 @@ if (-not (Wait-ForHttp 'http://localhost:5173' 25)) {
     exit 1
 }
 
+if ($qdrantReady) {
+    Write-Host '[stack] qdrant   : http://127.0.0.1:6333'
+    if (Test-Path $qdrantPidFile) { Write-Host "[stack] qdrant pid: $((Get-Content $qdrantPidFile | Select-Object -First 1))" }
+} else {
+    Write-Host '[stack] qdrant   : disabled for this run, backend using vectra fallback'
+}
 Write-Host '[stack] backend  : http://localhost:8000'
 Write-Host '[stack] frontend : http://localhost:5173'
 Write-Host "[stack] server pid: $($serverProc.Id)"

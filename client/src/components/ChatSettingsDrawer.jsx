@@ -17,6 +17,8 @@ function ChatSettingsDrawer({ contact, apiUrl, onClose, onClearHistory, isGenera
     const [expandedHistory, setExpandedHistory] = useState({});
     const [impressionHistories, setImpressionHistories] = useState({});
     const [contextStats, setContextStats] = useState(null);
+    const [emotionLogs, setEmotionLogs] = useState([]);
+    const [isLoadingEmotionLogs, setIsLoadingEmotionLogs] = useState(false);
     const [isScheduled, setIsScheduled] = useState(contact?.is_scheduled !== 0);
     const [todaySchedule, setTodaySchedule] = useState([]);
     const [isSavingSchedule, setIsSavingSchedule] = useState(false);
@@ -24,6 +26,7 @@ function ChatSettingsDrawer({ contact, apiUrl, onClose, onClearHistory, isGenera
     const [cityActionFreq, setCityActionFreq] = useState(contact?.city_action_frequency ?? 1);
     const [isSavingFreq, setIsSavingFreq] = useState(false);
     const [isRetryingSweep, setIsRetryingSweep] = useState(false);
+    const [isResettingPhysicalState, setIsResettingPhysicalState] = useState(false);
     const authHeaders = {
         'Content-Type': 'application/json',
         'Authorization': `Bearer ${localStorage.getItem('cp_token') || ''}`
@@ -60,6 +63,42 @@ function ChatSettingsDrawer({ contact, apiUrl, onClose, onClearHistory, isGenera
         const interval = setInterval(fetchStats, 15000);
         return () => clearInterval(interval);
     }, [contact?.id, apiUrl, messagesHideStateCount]);
+
+    useEffect(() => {
+        if (!contact) return;
+
+        let cancelled = false;
+        const fetchEmotionLogs = async () => {
+            setIsLoadingEmotionLogs(true);
+            try {
+                const r = await fetch(`${apiUrl}/characters/${contact.id}/emotion-logs?limit=30`, { headers: authHeaders });
+                const data = await r.json();
+                if (!cancelled) {
+                    setEmotionLogs(data.success ? (data.logs || []) : []);
+                }
+            } catch (err) {
+                if (!cancelled) {
+                    console.error('Failed to load emotion logs', err);
+                    setEmotionLogs([]);
+                }
+            } finally {
+                if (!cancelled) setIsLoadingEmotionLogs(false);
+            }
+        };
+
+        const handleRefresh = () => fetchEmotionLogs();
+        fetchEmotionLogs();
+        const interval = setInterval(fetchEmotionLogs, 5000);
+        window.addEventListener('refresh_contacts', handleRefresh);
+        window.addEventListener('city_update', handleRefresh);
+
+        return () => {
+            cancelled = true;
+            clearInterval(interval);
+            window.removeEventListener('refresh_contacts', handleRefresh);
+            window.removeEventListener('city_update', handleRefresh);
+        };
+    }, [contact?.id, apiUrl]);
 
     useEffect(() => {
         if (!contact) return;
@@ -269,16 +308,56 @@ function ChatSettingsDrawer({ contact, apiUrl, onClose, onClearHistory, isGenera
         }
     };
 
-    const estimatedTotal = contextStats?.total ?? (
-        (contextStats?.base || 0)
-        + (contextStats?.x_chat || 0)
-        + (contextStats?.city_x_y || 0)
-        + (contextStats?.z_memory || 0)
-        + (contextStats?.moments || 0)
-        + (contextStats?.cross_group || 0)
-        + (contextStats?.cross_private || 0)
-        + (contextStats?.q_impression || 0)
-    );
+    const handleResetPhysicalState = async () => {
+        if (!contact?.id) return;
+        if (!window.confirm(lang === 'en'
+            ? `Reset ${contact.name}'s negative physical state? This will restore energy and clear sleep/stress-related burden.`
+            : `确定要清空 ${contact.name} 的负面生理状态吗？这会恢复精力，并清掉睡眠债、压力和相关干扰。`)) return;
+        setIsResettingPhysicalState(true);
+        try {
+            const res = await fetch(`${apiUrl}/characters/${contact.id}/reset-physical-state`, {
+                method: 'POST',
+                headers: authHeaders
+            });
+            const data = await res.json();
+            if (!res.ok || !data.success) {
+                alert((lang === 'en' ? 'Reset failed: ' : '重置失败：') + (data.error || 'Unknown error'));
+                return;
+            }
+            await refreshStats();
+            window.dispatchEvent(new Event('refresh_contacts'));
+            window.dispatchEvent(new Event('city_update'));
+            alert(lang === 'en' ? 'Negative physical state cleared.' : '负面生理状态已清空。');
+        } catch (e) {
+            console.error('Failed to reset physical state', e);
+            alert(lang === 'en' ? 'Network request failed.' : '网络请求失败。');
+        } finally {
+            setIsResettingPhysicalState(false);
+        }
+    };
+
+    const estimatedWithoutCache = contextStats?.estimated_without_cache_tokens ?? 0;
+    const estimatedWithCache = contextStats?.estimated_with_cache_tokens ?? 0;
+    const estimatedTailTokens = contextStats?.estimated_tail_tokens ?? 0;
+    const estimatedWithoutCacheBase = contextStats?.estimated_without_cache_base_tokens ?? 0;
+    const estimatedWithCacheBase = contextStats?.estimated_with_cache_base_tokens ?? 0;
+    const estimatedWithoutCacheX = contextStats?.estimated_full_history_tokens ?? 0;
+    const estimatedWithCacheX = contextStats?.estimated_history_tokens ?? 0;
+    const estimatedY = contextStats?.city_x_y ?? 0;
+    const estimatedZ = contextStats?.z_memory ?? 0;
+    const estimatedMoments = contextStats?.moments ?? 0;
+    const estimatedO = contextStats?.q_impression ?? 0;
+    const actualInputTokens = contextStats?.last_conversation_prompt_tokens || contextStats?.last_actual_prompt_tokens || 0;
+    const actualSavedTokens = Math.max(0, estimatedWithoutCache - actualInputTokens);
+    const actualSavedRate = estimatedWithoutCache > 0
+        ? Math.round((actualSavedTokens / estimatedWithoutCache) * 100)
+        : 0;
+
+    const formatEmotionLogDelta = (label, before, after) => {
+        if (before == null && after == null) return null;
+        if (before === after) return null;
+        return `${label} ${before ?? '-'}→${after ?? '-'}`;
+    };
 
     return (
         <div className="memory-drawer" style={{ width: '320px', backgroundColor: '#f7f7f7' }}>
@@ -413,23 +492,43 @@ function ChatSettingsDrawer({ contact, apiUrl, onClose, onClearHistory, isGenera
                     </div>
                     {contextStats ? (
                         <div style={{ display: 'flex', flexDirection: 'column', gap: '8px', fontSize: '12px' }}>
-                            <div style={{ display: 'flex', justifyContent: 'space-between' }}><span style={{ color: '#666' }}>{lang === 'en' ? 'Base Prompt' : '基础设定与系统指令 (Base)'}</span><span style={{ fontWeight: '500', color: '#2c3e50' }}>{contextStats.base} T</span></div>
-                            <div style={{ display: 'flex', justifyContent: 'space-between' }}><span style={{ color: '#666' }}>{lang === 'en' ? 'Recent Private Chat (X)' : '近期私聊回顾 (X参数)'}</span><span style={{ fontWeight: '500', color: '#27ae60' }}>{contextStats.x_chat} T</span></div>
-                            <div style={{ display: 'flex', justifyContent: 'space-between' }}><span style={{ color: '#666' }}>{lang === 'en' ? 'City / Street Context (Y)' : '商业街环境感知 (Y参数)'}</span><span style={{ fontWeight: '500', color: '#e67e22' }}>{contextStats.city_x_y} T</span></div>
-                            <div style={{ display: 'flex', justifyContent: 'space-between' }}><span style={{ color: '#666' }}>{lang === 'en' ? 'Deep Memory (Z)' : '深层记忆调用 (Z参数)'}</span><span style={{ fontWeight: '500', color: '#8e44ad' }}>{contextStats.z_memory} T</span></div>
-                            <div style={{ display: 'flex', justifyContent: 'space-between' }}><span style={{ color: '#666' }}>{lang === 'en' ? 'Moments Context' : '朋友圈上下文'}</span><span style={{ fontWeight: '500', color: '#2980b9' }}>{contextStats.moments} T</span></div>
-                            {contextStats.cross_group > 0 && <div style={{ display: 'flex', justifyContent: 'space-between' }}><span style={{ color: '#27ae60' }}>👥 {lang === 'en' ? 'Visible Group Chats' : '可见群聊注入'}</span><span style={{ fontWeight: '500', color: '#27ae60' }}>{contextStats.cross_group} T</span></div>}
-                            <div style={{ display: 'flex', justifyContent: 'space-between' }}><span style={{ color: '#666' }}>{lang === 'en' ? 'Impression History (Q)' : '往事印象注入 (Q参数)'}</span><span style={{ fontWeight: '500', color: '#e74c3c' }}>{contextStats.q_impression} T</span></div>
-                            <div style={{ display: 'flex', justifyContent: 'space-between' }}><span style={{ color: '#666' }}>{lang === 'en' ? 'Estimated Prompt Total' : '估算输入总量'}</span><span style={{ fontWeight: '700', color: '#2c3e50' }}>{estimatedTotal} T</span></div>
-                            <div style={{ display: 'flex', justifyContent: 'space-between', borderTop: '1px dashed #eee', paddingTop: '8px', marginTop: '4px' }}><span style={{ color: '#666' }}>{lang === 'en' ? 'Memory Sweep Progress (W)' : '长时记忆消化积攒 (W)'}</span><span style={{ fontWeight: '500', color: contextStats.w_unsummarized_count >= contextStats.w_sweep_limit ? '#c0392b' : '#34495e' }}>{contextStats.w_unsummarized_count} / {contextStats.w_sweep_limit} {lang === 'en' ? 'msgs' : '条'}</span></div>
-                            {!!contextStats.w_last_error && <div style={{ marginTop: '6px', padding: '8px 10px', background: '#fff1f1', border: '1px solid #ffc0c0', borderRadius: '6px', color: '#c0392b', fontSize: '12px', lineHeight: 1.5 }}><strong>{lang === 'en' ? 'Sweep Error: ' : '整理失败：'}</strong>{contextStats.w_last_error}</div>}
-                            {contextStats.w_last_run_at > 0 && <div style={{ display: 'flex', justifyContent: 'space-between' }}><span style={{ color: '#666' }}>{lang === 'en' ? 'Last Sweep Attempt' : '上次整理尝试'}</span><span style={{ fontWeight: '500', color: '#555' }}>{new Date(contextStats.w_last_run_at).toLocaleString()}</span></div>}
-                            {contextStats.w_last_success_at > 0 && <div style={{ display: 'flex', justifyContent: 'space-between' }}><span style={{ color: '#666' }}>{lang === 'en' ? 'Last Sweep Success' : '上次整理成功'}</span><span style={{ fontWeight: '500', color: '#2e7d32' }}>{new Date(contextStats.w_last_success_at).toLocaleString()}</span></div>}
-                            <div style={{ display: 'flex', justifyContent: 'space-between' }}><span style={{ color: '#666' }}>{lang === 'en' ? 'Last Saved Memories' : '上次新增记忆'}</span><span style={{ fontWeight: '500', color: '#8e44ad' }}>{contextStats.w_last_saved_count ?? 0}</span></div>
-                            <div style={{ display: 'flex', justifyContent: 'space-between', borderTop: '1px dashed #eee', paddingTop: '8px', marginTop: '4px' }}><span style={{ color: '#666' }}>{lang === 'en' ? 'Actual Input Tokens' : '实际输入 token'}</span><span style={{ fontWeight: '500', color: '#2c3e50' }}>{contextStats.actual_prompt_tokens_total ?? 0}</span></div>
-                            <div style={{ display: 'flex', justifyContent: 'space-between' }}><span style={{ color: '#666' }}>{lang === 'en' ? 'Actual Output Tokens' : '实际输出 token'}</span><span style={{ fontWeight: '500', color: '#8e44ad' }}>{contextStats.actual_completion_tokens_total ?? 0}</span></div>
-                            <div style={{ display: 'flex', justifyContent: 'space-between' }}><span style={{ color: '#666' }}>{lang === 'en' ? 'Actual Total Tokens' : '实际总 token'}</span><span style={{ fontWeight: '700', color: '#c0392b' }}>{contextStats.actual_total_tokens ?? 0}</span></div>
-                            <div style={{ display: 'flex', justifyContent: 'space-between' }}><span style={{ color: '#666' }}>{lang === 'en' ? 'Tracked Requests' : '已统计请求数'}</span><span style={{ fontWeight: '500', color: '#16a085' }}>{contextStats.actual_request_count ?? 0}</span></div>
+                            <div style={{ padding: '12px', borderRadius: '10px', background: '#eff6ff', border: '1px solid #bfdbfe' }}>
+                                <div style={{ fontSize: '12px', color: '#2563eb', marginBottom: '6px' }}>
+                                    {lang === 'en' ? 'Actual token saved last round' : '上一轮实际省下的 token'}
+                                </div>
+                                <div style={{ fontSize: '26px', fontWeight: '800', color: '#1d4ed8', lineHeight: 1.1 }}>
+                                    {actualSavedRate}%
+                                </div>
+                                <div style={{ fontSize: '12px', color: '#1e40af', marginTop: '6px', lineHeight: 1.5 }}>
+                                    {lang === 'en'
+                                        ? `About ${actualSavedTokens} tokens were saved in the last real request.`
+                                        : `按上一轮真实输入算，大约少喂了 ${actualSavedTokens} 个 token。`}
+                                </div>
+                            </div>
+                            <div style={{ display: 'flex', justifyContent: 'space-between' }}><span style={{ color: '#666' }}>{lang === 'en' ? 'Estimated Without Cache' : '无缓存预估 token'}</span><span style={{ fontWeight: '700', color: '#c0392b' }}>{estimatedWithoutCache} T</span></div>
+                            <div style={{ display: 'flex', justifyContent: 'space-between' }}><span style={{ color: '#666' }}>{lang === 'en' ? 'Estimated With Cache' : '有缓存后预估 token'}</span><span style={{ fontWeight: '700', color: '#2c3e50' }}>{estimatedWithCache} T</span></div>
+                            <div style={{ display: 'flex', justifyContent: 'space-between' }}><span style={{ color: '#666' }}>{lang === 'en' ? 'Tail Tokens' : '尾巴 token'}</span><span style={{ fontWeight: '700', color: '#27ae60' }}>{estimatedTailTokens} T</span></div>
+                            <div style={{ display: 'flex', justifyContent: 'space-between', borderTop: '1px dashed #eee', paddingTop: '8px', marginTop: '4px' }}><span style={{ color: '#666', fontWeight: '600' }}>{lang === 'en' ? 'Without Cache Breakdown' : '无缓存预估明细'}</span><span style={{ fontWeight: '700', color: '#c0392b' }}>{estimatedWithoutCache} T</span></div>
+                            <div style={{ display: 'flex', justifyContent: 'space-between' }}><span style={{ color: '#666' }}>{lang === 'en' ? 'Base' : '基础设定与系统指令 (Base)'}</span><span style={{ fontWeight: '500', color: '#333' }}>{estimatedWithoutCacheBase} T</span></div>
+                            <div style={{ display: 'flex', justifyContent: 'space-between' }}><span style={{ color: '#666' }}>{lang === 'en' ? 'Private Window (X)' : '私聊上下文窗口 (X参数)'}</span><span style={{ fontWeight: '500', color: '#27ae60' }}>{estimatedWithoutCacheX} T</span></div>
+                            <div style={{ display: 'flex', justifyContent: 'space-between' }}><span style={{ color: '#666' }}>{lang === 'en' ? 'City Context (Y)' : '商业街环境感知 (Y参数)'}</span><span style={{ fontWeight: '500', color: '#e67e22' }}>{estimatedY} T</span></div>
+                            <div style={{ display: 'flex', justifyContent: 'space-between' }}><span style={{ color: '#666' }}>{lang === 'en' ? 'Deep Memory (Z)' : '深层记忆调用 (Z参数)'}</span><span style={{ fontWeight: '500', color: '#7f8c8d' }}>{estimatedZ} T</span></div>
+                            <div style={{ display: 'flex', justifyContent: 'space-between' }}><span style={{ color: '#666' }}>{lang === 'en' ? 'Moments Feed' : '朋友圈上下文'}</span><span style={{ fontWeight: '500', color: '#7f8c8d' }}>{estimatedMoments} T</span></div>
+                            <div style={{ display: 'flex', justifyContent: 'space-between' }}><span style={{ color: '#666' }}>{lang === 'en' ? 'Impression History (Q)' : '往事印象注入 (Q参数)'}</span><span style={{ fontWeight: '500', color: '#c0392b' }}>{estimatedO} T</span></div>
+                            <div style={{ display: 'flex', justifyContent: 'space-between', borderTop: '1px dashed #eee', paddingTop: '8px', marginTop: '4px' }}><span style={{ color: '#666', fontWeight: '600' }}>{lang === 'en' ? 'With Cache Breakdown' : '有缓存后预估明细'}</span><span style={{ fontWeight: '700', color: '#2c3e50' }}>{estimatedWithCache} T</span></div>
+                            <div style={{ display: 'flex', justifyContent: 'space-between' }}><span style={{ color: '#666' }}>{lang === 'en' ? 'Base' : '基础设定与系统指令 (Base)'}</span><span style={{ fontWeight: '500', color: '#333' }}>{estimatedWithCacheBase} T</span></div>
+                            <div style={{ display: 'flex', justifyContent: 'space-between' }}><span style={{ color: '#666' }}>{lang === 'en' ? 'Private Window (X)' : '私聊上下文窗口 (X参数)'}</span><span style={{ fontWeight: '500', color: '#27ae60' }}>{estimatedWithCacheX} T</span></div>
+                            <div style={{ display: 'flex', justifyContent: 'space-between' }}><span style={{ color: '#666' }}>{lang === 'en' ? 'City Context (Y)' : '商业街环境感知 (Y参数)'}</span><span style={{ fontWeight: '500', color: '#e67e22' }}>{estimatedY} T</span></div>
+                            <div style={{ display: 'flex', justifyContent: 'space-between' }}><span style={{ color: '#666' }}>{lang === 'en' ? 'Deep Memory (Z)' : '深层记忆调用 (Z参数)'}</span><span style={{ fontWeight: '500', color: '#7f8c8d' }}>{estimatedZ} T</span></div>
+                            <div style={{ display: 'flex', justifyContent: 'space-between' }}><span style={{ color: '#666' }}>{lang === 'en' ? 'Moments Feed' : '朋友圈上下文'}</span><span style={{ fontWeight: '500', color: '#7f8c8d' }}>{estimatedMoments} T</span></div>
+                            <div style={{ display: 'flex', justifyContent: 'space-between' }}><span style={{ color: '#666' }}>{lang === 'en' ? 'Impression History (Q)' : '往事印象注入 (Q参数)'}</span><span style={{ fontWeight: '500', color: '#c0392b' }}>{estimatedO} T</span></div>
+                            <div style={{ display: 'flex', justifyContent: 'space-between' }}><span style={{ color: '#666' }}>{lang === 'en' ? 'Tail Tokens' : '尾巴 token'}</span><span style={{ fontWeight: '700', color: '#27ae60' }}>{estimatedTailTokens} T</span></div>
+                            <div style={{ display: 'flex', justifyContent: 'space-between', borderTop: '1px dashed #eee', paddingTop: '8px', marginTop: '4px' }}><span style={{ color: '#666', fontWeight: '600' }}>{lang === 'en' ? 'Actual Input Tokens' : '实际输入 token'}</span><span style={{ fontWeight: '700', color: '#8e44ad' }}>{actualInputTokens} T</span></div>
+                            <div style={{ display: 'flex', justifyContent: 'space-between', borderTop: '1px dashed #eee', paddingTop: '8px', marginTop: '4px' }}><span style={{ color: '#666', fontWeight: '600' }}>{lang === 'en' ? 'Memory Sweep Progress (W)' : '长时记忆消化积攒 (W参数)'}</span><span style={{ fontWeight: '500', color: (contextStats?.w_unsummarized_count ?? 0) >= (contextStats?.w_sweep_limit ?? 0) ? '#c0392b' : '#34495e' }}>{contextStats?.w_unsummarized_count ?? 0} / {contextStats?.w_sweep_limit ?? 0} {lang === 'en' ? 'msgs' : '条'}</span></div>
+                            {!!contextStats?.w_last_error && <div style={{ marginTop: '6px', padding: '8px 10px', background: '#fff1f1', border: '1px solid #ffc0c0', borderRadius: '6px', color: '#c0392b', fontSize: '12px', lineHeight: 1.5 }}><strong>{lang === 'en' ? 'Sweep Error: ' : '整理失败：'}</strong>{contextStats.w_last_error}</div>}
+                            {(contextStats?.w_last_run_at ?? 0) > 0 && <div style={{ display: 'flex', justifyContent: 'space-between' }}><span style={{ color: '#666' }}>{lang === 'en' ? 'Last Sweep Attempt' : '上次整理尝试'}</span><span style={{ fontWeight: '500', color: '#555' }}>{new Date(contextStats.w_last_run_at).toLocaleString()}</span></div>}
+                            {(contextStats?.w_last_success_at ?? 0) > 0 && <div style={{ display: 'flex', justifyContent: 'space-between' }}><span style={{ color: '#666' }}>{lang === 'en' ? 'Last Sweep Success' : '上次整理成功'}</span><span style={{ fontWeight: '500', color: '#2e7d32' }}>{new Date(contextStats.w_last_success_at).toLocaleString()}</span></div>}
+                            <div style={{ display: 'flex', justifyContent: 'space-between' }}><span style={{ color: '#666' }}>{lang === 'en' ? 'Last Saved Memories' : '上次新增记忆'}</span><span style={{ fontWeight: '500', color: '#8e44ad' }}>{contextStats?.w_last_saved_count ?? 0}</span></div>
                         </div>
                     ) : (
                         <div style={{ fontSize: '12px', color: '#999', textAlign: 'center', padding: '10px 0' }}>{lang === 'en' ? 'Calculating...' : '计算中...'}</div>
@@ -571,6 +670,92 @@ function ChatSettingsDrawer({ contact, apiUrl, onClose, onClearHistory, isGenera
                         ))
                     )}
                     {regenError && <div style={{ marginTop: '8px', padding: '6px 10px', background: '#fff1f1', border: '1px solid #ffc0c0', borderRadius: '6px', fontSize: '12px', color: '#c0392b' }}>⚠️ {regenError}</div>}
+                </div>
+
+                <div style={{ marginTop: '10px', backgroundColor: '#fff', padding: '15px', borderTop: '1px solid #eee', borderBottom: '1px solid #eee' }}>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '12px' }}>
+                        <div style={{ fontSize: '13px', fontWeight: 'bold', color: '#333' }}>
+                            {lang === 'en' ? 'Emotion Change Log' : '情绪变化日志'}
+                        </div>
+                        <div style={{ fontSize: '11px', color: '#999' }}>
+                            {isLoadingEmotionLogs ? (lang === 'en' ? 'Loading...' : '加载中...') : (lang === 'en' ? 'Auto refresh 5s' : '5秒自动刷新')}
+                        </div>
+                    </div>
+                    <div style={{ fontSize: '12px', color: '#666', marginBottom: '10px', lineHeight: '1.5' }}>
+                        {lang === 'en'
+                            ? 'Shows when emotion state changed, what caused it, and which hidden values moved.'
+                            : '这里会记录情绪什么时候变化、为什么变化，以及背后的隐藏数值是怎么变的。'}
+                    </div>
+                    {emotionLogs.length === 0 ? (
+                        <div style={{ fontSize: '12px', color: '#999', textAlign: 'center', padding: '10px 0', background: '#f8f9fa', borderRadius: '6px' }}>
+                            {isLoadingEmotionLogs ? (lang === 'en' ? 'Loading emotion logs...' : '正在读取情绪日志...') : (lang === 'en' ? 'No emotion changes logged yet.' : '暂时还没有情绪变化记录。')}
+                        </div>
+                    ) : (
+                        <div style={{ display: 'flex', flexDirection: 'column', gap: '8px', maxHeight: '340px', overflowY: 'auto', paddingRight: '2px' }}>
+                            {emotionLogs.map(log => {
+                                const deltas = [
+                                    formatEmotionLogDelta(lang === 'en' ? 'Mood' : '心情', log.old_mood, log.new_mood),
+                                    formatEmotionLogDelta(lang === 'en' ? 'Stress' : '压力', log.old_stress, log.new_stress),
+                                    formatEmotionLogDelta(lang === 'en' ? 'Social' : '社交需求', log.old_social_need, log.new_social_need),
+                                    formatEmotionLogDelta(lang === 'en' ? 'Pressure' : '焦虑值', log.old_pressure, log.new_pressure),
+                                    formatEmotionLogDelta(lang === 'en' ? 'Jealousy' : '嫉妒值', log.old_jealousy, log.new_jealousy)
+                                ].filter(Boolean);
+                                return (
+                                    <div key={log.id} style={{ background: '#f8f9fa', borderRadius: '8px', padding: '10px', borderLeft: '3px solid #ffb74d' }}>
+                                        <div style={{ display: 'flex', justifyContent: 'space-between', gap: '10px', marginBottom: '4px' }}>
+                                            <div style={{ fontSize: '12px', fontWeight: '600', color: '#333' }}>
+                                                {(log.old_state || (lang === 'en' ? 'Unknown' : '未知'))} → {(log.new_state || (lang === 'en' ? 'Unknown' : '未知'))}
+                                            </div>
+                                            <div style={{ fontSize: '11px', color: '#999', whiteSpace: 'nowrap' }}>
+                                                {log.timestamp ? new Date(log.timestamp).toLocaleString() : '-'}
+                                            </div>
+                                        </div>
+                                        <div style={{ fontSize: '11px', color: '#b26a00', marginBottom: '6px' }}>
+                                            {lang === 'en' ? 'Source: ' : '来源：'}{log.source || '-'}
+                                        </div>
+                                        <div style={{ fontSize: '12px', color: '#555', lineHeight: '1.5' }}>
+                                            {log.reason || (lang === 'en' ? 'No explicit reason.' : '没有记录到明确原因。')}
+                                        </div>
+                                        {deltas.length > 0 && (
+                                            <div style={{ marginTop: '6px', fontSize: '11px', color: '#777', lineHeight: '1.5' }}>
+                                                {deltas.join(' | ')}
+                                            </div>
+                                        )}
+                                    </div>
+                                );
+                            })}
+                        </div>
+                    )}
+                </div>
+
+                <div style={{ marginTop: '10px', backgroundColor: '#fff', borderTop: '1px solid #eee', borderBottom: '1px solid #eee' }}>
+                    <div style={{ padding: '15px', display: 'flex', flexDirection: 'column', gap: '10px' }}>
+                        <div style={{ fontSize: '13px', fontWeight: 'bold', color: '#333' }}>
+                            {lang === 'en' ? 'Physical Reset' : '生理状态重置'}
+                        </div>
+                        <div style={{ fontSize: '12px', color: '#666', lineHeight: '1.5' }}>
+                            {lang === 'en'
+                                ? 'One click to restore energy and clear sleep/stress-related burden without touching affinity, memories, or wallet.'
+                                : '一键恢复精力，并清空睡眠债、压力和相关干扰，不会影响好感、记忆或钱包。'}
+                        </div>
+                        <button
+                            onClick={handleResetPhysicalState}
+                            disabled={isResettingPhysicalState}
+                            style={{
+                                padding: '10px 12px',
+                                border: '1px solid #7fb3ff',
+                                background: isResettingPhysicalState ? '#eef5ff' : '#f7fbff',
+                                color: '#2f74d0',
+                                borderRadius: '8px',
+                                cursor: isResettingPhysicalState ? 'not-allowed' : 'pointer',
+                                fontWeight: '600'
+                            }}
+                        >
+                            {isResettingPhysicalState
+                                ? (lang === 'en' ? 'Resetting...' : '重置中...')
+                                : (lang === 'en' ? 'Clear Negative Physical State' : '一键清空负面生理状态')}
+                        </button>
+                    </div>
                 </div>
 
                 <div style={{ marginTop: '10px', backgroundColor: '#fff', borderTop: '1px solid #eee', borderBottom: '1px solid #eee' }}>

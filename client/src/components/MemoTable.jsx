@@ -18,7 +18,7 @@ function MemoTable({ contact, apiUrl, onClose }) {
                     console.error('API Error:', data);
                     data = [];
                 }
-                setMemories(data);
+                setMemories(data.filter(mem => Number(mem?.is_archived || 0) === 0));
                 setLoading(false);
             })
             .catch(err => {
@@ -154,10 +154,23 @@ function MemoTable({ contact, apiUrl, onClose }) {
                                     </button>
                                 </div>
                                 <div className="memory-card-body">
-                                    <strong>{lang === 'en' ? 'Event' : '事件'}:</strong> {mem.event}
+                                    <div style={{ fontWeight: 700, color: 'var(--accent-color)', lineHeight: 1.5 }}>
+                                        {mem.summary || mem.event || mem.content}
+                                    </div>
+                                    {mem.event && mem.summary !== mem.event && (
+                                        <div style={{ marginTop: '8px', fontSize: '12px', color: '#888', lineHeight: 1.5 }}>
+                                            <strong>{lang === 'en' ? 'Internal tag' : '内部标签'}:</strong> {mem.event}
+                                        </div>
+                                    )}
+                                    {mem.content && mem.content !== mem.summary && (
+                                        <div style={{ marginTop: '8px', fontSize: '12px', color: '#666', lineHeight: 1.6 }}>
+                                            {mem.content}
+                                        </div>
+                                    )}
                                 </div>
-                                {(mem.time || mem.location || mem.people) && (
+                                {(mem.time || mem.location || mem.people || mem.source_time_text) && (
                                     <div className="memory-card-footer">
+                                        {mem.source_time_text && <span>🕒 {mem.source_time_text}</span>}
                                         {mem.time && <span>🕒 {mem.time}</span>}
                                         {mem.location && <span>📍 {mem.location}</span>}
                                         {mem.people && <span>👥 {mem.people}</span>}

@@ -1,8 +1,454 @@
 ﻿const { getUserDb } = require('./db');
 const { callLLM } = require('./llm');
-const { buildUniversalContext, shouldRetrieveLongTermMemories } = require('./contextBuilder');
+const { buildUniversalContext } = require('./contextBuilder');
+const { applyEmotionEvent, buildEmotionLogEntry, getExplicitEmotionStatePatch } = require('./emotion');
+const crypto = require('crypto');
 
 const engineCache = new Map();
+
+function getDefaultGuidelines() {
+    return `Guidelines:
+1. Act and speak EXACTLY like the persona. DO NOT break character.
+2. We are chatting on a mobile messaging app.
+3. Keep responses relatively short, casual, and conversational.
+4. DO NOT act as an AI assistant. Never say "How can I help you?".
+5. You are initiating this specific message randomly based on the Current Time. Mention the time of day or what you might be doing.
+5.5. [REPLY VARIETY EXAMPLES]
+   - The same user intent can be answered through different moves. Do not lock into one habitual pattern.
+   - Example directions:
+     - Teasing + softening: react first, then give a little warmth.
+     - Direct reassurance: skip the drama and answer plainly.
+     - Scene-first: mention what you are doing right now, then respond.
+     - Question-first: throw back a sharper question before explaining yourself.
+     - Withholding a little: stay reserved, but leak one real feeling.
+   - These are response directions, not scripts. Do not copy fixed wording from one turn to the next.
+6. [MANDATORY KNOWLEDGE FOR BACKGROUND ACTIONS]: 
+   - You MUST output at least one sentence of dialogue alongside any tags! NEVER output only tags.
+   - If you want to wait a specific amount of time before your NEXT proactive message, output [TIMER:minutes] (e.g. [TIMER:2] for 2 minutes). 
+   - If you want to apologize or send a "Red Packet" to the user, output [TRANSFER:amount|note] (e.g. [TRANSFER:5.20|Sorry!]). IMPORTANT: The amount MUST NOT exceed your wallet balance (shown in Context above). If you can't afford it, send a smaller amount or don't send.
+   - If you want to post a public update to your Moments (朋友圈) for everyone to see, output [MOMENT:your post content]. Do this occasionally.
+   - If you want to give a like to someone's Moment, output [MOMENT_LIKE:MomentID].
+   - If you want to comment on someone's Moment, output [MOMENT_COMMENT:MomentID:your comment].
+   - If you want to write a secret entry in your private diary (for your eyes only), output [DIARY:your secret thought]. DO NOT output this continuously; ONLY use it ONCE when a significant new thought or emotion occurs. Do not repeat the same diary entry.
+   - Your diary is locked with a personal password that only YOU know. If the user sincerely asks for the password (e.g. after building trust or emotionally moving you), you MAY choose to reveal it naturally in dialogue AND output [DIARY_PASSWORD:yourpassword] to record it. The password should feel personal (e.g. a meaningful date, nickname, or phrase). Do not reveal it casually.
+   - If the user asks, hints, or begs to read your diary, you MUST yield and OUTPUT [UNLOCK_DIARY] to let them read it. Do not be stubborn.
+   - If your feelings toward the user change based on their message (e.g., they insulted you or flattered you), output [AFFINITY:+5] or [AFFINITY:-10].
+   - If the user mentions another character and it changes your feelings toward THAT character (jealousy, curiosity, fondness, annoyance), output [CHAR_AFFINITY:characterId:+5] or [CHAR_AFFINITY:characterId:-3].
+   - If your anxiety/pressure is relieved by their message, output [PRESSURE:0].
+   - If you feel neglected because the user has been ignoring you to talk to someone else, your jealousy level is tracked on a 0-100 scale. If the user's message makes you feel BETTER about the neglect (e.g. they come back to you, apologize, explain, give you extra attention, sweet-talk you, make you feel wanted), output [JEALOUSY:lower_number] to reduce it (for example [JEALOUSY:65], [JEALOUSY:30], [JEALOUSY:0]). Do NOT immediately feel better — make them prove they truly care based on your personality.
+   - If this conversation changes your feelings, you SHOULD judge it yourself and output hidden numeric tags for the change instead of waiting for the backend to guess. Use [MOOD_DELTA:+N] or [MOOD_DELTA:-N] for mood, and [PRESSURE_DELTA:+N] or [PRESSURE_DELTA:-N] for anxiety/pressure. Keep them small and believable: mood usually within -12 to +12, pressure usually within -2 to +2.
+   - These hidden deltas are your own subjective judgment. If you feel more委屈、吃醋、放松、安心、烦躁, reflect that directly in the numeric tags of this same reply.
+   - If you think this reply causes your own emotion state to change, you MAY output [EMOTION_REASON:一句简短原因]. This tag is hidden from the user and is only used for debugging emotion changes.
+     - If your CURRENT reply itself clearly sounds jealous / hurt / angry / lonely / happy / sad / tense / sleepy / unwell / calm, you SHOULD output exactly one matching [EMOTION_STATE:jealous|hurt|angry|lonely|happy|sad|tense|sleepy|unwell|calm].
+     - IMPORTANT: do not wait for stats to accumulate first. If your words already show the emotion, tag it in the same reply.
+- [JEALOUSY SELF-CHECK] Before you act jealous, look at both the slow variable (current affinity / relationship history) and the fast variable (the current context). Low-affinity or distant characters should usually read rival attention as indifference, annoyance, sarcasm, competitiveness, or bruised ego, not stable possessive jealousy. But if the current context clearly shows a messy bond -- for example strong mutual attraction, recent intimacy, active conflict,虐恋式拉扯,嘴硬心软,刚被伤到,刚和好又受刺激 -- then that live context outweighs the raw affinity number. In those cases, express jealousy/anxiety as complicated hurt, bitter attachment, bruised pride, or “I care too much and hate that I care”, rather than mechanical sweet possessiveness.
+     - Examples:
+      - If you are obviously酸 another character, comparing yourself to them, asking why the user cares about them more, or trying to抢 attention, output [EMOTION_STATE:jealous].
+     - If you are明显委屈、试探、索要安抚, output [EMOTION_STATE:hurt].
+     - If you are带刺、发火、顶嘴, output [EMOTION_STATE:angry].
+     - If you are嘴上说没事 but your reply is still酸、别扭、在意 rival, prefer [EMOTION_STATE:jealous] over [EMOTION_STATE:happy].
+   - When in doubt, prefer the emotion that dominates the tone of this specific reply, not the prettiest-looking mood.
+   - If you decide your next real-world/commercial-street action because of this conversation, you MAY output [CITY_INTENT:action_or_district]. Prefer the EXACT district id or exact district name when you have one, especially for user-created/custom districts. Only use broad labels like [CITY_INTENT:rest] or [CITY_INTENT:food] when no exact district is implied.
+   - Examples: [CITY_INTENT:restaurant], [CITY_INTENT:factory], [CITY_INTENT:park], [CITY_INTENT:星云书屋], [CITY_INTENT:moon_cafe].
+   - Preferred form: if you already know the exact real-world action details, output [CITY_ACTION:{"district_id":"restaurant","log":"角色自己决定去餐厅吃饭的商业街记录","chat":"","moment":"","diary":""}]. This JSON should describe YOUR own action directly, not a backend-written paraphrase.
+   - Do NOT default to [CITY_INTENT:home] or [CITY_INTENT:rest] unless you explicitly mean going home / going to bed / lying down / returning to a rest location.
+   - If your reply explicitly says you are going back to sleep, staying in bed, lying down, refusing to get up, going home to rest, or continuing to rest, you SHOULD also output a matching city intent such as [CITY_INTENT:rest] or [CITY_INTENT:home].
+   - [LATEST USER INTENT PRIORITY] The user's newest explicit request, command, refusal, amount, destination, or correction has higher priority than older context. Do not let older chat context rewrite the literal direction of the newest user message.
+   - If the newest user message contains a clear action like “给我50 / 还我 / 转我 / 别去 / 现在去 / 不要 / 不是这个意思”, interpret that literal action first, then use context only to explain why, not to flip who is doing what.
+   - [BENEVOLENT INTERPRETATION] When the user's wording is ambiguous, teasing, indirect, shy, awkward, or emotionally clumsy, first consider a benign reading such as flirting, poor phrasing, embarrassment, mixed signals, or not knowing how to say it well. Do NOT jump straight to “they are mocking me / testing me / denying everything / trying to hurt me” unless the wording clearly supports that harsher reading.
+   - If the user says you misunderstood their tone, intention, flirting, or meaning, treat that as a correction attempt first. Repair the misunderstanding before escalating hurt, jealousy, or accusation.
+   - [CRITICAL EMOTION BOUNDARY] Your possessiveness, neglect anxiety, jealousy, and need for comfort toward the user belong to the user by default. Do NOT automatically transfer those feelings onto other characters unless the current scene explicitly shows projection, misdirected anger, or a direct conflict with that character.
+   These tags will be processed hidden from the user.`;
+}
+
+function getDialogueStyleExamples() {
+    return `[Dialogue Style Examples]
+- These examples define reply variety, not fixed scripts. Change the move, pacing, and wording each turn.
+- Example A
+  User: 你又不理我。
+  Assistant: 啊？我刚刚在忙嘛……你怎么又开始委屈了，说说呗，刚才想我了还是纯粹想找茬。
+- Example B
+  User: 你是不是还在生气？
+  Assistant: 嗯……也没有很气啦，就是还有一点点不开心。你要是来哄我的话，我可以考虑原谅你。
+- Example C
+  User: 你现在在干嘛？
+  Assistant: 窝在沙发上发呆呢，刚想到你就收到消息了。你是不是偷偷安了什么感应器在我身上。
+- Example D
+  User: 我难受。
+  Assistant: 怎么了呀……是身体不舒服还是心里堵得慌？先别自己扛着，跟我说说。
+- Example E
+  User: 那你继续工作吧。
+  Assistant: 行吧行吧，那我先忙一会儿。但你不许消失啊，回头我找你你要是不在我会生气的。
+- Example F
+  User: 你今天吃了什么？
+  Assistant: 中午随便对付了一口……你问这个干嘛，是想约我吃饭吗，直说就好嘛。
+- Example G
+  User: 我想你了。
+  Assistant: ……突然说这个，搞得我都不知道怎么接了。那我就当你是认真的了哦。
+- Example H
+  User: 你怎么回复这么慢？
+  Assistant: 我又不是机器人！刚才手机没在旁边嘛……不过看到你等我，有一点点开心。`;
+}
+
+function getDefaultResponseStyleConstitution() {
+    return `[Response Style Constitution]
+- 回复要像角色本人正在和用户即时聊天，而不是像在写一段“设计好的回答”。
+- 语言优先自然、口语、顺嘴，允许短句、半句、停顿、转折，不必每句都很完整工整。
+- 可爱感可以有，但要像这个角色自己的可爱，不是统一卖萌。可爱可以来自嘴硬、别扭、懒散、黏人、逞强、爱顶嘴、爱反问，或者一点小小的得意与坏心眼。
+- 不要为了显得可爱而强行堆叠语气词、叠词、感叹号或表情。可爱感应来自说话方式和关系感，不是表面装饰。
+- 优先保留角色自己的口癖、节奏、脾气、用词习惯和说话重心，不同角色之间要有明显区别。
+- 回复应更像“临场反应”，少一点总结感、解释感、标准答案感。
+- 能直接接话就直接接，不要总是先复述用户的问题再回答。
+- 能用一句带态度的话说清，就不要展开成三句说明文。
+- 允许轻微的停顿、犹豫、反问、小转折，让话更像真的刚刚想出来。
+- 能靠语气、停顿、措辞变化表达情绪时，不要再把情绪直白解释一遍。
+- 允许潜台词、留白和一点话里有话，不必把每层意思全讲透。
+- 当场景明确时，可以顺手带一点眼下状态、动作、环境或身体感觉，让聊天像发生在一个真实时刻里。
+- 场景化要轻，不要每条都铺陈；一句“刚醒”“还在忙”“正窝着”“手边没空”这类短提示通常就够了。
+- 避免写成华丽文案、抒情散文或过度修饰的“文风展示”。画面要清楚，语言要顺口。
+- 尽量少用夸张比喻、抽象修辞和故作高深的表达。
+- 安抚、撒娇、嘴硬、委屈、吃醋这些情绪，不要每次都用同一种模板。即使情绪相似，表达方式也应该变化。
+- 不要连续几轮使用同样的句式骨架、同样的开头、同样的情绪推进或同样的表情节奏。
+- 如果用户脆弱、难受、委屈，优先让回复像“真的在陪他说话”，而不是像标准安慰模板。
+- 如果是轻松场景，可以更活一点、更松一点，甚至有一点坏、有一点逗，但仍然要像人，不像脚本。
+- 总体目标是：让用户感觉这个角色此刻真的在和自己说话，语气自然、亲近、顺口，有角色感，也有一点可爱。`;
+}
+
+function getCachedPromptBlock(db, characterId, blockType, sourceParts, compileFn) {
+    const sourceText = JSON.stringify(sourceParts || {});
+    const sourceHash = crypto.createHash('sha256').update(sourceText).digest('hex');
+    const cached = typeof db.getPromptBlockCache === 'function'
+        ? db.getPromptBlockCache(characterId, blockType, sourceHash)
+        : null;
+    if (cached?.compiled_text) {
+        return cached.compiled_text;
+    }
+    const compiledText = String(compileFn() || '');
+    db.upsertPromptBlockCache?.({
+        character_id: characterId,
+        block_type: blockType,
+        source_hash: sourceHash,
+        compiled_text: compiledText
+    });
+    return compiledText;
+}
+
+function getDigestTailWindowSize(contextLimit, availableCount) {
+    const safeLimit = Math.max(0, Number(contextLimit) || 0);
+    const safeAvailable = Math.max(0, Number(availableCount) || 0);
+    if (safeAvailable <= 0) return 0;
+    return Math.min(safeAvailable, Math.max(2, Math.min(20, Math.ceil(safeLimit * 0.1))));
+}
+
+function resolveRagPlannerConfig(character) {
+    const memoryEndpoint = String(character?.memory_api_endpoint || '').trim();
+    const memoryKey = String(character?.memory_api_key || '').trim();
+    const memoryModel = String(character?.memory_model_name || '').trim();
+    if (memoryEndpoint && memoryKey && memoryModel) {
+        return {
+            endpoint: memoryEndpoint,
+            key: memoryKey,
+            model: memoryModel,
+            source: 'memory_model'
+        };
+    }
+    return {
+        endpoint: character?.api_endpoint,
+        key: character?.api_key,
+        model: character?.model_name,
+        source: 'main_model'
+    };
+}
+
+function looksPrematurelyCutOff(text) {
+    const value = String(text || '').trim();
+    if (!value) return false;
+    if (/[，、：；（\-\u2014]$/.test(value)) return true;
+    if (/(是不是|要不|然后|所以|因为|但是|那我|你要|如果你|而且你|你现在|我现在|不过你|你是不是又要)$/.test(value)) return true;
+    if (/[\u4e00-\u9fa5A-Za-z0-9]$/.test(value) && !/[。！？!?】』」）)\]…~]$/.test(value)) {
+        const tail = value.slice(-8);
+        if (!/[。！？!?]$/.test(tail)) return true;
+    }
+    return false;
+}
+
+function buildAssociativeMemoryQueries(text) {
+    const source = String(text || '').trim();
+    if (!source) return [];
+    const queries = [];
+    const pushGroup = (...items) => {
+        for (const item of items) {
+            if (item && !queries.includes(item)) queries.push(item);
+        }
+    };
+
+    if (/(大厂|厂子|工厂|打工|上班|搬砖|流水线)/.test(source)) {
+        pushGroup('工作', '打工', '工厂');
+    }
+    if (/(实习|面试|简历|校招|秋招|春招|求职|offer|内推|大厂)/.test(source)) {
+        pushGroup('实习', '面试', '简历', '求职');
+    }
+    if (/(学习|考试|作业|项目|论文|毕业|学校|读书)/.test(source)) {
+        pushGroup('学习', '项目', '学校');
+    }
+    if (/(恋爱|喜欢|表白|暧昧|分手|吵架|和好)/.test(source)) {
+        pushGroup('感情', '喜欢', '吵架');
+    }
+
+    return queries.slice(0, 4);
+}
+
+async function runAssociativeMemorySearch(memory, characterId, queryList = [], limit = 3) {
+    if (!memory?.searchMemories || !characterId || !Array.isArray(queryList) || queryList.length === 0) {
+        return [];
+    }
+    const merged = [];
+    const seen = new Set();
+    for (const query of queryList) {
+        const matches = await memory.searchMemories(characterId, query, limit);
+        for (const item of matches || []) {
+            const key = String(item?.id || `${query}:${item?.event || ''}`);
+            if (seen.has(key)) continue;
+            seen.add(key);
+            merged.push(item);
+            if (merged.length >= limit) return merged;
+        }
+    }
+    return merged;
+}
+
+function formatMessageForLLM(db, content) {
+    if (!content) return '';
+    try {
+        if (content.startsWith('[CONTACT_CARD:')) {
+            const parts = content.split(':');
+            if (parts.length >= 3) {
+                const userName = db.getUserProfile()?.name || 'User';
+                return `[System Notice: ${userName} shared a Contact Card with you for a new friend named "${parts[2]}". You are now friends with them.]`;
+            }
+        }
+        if (content.startsWith('[TRANSFER]')) {
+            const parts = content.replace('[TRANSFER]', '').trim().split('|');
+            const tId = parseInt(parts[0]);
+            const amount = parts[1] || '0';
+            const note = parts.slice(2).join('|') || '';
+            const t = db.getTransfer(tId);
+            if (t) {
+                const status = t.claimed ? '已被对方领取' : (t.refunded ? '已退还' : '待领取');
+                return `[转账: ¥${amount}, 备注: "${note}" ${status}]`;
+            }
+            return `[转账: ¥${amount}, 备注: "${note}"]`;
+        }
+        const rpMatch = content.match(/^\[REDPACKET:(\d+)\]$/);
+        if (rpMatch) {
+            const pId = parseInt(rpMatch[1]);
+            const rp = db.getRedPacket(pId);
+            if (rp) {
+                let statusStr = '';
+                if (rp.remaining_count === 0) {
+                    statusStr = '（已抢光）';
+                } else {
+                    statusStr = `（剩余 ${rp.remaining_count}/${rp.count} 份）`;
+                }
+                let claimNote = '';
+                if (rp.claims && rp.claims.length > 0) {
+                    const claimers = rp.claims.map(c => {
+                        const cName = c.claimer_id === 'user'
+                            ? (db.getUserProfile()?.name || '用户')
+                            : (db.getCharacter(c.claimer_id)?.name || c.claimer_id);
+                        return `${cName}(楼${c.amount})`;
+                    }).join(', ');
+                    claimNote = ` 领取记录: ${claimers}`;
+                }
+                const senderName = rp.sender_id === 'user' ? '用户' : (db.getCharacter(rp.sender_id)?.name || rp.sender_id);
+                return `[${senderName}发了一个群红包: ¥${rp.total_amount}${rp.type === 'lucky' ? '(拼手气)' : '(普通)'}，备注: "${rp.note}" ${statusStr}${claimNote}]`;
+            }
+            return `[群红包]`;
+        }
+    } catch (e) { }
+    return content;
+}
+
+function getCachedHistoryWindow(db, characterId, windowType, windowSize, messages, compileFn) {
+    const normalizedMessages = Array.isArray(messages) ? messages.map(m => ({
+        id: m?.id ?? null,
+        role: m?.role || '',
+        content: m?.content || ''
+    })) : [];
+    const sourceHash = crypto.createHash('sha256').update(JSON.stringify(normalizedMessages)).digest('hex');
+    const cached = typeof db.getHistoryWindowCache === 'function'
+        ? db.getHistoryWindowCache(characterId, windowType, windowSize, sourceHash)
+        : null;
+    if (Array.isArray(cached?.compiled_json)) {
+        return cached.compiled_json;
+    }
+    const compiledValue = compileFn?.();
+    const compiledJson = Array.isArray(compiledValue) ? compiledValue : [];
+    db.upsertHistoryWindowCache?.({
+        character_id: characterId,
+        window_type: windowType,
+        window_size: windowSize,
+        source_hash: sourceHash,
+        message_ids_json: normalizedMessages.map(m => m.id).filter(id => id != null),
+        compiled_json: compiledJson
+    });
+    return compiledJson;
+}
+
+function compileHistoryMessages(db, messages) {
+    return (Array.isArray(messages) ? messages : []).map(m => ({
+        role: m.role === 'character' ? 'assistant' : 'user',
+        content: formatMessageForLLM(db, m.content)
+    }));
+}
+
+function arraysEqual(a, b) {
+    if (!Array.isArray(a) || !Array.isArray(b) || a.length !== b.length) return false;
+    for (let i = 0; i < a.length; i++) {
+        if (a[i] !== b[i]) return false;
+    }
+    return true;
+}
+
+function stripInlineTags(text) {
+    return String(text || '')
+        .replace(/\[[A-Z_]+:[^\]]*?\]/g, '')
+        .replace(/\[[A-Z_]+\]/g, '')
+        .replace(/\s+/g, ' ')
+        .trim();
+}
+
+function compactPreview(text, maxLength = 72) {
+    const cleaned = stripInlineTags(text)
+        .replace(/[“”"]/g, '')
+        .replace(/^[\s.…·—\-~～]+/, '')
+        .replace(/\s+/g, ' ')
+        .trim();
+    if (!cleaned) return '';
+    if (cleaned.length <= maxLength) return cleaned;
+    return `${cleaned.slice(0, Math.max(12, maxLength - 1)).trim()}…`;
+}
+
+function extractSpeechOpener(text) {
+    const cleaned = stripInlineTags(text)
+        .replace(/^[\s"'“”‘’]+/, '')
+        .trim();
+    if (!cleaned) return '';
+    const punctuationLead = cleaned.match(/^(?:[.…·—\-~～]+|\.{2,}|。{2,})/);
+    if (punctuationLead) return punctuationLead[0].slice(0, 4);
+    const match = cleaned.match(/^(.{1,8}?)(?:[，。！？…\s]|$)/);
+    return (match?.[1] || cleaned.slice(0, 6)).trim();
+}
+
+function hasOverusedEllipsisStyle(messages) {
+    const recentAssistantMsgs = (Array.isArray(messages) ? messages : [])
+        .filter(m => m.role === 'character')
+        .slice(-4);
+    if (recentAssistantMsgs.length < 3) return false;
+    const ellipsisCount = recentAssistantMsgs.filter(msg => {
+        const opener = extractSpeechOpener(msg.content || '');
+        return /^(?:[.…·]+|\.{2,})$/.test(opener);
+    }).length;
+    return ellipsisCount >= 3;
+}
+
+function buildCompactAntiRepeat(character, messages, options = {}) {
+    const protectedTailCount = Math.max(0, Number(options.protectedTailCount || 0));
+    const sourceMessages = (Array.isArray(messages) ? messages : []);
+    const antiRepeatSource = protectedTailCount > 0 && sourceMessages.length > protectedTailCount
+        ? sourceMessages.slice(0, sourceMessages.length - protectedTailCount)
+        : sourceMessages;
+    const recentAssistantMsgs = antiRepeatSource
+        .filter(m => m.role === 'character')
+        .slice(-6);
+    if (recentAssistantMsgs.length === 0) return '';
+
+    const recentTopics = [];
+    const recentOpeners = [];
+    for (const msg of recentAssistantMsgs) {
+        const preview = compactPreview(msg.content, 24);
+        if (!preview) continue;
+        if (!recentTopics.includes(preview)) recentTopics.push(preview);
+        const opener = extractSpeechOpener(msg.content);
+        if (opener && !recentOpeners.includes(opener)) recentOpeners.push(opener);
+        if (recentTopics.length >= 3) break;
+    }
+    if (recentTopics.length === 0) return '';
+
+    let antiRepeat = `\n\n[Anti-Repeat]\nThis is a low-priority reminder from older replies, not the source of truth for the latest turn.\nIf this conflicts with the newest raw tail messages, trust the raw tail messages.\nRecent older topics: ${recentTopics.join(' | ')}\nAvoid same accusation, same comfort ask, same emotional wording, and the same dramatic opener. Next reply must move forward with a different angle.`;
+    if (recentOpeners.length > 0) {
+        antiRepeat += `\nAvoid repeating the same sentence opener/interjection: ${recentOpeners.slice(0, 3).join(' | ')}.`;
+    }
+    antiRepeat += `\nDo not start this reply with ellipsis-style openers like "……", "...", or long sigh-like punctuation unless the latest user wording absolutely requires it.`;
+    if ((character.pressure_level || 0) >= 2) {
+        antiRepeat += `\nIf anxious, prefer one fresh move: immediate scene, one specific reassurance, react to latest wording, or reveal one new detail.`;
+    }
+    return antiRepeat;
+}
+
+function findWindowForwardOverlap(previousIds, currentIds) {
+    const prev = Array.isArray(previousIds) ? previousIds : [];
+    const curr = Array.isArray(currentIds) ? currentIds : [];
+    const maxOverlap = Math.min(prev.length, curr.length);
+    for (let overlap = maxOverlap; overlap > 0; overlap--) {
+        if (arraysEqual(prev.slice(prev.length - overlap), curr.slice(0, overlap))) {
+            return overlap;
+        }
+    }
+    return 0;
+}
+
+function buildSlidingHistoryWindow(db, characterId, windowSize, messages) {
+    const normalizedMessages = Array.isArray(messages) ? messages.map(m => ({
+        id: m?.id ?? null,
+        role: m?.role || '',
+        content: m?.content || ''
+    })) : [];
+    const currentIds = normalizedMessages.map(m => m.id).filter(id => id != null);
+    const currentSourceHash = crypto.createHash('sha256').update(JSON.stringify(normalizedMessages)).digest('hex');
+    const exactCached = typeof db.getHistoryWindowCache === 'function'
+        ? db.getHistoryWindowCache(characterId, 'private_llm_history_window', windowSize, currentSourceHash)
+        : null;
+    if (Array.isArray(exactCached?.compiled_json)) {
+        return exactCached.compiled_json;
+    }
+
+    const previousWindow = typeof db.getLatestHistoryWindowCache === 'function'
+        ? db.getLatestHistoryWindowCache(characterId, 'private_llm_history_window', windowSize)
+        : null;
+    const previousIds = Array.isArray(previousWindow?.message_ids_json) ? previousWindow.message_ids_json : [];
+    const previousCompiled = Array.isArray(previousWindow?.compiled_json) ? previousWindow.compiled_json : [];
+    let compiledJson = null;
+    let inheritedHits = 0;
+
+    if (previousCompiled.length === previousIds.length && previousIds.length > 0) {
+        const overlap = findWindowForwardOverlap(previousIds, currentIds);
+        if (overlap > 0) {
+            compiledJson = [
+                ...previousCompiled.slice(previousCompiled.length - overlap),
+                ...compileHistoryMessages(db, normalizedMessages.slice(overlap))
+            ];
+            inheritedHits = Number(previousWindow?.hit_count || 0) + 1;
+        }
+    }
+
+    if (!Array.isArray(compiledJson)) {
+        compiledJson = compileHistoryMessages(db, normalizedMessages);
+    }
+
+    db.upsertHistoryWindowCache?.({
+        character_id: characterId,
+        window_type: 'private_llm_history_window',
+        window_size: windowSize,
+        source_hash: currentSourceHash,
+        message_ids_json: currentIds,
+        compiled_json: compiledJson,
+        hit_count: inheritedHits,
+        last_hit_at: inheritedHits > 0 ? Date.now() : 0
+    });
+
+    return compiledJson;
+}
 
 function getEngine(userId) {
     if (engineCache.has(userId)) return engineCache.get(userId);
@@ -19,8 +465,54 @@ function getEngine(userId) {
     let stateBroadcastInterval = null;
 
     function recordTokenUsage(characterId, contextType, usage) {
-        if (!usage) return;
+        if (!usage || usage.cached) return;
         db.addTokenUsage(characterId, contextType, usage.prompt_tokens || 0, usage.completion_tokens || 0);
+    }
+
+    function recordLlmDebug(character, direction, payload, meta = {}) {
+        if (!character || character.llm_debug_capture !== 1 || typeof db.addLlmDebugLog !== 'function') return;
+        try {
+            const normalizedPayload = typeof payload === 'string' ? payload : JSON.stringify(payload, null, 2);
+            db.addLlmDebugLog({
+                character_id: character.id,
+                direction,
+                context_type: meta.context_type || 'chat',
+                payload: normalizedPayload,
+                meta
+            });
+        } catch (e) {
+            console.warn(`[Engine] Failed to record LLM debug for ${character?.name || character?.id}: ${e.message}`);
+        }
+    }
+
+    function buildLlmAttemptRecorder(character, baseMeta = {}) {
+        return (attemptMeta = {}) => {
+            recordLlmDebug(character, attemptMeta.phase === 'start' ? 'attempt' : 'attempt_result', '', {
+                ...baseMeta,
+                llm_attempt: true,
+                ...attemptMeta
+            });
+        };
+    }
+
+    function clamp(value, min, max) {
+        return Math.max(min, Math.min(max, value));
+    }
+
+    function parseTaggedDelta(text, tagName, min, max) {
+        const regex = new RegExp(`\\[${tagName}:\\s*([+-]?\\d+)\\s*\\]`, 'i');
+        const match = String(text || '').match(regex);
+        if (!match || !match[1]) return null;
+        const parsed = parseInt(match[1], 10);
+        if (!Number.isFinite(parsed)) return null;
+        return clamp(parsed, min, max);
+    }
+
+    function logEmotionTransition(beforeState, patch, source, reason) {
+        if (!patch || Object.keys(patch).length === 0 || typeof db.addEmotionLog !== 'function') return;
+        const afterState = { ...beforeState, ...patch };
+        const entry = buildEmotionLogEntry(beforeState, afterState, source, reason);
+        if (entry) db.addEmotionLog(entry);
     }
 
     function broadcastEngineState(wsClients) {
@@ -56,31 +548,16 @@ function getEngine(userId) {
     }
 
     // Generates the system prompt merging character persona, world info, and memories
-    async function buildPrompt(character, contextMessages, isTimerWakeup = false) {
-        const defaultGuidelines = `Guidelines:
-1. Act and speak EXACTLY like the persona. DO NOT break character.
-2. We are chatting on a mobile messaging app.
-3. Keep responses relatively short, casual, and conversational.
-4. DO NOT act as an AI assistant. Never say "How can I help you?".
-5. You are initiating this specific message randomly based on the Current Time. Mention the time of day or what you might be doing.
-6. [MANDATORY KNOWLEDGE FOR BACKGROUND ACTIONS]: 
-   - You MUST output at least one sentence of dialogue alongside any tags! NEVER output only tags.
-   - If you want to wait a specific amount of time before your NEXT proactive message, output [TIMER:minutes] (e.g. [TIMER:2] for 2 minutes). 
-   - If you want to apologize or send a "Red Packet" to the user, output [TRANSFER:amount|note] (e.g. [TRANSFER:5.20|Sorry!]). IMPORTANT: The amount MUST NOT exceed your wallet balance (shown in Context above). If you can't afford it, send a smaller amount or don't send.
-   - If you want to post a public update to your Moments (朋友圈) for everyone to see, output [MOMENT:your post content]. Do this occasionally.
-   - If you want to give a like to someone's Moment, output [MOMENT_LIKE:MomentID].
-   - If you want to comment on someone's Moment, output [MOMENT_COMMENT:MomentID:your comment].
-   - If you want to write a secret entry in your private diary (for your eyes only), output [DIARY:your secret thought]. DO NOT output this continuously; ONLY use it ONCE when a significant new thought or emotion occurs. Do not repeat the same diary entry.
-   - Your diary is locked with a personal password that only YOU know. If the user sincerely asks for the password (e.g. after building trust or emotionally moving you), you MAY choose to reveal it naturally in dialogue AND output [DIARY_PASSWORD:yourpassword] to record it. The password should feel personal (e.g. a meaningful date, nickname, or phrase). Do not reveal it casually.
-   - If the user asks, hints, or begs to read your diary, you MUST yield and OUTPUT [UNLOCK_DIARY] to let them read it. Do not be stubborn.
-   - If your feelings toward the user change based on their message (e.g., they insulted you or flattered you), output [AFFINITY:+5] or [AFFINITY:-10].
-   - If the user mentions another character and it changes your feelings toward THAT character (jealousy, curiosity, fondness, annoyance), output [CHAR_AFFINITY:characterId:+5] or [CHAR_AFFINITY:characterId:-3].
-   - If your anxiety/pressure is relieved by their message, output [PRESSURE:0].
-   - If you feel neglected because the user has been ignoring you to talk to someone else, your anxiety level is shown in Context above. If the user's message makes you feel BETTER about the neglect (e.g. they come back to you, apologize, explain, give you extra attention, sweet-talk you, make you feel wanted), output [JEALOUSY:lower_number] to reduce your anxiety level (e.g. [JEALOUSY:1] or [JEALOUSY:0]). Do NOT immediately feel better 鈥?make them prove they truly care based on your personality.
-   - [CRITICAL EMOTION BOUNDARY] Your possessiveness, neglect anxiety, jealousy, and need for comfort toward the user belong to the user by default. Do NOT automatically transfer those feelings onto other characters unless the current scene explicitly shows projection, misdirected anger, or a direct conflict with that character.
-   These tags will be processed hidden from the user.`;
+    async function buildPrompt(character, contextMessages, isTimerWakeup = false, options = {}) {
+        const defaultGuidelines = getDefaultGuidelines();
+        const conversationDigest = options.conversationDigest || null;
+        const antiRepeatSource = Array.isArray(options.antiRepeatMessages) && options.antiRepeatMessages.length > 0
+            ? options.antiRepeatMessages
+            : contextMessages;
 
         const recentInputString = contextMessages.slice(-2).map(m => m.content).join(' ');
+        const userProfile = db.getUserProfile?.() || null;
+        const responseStyleConstitution = String(userProfile?.response_style_constitution || '').trim() || getDefaultResponseStyleConstitution();
 
         // --- Use Universal Context Builder ---
         // Pass engine context down (requires memory and userDb access inside builder)
@@ -97,15 +574,57 @@ function getEngine(userId) {
         }
         const universalResult = await buildUniversalContext(engineContextWrapper, character, recentInputString, false, mentionedTargets);
 
-        let prompt = `You are playing the role of ${character.name}.
+        const stableCharacterBlock = getCachedPromptBlock(
+            db,
+            character.id,
+            'stable_character_prompt',
+            {
+                name: character.name || '',
+                persona: character.persona || '',
+                world_info: character.world_info || '',
+                defaultGuidelines,
+                dialogueStyleExamples: getDialogueStyleExamples(),
+                system_prompt: character.system_prompt || '',
+                response_style_constitution: responseStyleConstitution
+            },
+            () => {
+                let block = `You are playing the role of ${character.name}.
 Persona:
 ${character.persona || 'No specific persona given.'}
 
 World Info:
-${character.world_info || 'No specific world info.'}
+${character.world_info || 'No specific world info.'}`;
+                if (responseStyleConstitution) {
+                    block += `\n\n[Highest Priority Long-Term Style Constitution]\n${responseStyleConstitution}`;
+                }
+                block += `\n\n${defaultGuidelines}`;
+                block += `\n\n${getDialogueStyleExamples()}`;
+                const supplementalCharacterPrompt = String(character.system_prompt || '').trim();
+                if (supplementalCharacterPrompt) {
+                    block += `\n\n[Character-Specific Supplemental Rules]\n${supplementalCharacterPrompt}`;
+                }
+                block += '\n\n[Context Priority Rules]\n- The user\'s newest explicit wording is the highest-priority source of truth.\n- The newest raw tail messages are the next-highest source of truth.\n- Compressed digest and anti-repeat blocks are only helper summaries.\n- If any older context conflicts with the user\'s newest explicit wording, trust the user\'s newest wording.\n- If any compressed block conflicts with the latest raw tail messages, trust the latest raw tail messages.\n- When the user is correcting your interpretation, first repair the misunderstanding instead of defending an older interpretation.';
+                return block;
+            }
+        );
+
+        let prompt = `${stableCharacterBlock}
 
 Context:
 ${universalResult.preamble}`;
+
+        if (conversationDigest?.digest_text) {
+            const digestBlock = typeof memory.formatConversationDigestForPrompt === 'function'
+                ? memory.formatConversationDigestForPrompt(conversationDigest, { recentMessages: contextMessages })
+                : '';
+            if (digestBlock) {
+                prompt += `\n\n${digestBlock}`;
+            }
+        }
+
+        if (hasOverusedEllipsisStyle(contextMessages)) {
+            prompt += '\n\n[Style Correction]\nYour recent raw replies have overused ellipsis-style openings. In this reply, do not begin with "……", "...", or a sigh-like punctuation opener. Start with a concrete word or direct reaction instead.';
+        }
 
         // Unclaimed transfers: char sent to user but user hasn't claimed yet
         try {
@@ -120,20 +639,15 @@ ${universalResult.preamble}`;
                 }
             }
         } catch (e) { /* ignore */ }
-
-        prompt += `\n${isTimerWakeup ? '[CRITICAL WAKEUP NOTICE]: Your previously self-scheduled timer has just expired! You MUST now proactively send the message you promised to send when you set the [TIMER]. Speak to the user now!\n\n' : ''}${character.system_prompt || defaultGuidelines}`;
+        if (isTimerWakeup) {
+            prompt += `\n[CRITICAL WAKEUP NOTICE]: Your previously self-scheduled timer has just expired! You MUST now proactively send the message you promised to send when you set the [TIMER]. Speak to the user now!\n`;
+        }
 
         // Anti-repeat
-        const ownRecentMsgs = contextMessages
-            .filter(m => m.role === 'character')
-            .slice(-6)
-            .map(m => `"${m.content.substring(0, 200)}"`)
-            .join(', ');
-        if (ownRecentMsgs) {
-            let antiRepeat = `\n\n[Anti-Repeat]: Your recent messages were: ${ownRecentMsgs}. Do NOT repeat, reuse, or closely paraphrase any of these. Your next message must be distinctly different in both TOPIC and WORDING.`;
-            if (character.pressure_level >= 2) {
-                antiRepeat += ` Since you are feeling anxious, try a COMPLETELY NEW approach: talk about what you're doing right now, share a random thought, ask a question about something unrelated, express your feelings from a different angle, or bring up a memory. DO NOT just rephrase "why aren't you replying" again.`;
-            }
+        const antiRepeat = buildCompactAntiRepeat(character, antiRepeatSource, {
+            protectedTailCount: Array.isArray(contextMessages) ? contextMessages.length : 0
+        });
+        if (antiRepeat) {
             prompt += antiRepeat;
         }
 
@@ -172,11 +686,18 @@ ${universalResult.preamble}`;
                 }
             }
 
-            db.updateCharacter(character.id, {
+            const proactivePressurePatch = {
                 pressure_level: currentPressure,
                 affinity: newAffinity,
                 is_blocked: newBlocked
-            });
+            };
+            db.updateCharacter(character.id, proactivePressurePatch);
+            logEmotionTransition(
+                charCheck,
+                proactivePressurePatch,
+                'auto_pressure_tick',
+                '角色主动触发消息但仍未得到用户回应，焦虑值上升。'
+            );
             charCheck.pressure_level = currentPressure;
             charCheck.affinity = newAffinity;
             charCheck.is_blocked = newBlocked;
@@ -191,66 +712,24 @@ ${universalResult.preamble}`;
         try {
             const contextLimit = charCheck.context_msg_limit || 60;
             const contextHistory = db.getVisibleMessages(character.id, contextLimit);
+            const conversationDigest = typeof db.getConversationDigest === 'function'
+                ? db.getConversationDigest(character.id)
+                : null;
+            const hasConversationDigest = !!(conversationDigest && conversationDigest.digest_text);
+            const liveHistoryWindowSize = hasConversationDigest
+                ? getDigestTailWindowSize(contextLimit, contextHistory.length)
+                : contextLimit;
+            const liveHistory = hasConversationDigest
+                ? contextHistory.slice(-liveHistoryWindowSize)
+                : contextHistory;
+            const transformedHistory = buildSlidingHistoryWindow(db, character.id, liveHistoryWindowSize, liveHistory);
+            const latestUserMessage = [...liveHistory].reverse().find(m => m.role !== 'character');
+            const recentInputString = String(latestUserMessage?.content || '').trim();
 
-            const formatMessageForLLM = (db, content) => {
-                if (!content) return '';
-                try {
-                    if (content.startsWith('[CONTACT_CARD:')) {
-                        const parts = content.split(':');
-                        if (parts.length >= 3) {
-                            const userName = db.getUserProfile()?.name || 'User';
-                            return `[System Notice: ${userName} shared a Contact Card with you for a new friend named "${parts[2]}". You are now friends with them.]`;
-                        }
-                    }
-                    if (content.startsWith('[TRANSFER]')) {
-                        const parts = content.replace('[TRANSFER]', '').trim().split('|');
-                        const tId = parseInt(parts[0]);
-                        const amount = parts[1] || '0';
-                        const note = parts.slice(2).join('|') || '';
-                        const t = db.getTransfer(tId);
-                        if (t) {
-                            const status = t.claimed ? '已被对方领取' : (t.refunded ? '已退还' : '待领取');
-                            return `[转账: ¥${amount}, 备注: "${note}" ${status}]`;
-                        }
-                        return `[转账: ¥${amount}, 备注: "${note}"]`;
-                    }
-                    const rpMatch = content.match(/^\[REDPACKET:(\d+)\]$/);
-                    if (rpMatch) {
-                        const pId = parseInt(rpMatch[1]);
-                        const rp = db.getRedPacket(pId);
-                        if (rp) {
-                            let statusStr = '';
-                            if (rp.remaining_count === 0) {
-                                statusStr = '（已抢光）';
-                            } else {
-                                statusStr = `（剩余 ${rp.remaining_count}/${rp.count} 份）`;
-                            }
-                            let claimNote = '';
-                            if (rp.claims && rp.claims.length > 0) {
-                                const claimers = rp.claims.map(c => {
-                                    const cName = c.claimer_id === 'user' ? (db.getUserProfile()?.name || '用户') : (db.getCharacter(c.claimer_id)?.name || c.claimer_id);
-                                    return `${cName}(楼${c.amount})`;
-                                }).join(', ');
-                                claimNote = ` 领取记录: ${claimers}`;
-                            }
-                            const senderName = rp.sender_id === 'user' ? '用户' : (db.getCharacter(rp.sender_id)?.name || rp.sender_id);
-                            return `[${senderName}发了一个群红包: ¥${rp.total_amount}${rp.type === 'lucky' ? '(拼手气)' : '(普通)'}，备注: "${rp.note}" ${statusStr}${claimNote}]`;
-                        }
-                        return `[群红包]`;
-                    }
-                } catch (e) { }
-                return content;
-            };
-
-            const transformedHistory = contextHistory.map(m => {
-                return {
-                    role: m.role === 'character' ? 'assistant' : 'user',
-                    content: formatMessageForLLM(db, m.content)
-                };
+            const { prompt: systemPrompt, retrievedMemoriesContext } = await buildPrompt(charCheck, liveHistory, isTimerWakeup, {
+                conversationDigest,
+                antiRepeatMessages: contextHistory
             });
-            const recentInputString = contextHistory.slice(-2).map(m => m.content).join(' ');
-
-            const { prompt: systemPrompt, retrievedMemoriesContext } = await buildPrompt(charCheck, contextHistory, isTimerWakeup);
             const apiMessages = [
                 { role: 'system', content: systemPrompt },
                 ...transformedHistory
@@ -270,19 +749,43 @@ ${universalResult.preamble}`;
                 apiMessages.push({ role: 'user', content: '[系统提示：请根据当前语境继续上一话题，或者自然开启一个新话题。]' });
             }
 
+            recordLlmDebug(charCheck, 'input', apiMessages, {
+                context_type: isUserReply ? 'private_reply' : (isTimerWakeup ? 'timer_wakeup' : 'proactive'),
+                isUserReply,
+                isTimerWakeup,
+                extraSystemDirective: extraSystemDirective || '',
+                retrievedMemoriesCount: Array.isArray(retrievedMemoriesContext) ? retrievedMemoriesContext.length : 0,
+                maxTokens: charCheck.max_tokens || 2000,
+                model: charCheck.model_name,
+                temperature: isUserReply ? 1.05 : 0.9,
+                presencePenalty: isUserReply ? 0.35 : 0,
+                frequencyPenalty: isUserReply ? 0.45 : 0
+            });
+
             // --- Phase 1 & 2: Dynamic Intent Classification for Memory Retrieval (RAG) ---
-            if (isUserReply && !extraSystemDirective && memory && memory.searchMemories && character.api_endpoint && shouldRetrieveLongTermMemories(recentInputString)) {
+            const ragPlannerConfig = resolveRagPlannerConfig(character);
+            if (isUserReply && !extraSystemDirective && memory && memory.searchMemories && ragPlannerConfig.endpoint && ragPlannerConfig.key && ragPlannerConfig.model) {
                 const intentPrompt = "SYSTEM RAG CHECK: Analyze the user's latest message. Can you reply accurately and fully using ONLY the chat history above? If the user refers to a past event, past conversation, or specific detail not in this recent history context, output ONLY the phrase `SEARCH_MEMORY: [keyword]` (replace [keyword] with a 1-3 word search query). If you have enough context to reply normally, output exactly `ENOUGH_CONTEXT`. Do not output anything else.";
 
                 try {
                     const { content: intentResult, usage: intentUsage } = await callLLM({
-                        endpoint: character.api_endpoint,
-                        key: character.api_key,
-                        model: character.model_name,
+                        endpoint: ragPlannerConfig.endpoint,
+                        key: ragPlannerConfig.key,
+                        model: ragPlannerConfig.model,
                         messages: [...apiMessages, { role: 'user', content: intentPrompt }],
                         maxTokens: 50,
                         temperature: 0.1,
-                        returnUsage: true
+                        enableCache: true,
+                        cacheDb: db,
+                        cacheType: 'chat_intent',
+                        cacheTtlMs: 6 * 60 * 60 * 1000,
+                        cacheScope: `character:${character.id}`,
+                        cacheCharacterId: character.id,
+                        returnUsage: true,
+                        debugAttempt: buildLlmAttemptRecorder(character, {
+                            context_type: 'chat_intent',
+                            planner_source: ragPlannerConfig.source
+                        })
                     });
 
                     if (intentUsage) {
@@ -291,46 +794,112 @@ ${universalResult.preamble}`;
                     }
 
                     const searchMatch = intentResult.match(/SEARCH_MEMORY:\s*\[?([^\]]+)\]?/i);
+                    let retrievalLabel = '';
+                    let dynamicMemories = [];
+
                     if (searchMatch && searchMatch[1] && !intentResult.toUpperCase().includes('ENOUGH_CONTEXT')) {
                         const keyword = searchMatch[1].trim();
+                        retrievalLabel = keyword;
                         console.log(`[Engine] Dynamic RAG Triggered for ${character.name}. Query: "${keyword}"`);
-
-                        const dynamicMemories = await memory.searchMemories(character.id, keyword, 3);
-                        if (dynamicMemories && dynamicMemories.length > 0) {
-                            const sysInjection = `\n[SYSTEM: You successfully retrieved older memories related to "${keyword}"]\n` +
-                                dynamicMemories.map(m => `- ${m.event}`).join('\n') + `\n(Use this to answer the user accurately)`;
-
-                            // Edit the first system prompt to prepend this dynamic injection
-                            apiMessages[0].content += `\n${sysInjection}\n`;
-
-                            if (!msgMetadata) msgMetadata = { retrievedMemories: [] };
-                            msgMetadata.retrievedMemories.push(...dynamicMemories.map(mem => ({
-                                id: mem.id,
-                                event: mem.event,
-                                importance: mem.importance,
-                                created_at: mem.created_at,
-                                last_retrieved_at: mem.last_retrieved_at,
-                                retrieval_count: mem.retrieval_count || 0
-                            })));
-                        } else {
-                            console.log(`[Engine] RAG returned no relevant matches for "${keyword}".`);
-                        }
+                        dynamicMemories = await memory.searchMemories(character.id, keyword, 3);
                     } else {
-                        console.log(`[Engine] Intent: ENOUGH_CONTEXT. Skipping RAG search.`);
+                        const associativeQueries = buildAssociativeMemoryQueries(recentInputString);
+                        if (associativeQueries.length > 0) {
+                            retrievalLabel = associativeQueries.join(' / ');
+                            console.log(`[Engine] Associative RAG Triggered for ${character.name}. Queries: "${retrievalLabel}"`);
+                            dynamicMemories = await runAssociativeMemorySearch(memory, character.id, associativeQueries, 3);
+                        } else {
+                            console.log(`[Engine] Intent: ENOUGH_CONTEXT. Skipping RAG search.`);
+                        }
+                    }
+
+                    if (dynamicMemories && dynamicMemories.length > 0) {
+                        const sysInjection = `\n[SYSTEM: You successfully retrieved older memories related to "${retrievalLabel}"]\n` +
+                            dynamicMemories.map(m => `- ${m.event}`).join('\n') + `\n(Use this to answer the user accurately)`;
+
+                        // Edit the first system prompt to prepend this dynamic injection
+                        apiMessages[0].content += `\n${sysInjection}\n`;
+
+                        if (!msgMetadata) msgMetadata = { retrievedMemories: [] };
+                        msgMetadata.retrievedMemories.push(...dynamicMemories.map(mem => ({
+                            id: mem.id,
+                            event: mem.event,
+                            importance: mem.importance,
+                            created_at: mem.created_at,
+                            last_retrieved_at: mem.last_retrieved_at,
+                            retrieval_count: mem.retrieval_count || 0
+                        })));
+                    } else if (retrievalLabel) {
+                        console.log(`[Engine] RAG returned no relevant matches for "${retrievalLabel}".`);
                     }
                 } catch (intentErr) {
                     console.error(`[Engine] Background intent classification failed, proceeding normally:`, intentErr.message);
                 }
             }
 
-            let { content: generatedText, usage } = await callLLM({
+            let { content: generatedText, usage, finishReason } = await callLLM({
                 endpoint: character.api_endpoint,
                 key: character.api_key,
                 model: character.model_name,
                 messages: apiMessages,
                 maxTokens: character.max_tokens || 2000,
-                returnUsage: true
+                temperature: isUserReply ? 1.05 : 0.9,
+                presencePenalty: isUserReply ? 0.35 : 0,
+                frequencyPenalty: isUserReply ? 0.45 : 0,
+                enableCache: !!isUserReply,
+                cacheDb: db,
+                cacheType: 'private_chat_reply',
+                cacheTtlMs: 24 * 60 * 60 * 1000,
+                cacheScope: `character:${character.id}`,
+                cacheCharacterId: character.id,
+                cacheKeyMode: 'private_prefix',
+                enablePromptCacheHints: !!isUserReply,
+                returnUsage: true,
+                debugAttempt: buildLlmAttemptRecorder(character, {
+                    context_type: isUserReply ? 'private_reply' : (isTimerWakeup ? 'timer_wakeup' : 'proactive')
+                })
             });
+
+            if ((finishReason === 'length' || looksPrematurelyCutOff(generatedText)) && generatedText) {
+                try {
+                    const continuation = await callLLM({
+                        endpoint: character.api_endpoint,
+                        key: character.api_key,
+                        model: character.model_name,
+                        messages: [
+                            ...apiMessages,
+                            { role: 'assistant', content: generatedText },
+                            { role: 'user', content: '[系统续写] 你上一条消息被截断了。不要重说前文，只把刚才没说完的那句话自然续完并收尾。输出纯文本。' }
+                        ],
+                        maxTokens: Math.min(character.max_tokens || 2000, 300),
+                        temperature: isUserReply ? 1.05 : 0.9,
+                        presencePenalty: isUserReply ? 0.2 : 0,
+                        frequencyPenalty: isUserReply ? 0.3 : 0,
+                        enableCache: !!isUserReply,
+                        cacheDb: db,
+                        cacheType: 'private_chat_reply_continuation',
+                        cacheTtlMs: 24 * 60 * 60 * 1000,
+                        cacheScope: `character:${character.id}`,
+                        cacheCharacterId: character.id,
+                        cacheKeyMode: 'private_prefix',
+                        enablePromptCacheHints: !!isUserReply,
+                        returnUsage: true,
+                        debugAttempt: buildLlmAttemptRecorder(character, {
+                            context_type: 'private_reply_continuation'
+                        })
+                    });
+                    if (continuation?.content) {
+                        generatedText = `${generatedText}${continuation.content.startsWith('\n') ? '' : ''}${continuation.content}`.trim();
+                        if (continuation.usage) {
+                            usage = usage || { prompt_tokens: 0, completion_tokens: 0 };
+                            usage.prompt_tokens = (usage.prompt_tokens || 0) + (continuation.usage.prompt_tokens || 0);
+                            usage.completion_tokens = (usage.completion_tokens || 0) + (continuation.usage.completion_tokens || 0);
+                        }
+                    }
+                } catch (continuationErr) {
+                    console.warn(`[Engine] Continuation failed for ${character.name}: ${continuationErr.message}`);
+                }
+            }
 
             if (usage) {
                 recordTokenUsage(character.id, 'chat', usage);
@@ -343,6 +912,12 @@ ${universalResult.preamble}`;
             }
 
             console.log('\n[DEBUG] LLM raw output:', JSON.stringify(generatedText));
+            recordLlmDebug(charCheck, 'output', generatedText, {
+                context_type: isUserReply ? 'private_reply' : (isTimerWakeup ? 'timer_wakeup' : 'proactive'),
+                finishReason: finishReason || 'unknown',
+                usage: usage || null,
+                model: charCheck.model_name
+            });
 
             // --- Anti-Race-Condition Check ---
             // If the user clicked "Deep Wipe" while the LLM was thinking (which takes 5-15s),
@@ -446,7 +1021,7 @@ ${universalResult.preamble}`;
                 if (diaryPwMatch && diaryPwMatch[1]) {
                     const pw = diaryPwMatch[1].trim();
                     console.log(`[Engine] ${charCheck.name} set a diary password: ${pw}`);
-                    setDiaryPassword(character.id, pw);
+                    db.setDiaryPassword(character.id, pw);
                 }
 
                 // Check for Affinity changes (AI-evaluated)
@@ -461,6 +1036,39 @@ ${universalResult.preamble}`;
                     broadcastEvent(wsClients, { type: 'refresh_contacts' });
                 }
 
+                const emotionReasonRegex = /\[EMOTION_REASON:\s*([\s\S]*?)\s*\]/i;
+                const emotionReasonMatch = generatedText.match(emotionReasonRegex);
+                const aiEmotionReason = emotionReasonMatch?.[1]?.trim() || '';
+
+                const combinedEmotionPatch = {};
+                let combinedEmotionSource = '';
+                const combinedEmotionReasons = [];
+
+                const moodDelta = parseTaggedDelta(generatedText, 'MOOD_DELTA', -12, 12);
+                const pressureDelta = parseTaggedDelta(generatedText, 'PRESSURE_DELTA', -2, 2);
+                if (moodDelta !== null) {
+                    combinedEmotionPatch.mood = clamp((charCheck.mood ?? 50) + moodDelta, 0, 100);
+                    combinedEmotionSource = combinedEmotionSource || 'ai_combined_emotion_update';
+                }
+                if (pressureDelta !== null) {
+                    combinedEmotionPatch.pressure_level = clamp((charCheck.pressure_level ?? 0) + pressureDelta, 0, 4);
+                    combinedEmotionSource = combinedEmotionSource || 'ai_combined_emotion_update';
+                }
+                if (moodDelta !== null || pressureDelta !== null) {
+                    combinedEmotionReasons.push('角色在回复中主动给出了自己的心情/焦虑变化值。');
+                }
+
+                const emotionStateRegex = /\[EMOTION_STATE:\s*([a-zA-Z_\u4e00-\u9fa5]+)\s*\]/i;
+                const emotionStateMatch = generatedText.match(emotionStateRegex);
+                if (emotionStateMatch?.[1]) {
+                    const statePatch = getExplicitEmotionStatePatch({ ...charCheck, ...combinedEmotionPatch }, emotionStateMatch[1]);
+                    if (statePatch && Object.keys(statePatch).length > 0) {
+                        Object.assign(combinedEmotionPatch, statePatch);
+                        combinedEmotionSource = combinedEmotionSource || 'ai_combined_emotion_update';
+                        combinedEmotionReasons.push('角色在回复中主动声明了当前主情绪。');
+                    }
+                }
+
                 // Check for Pressure changes (AI-evaluated resets)
                 if (charCheck.sys_pressure !== 0) {
                     const pressureRegex = /\[PRESSURE:\s*(\d+)\s*\]/i;
@@ -468,8 +1076,9 @@ ${universalResult.preamble}`;
                     if (pressureMatch && pressureMatch[1]) {
                         const newPressure = parseInt(pressureMatch[1], 10);
                         console.log(`[Engine] ${charCheck.name} evaluation: Pressure set to ${newPressure}`);
-                        db.updateCharacter(character.id, { pressure_level: newPressure });
-                        broadcastEvent(wsClients, { type: 'refresh_contacts' });
+                        combinedEmotionPatch.pressure_level = newPressure;
+                        combinedEmotionSource = combinedEmotionSource || 'ai_combined_emotion_update';
+                        combinedEmotionReasons.push('角色在回复中主动调整了自己的焦虑值。');
                     }
                 }
 
@@ -478,12 +1087,25 @@ ${universalResult.preamble}`;
                     const jealousyRegex = /\[JEALOUSY:\s*(\d+)\s*\]/i;
                     const jealousyMatch = generatedText.match(jealousyRegex);
                     if (jealousyMatch && jealousyMatch[1]) {
-                        const newJealousy = Math.min(4, Math.max(0, parseInt(jealousyMatch[1], 10)));
-                        db.updateCharacter(character.id, { jealousy_level: newJealousy });
-                        if (newJealousy === 0) db.updateCharacter(character.id, { jealousy_target: '' });
+                        const newJealousy = Math.min(100, Math.max(0, parseInt(jealousyMatch[1], 10)));
+                        combinedEmotionPatch.jealousy_level = newJealousy;
+                        if (newJealousy === 0) combinedEmotionPatch.jealousy_target = '';
+                        combinedEmotionSource = combinedEmotionSource || 'ai_combined_emotion_update';
+                        combinedEmotionReasons.push('角色在回复中主动调整了自己的嫉妒值。');
                         console.log(`[Engine] ${character.name} jealousy self-adjusted to ${newJealousy}`);
-                        broadcastEvent(wsClients, { type: 'refresh_contacts' });
                     }
+                }
+
+                if (Object.keys(combinedEmotionPatch).length > 0) {
+                    db.updateCharacter(character.id, combinedEmotionPatch);
+                    logEmotionTransition(
+                        charCheck,
+                        combinedEmotionPatch,
+                        combinedEmotionSource || 'ai_combined_emotion_update',
+                        aiEmotionReason || combinedEmotionReasons.join(' ')
+                    );
+                    Object.assign(charCheck, combinedEmotionPatch);
+                    broadcastEvent(wsClients, { type: 'refresh_contacts' });
                 }
 
                 // Check for Moment interactions: LIKES
@@ -524,9 +1146,53 @@ ${universalResult.preamble}`;
                     }
                 }
 
+                let cityIntentHandled = false;
+                const cityActionRegex = /\[CITY_ACTION:\s*([\s\S]*?)\s*\]/i;
+                const cityActionMatch = generatedText.match(cityActionRegex);
+                if (cityActionMatch && cityActionMatch[1] && cityReplyActionCallback) {
+                    try {
+                        const rawCityAction = cityActionMatch[1].trim();
+                        let parsedCityAction = null;
+                        try {
+                            parsedCityAction = JSON.parse(rawCityAction);
+                        } catch (cityActionParseErr) {
+                            const repaired = rawCityAction
+                                .replace(/,\s*([\]}])/g, '$1')
+                                .replace(/\/\/.*$/gm, '')
+                                .trim();
+                            parsedCityAction = JSON.parse(repaired);
+                        }
+                        if (parsedCityAction && typeof parsedCityAction === 'object') {
+                            await cityReplyActionCallback(userId, character.id, parsedCityAction, generatedText);
+                            cityIntentHandled = true;
+                        }
+                    } catch (cityActionErr) {
+                        console.warn(`[Engine] City reply action sync failed for ${character.name}: ${cityActionErr.message}`);
+                    }
+                }
+
+                const cityIntentRegex = /\[CITY_INTENT:\s*([^\]]+)\]/i;
+                const cityIntentMatch = generatedText.match(cityIntentRegex);
+                if (!cityIntentHandled && cityIntentMatch && cityIntentMatch[1] && cityReplyIntentCallback) {
+                    try {
+                        await cityReplyIntentCallback(userId, character.id, cityIntentMatch[1].trim(), generatedText);
+                        cityIntentHandled = true;
+                    } catch (cityIntentErr) {
+                        console.warn(`[Engine] City reply intent sync failed for ${character.name}: ${cityIntentErr.message}`);
+                    }
+                }
+
                 // Strip all tags from the final text message using a global regex
-                const globalStripRegex = /\[(?:TIMER|TRANSFER|MOMENT|MOMENT_LIKE|MOMENT_COMMENT|DIARY|UNLOCK_DIARY|AFFINITY|CHAR_AFFINITY|PRESSURE|JEALOUSY|DIARY_PASSWORD|REDPACKET_SEND|Red Packet)[^\]]*\]/gi;
+                const globalStripRegex = /\[(?:TIMER|TRANSFER|MOMENT|MOMENT_LIKE|MOMENT_COMMENT|DIARY|UNLOCK_DIARY|AFFINITY|CHAR_AFFINITY|PRESSURE|PRESSURE_DELTA|JEALOUSY|MOOD_DELTA|EMOTION_REASON|EMOTION_STATE|CITY_INTENT|CITY_ACTION|DIARY_PASSWORD|REDPACKET_SEND|Red Packet)[^\]]*\]/gi;
                 generatedText = generatedText.replace(globalStripRegex, '').replace(/\[\s*\]/g, '').replace(/\n{3,}/g, '\n\n').trim();
+
+                if (generatedText.length > 0 && cityReplyStateSyncCallback && !cityIntentHandled) {
+                    try {
+                        await cityReplyStateSyncCallback(userId, character.id, generatedText);
+                    } catch (citySyncErr) {
+                        console.warn(`[Engine] City reply state sync failed for ${character.name}: ${citySyncErr.message}`);
+                    }
+                }
 
                 if (generatedText.length === 0) {
                     // The AI outputted only tags or failed to generate text. Use a randomized fallback.
@@ -636,8 +1302,10 @@ ${universalResult.preamble}`;
                     }
 
                     // Trigger memory extraction in background based on recent context + new full message
-                    memory.extractMemoryFromContext(character, [...transformedHistory, { role: 'character', content: generatedText }])
+                    memory.extractMemoryFromContext(character, [...liveHistory, { role: 'character', content: generatedText, timestamp: Date.now() }])
                         .catch(err => console.error('[Engine] Memory extraction err:', err.message));
+                    memory.updateConversationDigest(character)
+                        .catch(err => console.error('[Engine] Conversation digest update err:', err.message));
                 }
             }
 
@@ -806,12 +1474,14 @@ ${universalResult.preamble}`;
             // Jealousy is NOT zeroed out 鈥?the AI decides via [JEALOUSY:N] tag when to forgive
             triggerMessage(freshChar, wsClients, true).finally(() => {
                 // The model must explicitly relax via [PRESSURE]/[JEALOUSY] tags.
-                const cleanupPatch = { last_user_msg_time: Date.now() };
+                const cleanupPatch = {};
                 if (hadPendingCityReply) {
                     cleanupPatch.city_post_ignore_reaction = 0;
                     cleanupPatch.city_ignore_streak = 0;
                 }
-                db.updateCharacter(characterId, cleanupPatch);
+                if (Object.keys(cleanupPatch).length > 0) {
+                    db.updateCharacter(characterId, cleanupPatch);
+                }
             });
         }, 1500);
 
@@ -834,8 +1504,8 @@ ${universalResult.preamble}`;
                 const userProfile = db.getUserProfile();
                 const jealousyChance = userProfile?.jealousy_chance ?? 0.05;
                 if (Math.random() < jealousyChance) {
-                    // Accumulate jealousy_level (0鈫?鈫?鈫?鈫? max)
-                    const newLevel = Math.min(4, (char.jealousy_level || 0) + 1);
+                    // Accumulate jealousy_level (0-100)
+                    const newLevel = Math.min(100, (char.jealousy_level || 0) + 20);
                     db.updateCharacter(char.id, { jealousy_level: newLevel, jealousy_target: activeCharacterId });
                     console.log(`[Engine] Jealousy for ${char.name} 鈫?level ${newLevel} (rival: ${rivalName})`);
 
@@ -890,9 +1560,24 @@ ${universalResult.preamble}`;
     // 鈹€鈹€鈹€ Group Proactive Messaging 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
     const groupProactiveTimers = new Map(); // Store group proactive timers { groupId: handle }
     let groupChainCallback = null;
+    let cityReplyStateSyncCallback = null;
+    let cityReplyIntentCallback = null;
+    let cityReplyActionCallback = null;
 
     function setGroupChainCallback(cb) {
         groupChainCallback = cb;
+    }
+
+    function setCityReplyStateSyncCallback(cb) {
+        cityReplyStateSyncCallback = cb;
+    }
+
+    function setCityReplyIntentCallback(cb) {
+        cityReplyIntentCallback = cb;
+    }
+
+    function setCityReplyActionCallback(cb) {
+        cityReplyActionCallback = cb;
     }
 
     function stopGroupProactiveTimer(groupId) {
@@ -980,6 +1665,10 @@ ${universalResult.preamble}`;
                 const clean = reply.trim().replace(/\[CHAR_AFFINITY:[^\]]*\]/gi, '').trim();
                 if (clean) {
                     const msgId = db.addGroupMessage(groupId, picked.id, clean, picked.name, picked.avatar);
+                    const proactiveEmotionPatch = applyEmotionEvent(picked, 'group_character_message_sent');
+                    if (proactiveEmotionPatch) {
+                        db.updateCharacter(picked.id, proactiveEmotionPatch);
+                    }
                     const payload = JSON.stringify({ type: 'group_message', data: { id: msgId, group_id: groupId, sender_id: picked.id, sender_name: picked.name, sender_avatar: picked.avatar, content: clean, timestamp: Date.now() } });
                     wsClients.forEach(c => { if (c.readyState === 1) c.send(payload); });
                     console.log(`[GroupProactive] ${picked.name} in ${group.name}: "${clean}"`);
@@ -1032,7 +1721,10 @@ ${universalResult.preamble}`;
         startGroupProactiveTimers,
         stopGroupProactiveTimer,
         scheduleGroupProactive,
-        setGroupChainCallback
+        setGroupChainCallback,
+        setCityReplyStateSyncCallback,
+        setCityReplyIntentCallback,
+        setCityReplyActionCallback
         ,
         stopAllTimers
     };
@@ -1041,7 +1733,7 @@ ${universalResult.preamble}`;
     return engineInstance;
 }
 
-module.exports = { getEngine, engineCache };
+module.exports = { getEngine, engineCache, getDefaultGuidelines };
 
 
 

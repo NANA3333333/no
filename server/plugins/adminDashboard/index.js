@@ -3,6 +3,7 @@ const path = require('path');
 const Database = require('better-sqlite3');
 const { getMemory, clearMemoryCache } = require('../../memory');
 const { userDbCache } = require('../../db');
+const qdrant = require('../../qdrant');
 
 module.exports = function initAdminDashboard(app, context) {
     const { authMiddleware, authDb, wss, getWsClients } = context;
@@ -124,6 +125,66 @@ module.exports = function initAdminDashboard(app, context) {
         }
         next();
     };
+
+    const getQdrantMode = () => {
+        const config = qdrant.getQdrantConfig();
+        if (!config.enabled) return 'disabled';
+        const localBinaryPath = path.join(__dirname, '..', '..', '..', 'tools', 'qdrant', 'current', 'qdrant.exe');
+        if (fs.existsSync(localBinaryPath)) return 'local';
+        if (/127\.0\.0\.1|localhost/i.test(config.url)) return 'self-hosted';
+        return 'external';
+    };
+
+    app.get('/api/admin/qdrant/status', authMiddleware, adminMiddleware, async (req, res) => {
+        const config = qdrant.getQdrantConfig();
+        const status = {
+            enabled: !!config.enabled,
+            reachable: false,
+            url: config.url,
+            mode: getQdrantMode(),
+            collectionPrefix: process.env.QDRANT_COLLECTION_PREFIX || 'chatpulse_memories',
+            backend: config.enabled ? 'qdrant-primary-with-vectra-fallback' : 'vectra-fallback-only',
+            collectionsCount: 0,
+            collections: [],
+            indexedPoints: 0,
+            lastError: ''
+        };
+
+        if (!config.enabled) {
+            return res.json({ success: true, status });
+        }
+
+        try {
+            const collections = await qdrant.listCollections();
+            const ownCollections = collections
+                .map(item => String(item?.name || ''))
+                .filter(Boolean)
+                .filter(name => name.startsWith(`${status.collectionPrefix}_`));
+
+            let indexedPoints = 0;
+            for (const collectionName of ownCollections.slice(0, 20)) {
+                try {
+                    const info = await qdrant.getCollectionInfo(collectionName);
+                    indexedPoints += Number(
+                        info?.points_count ??
+                        info?.vectors_count ??
+                        info?.indexed_vectors_count ??
+                        0
+                    );
+                } catch (e) { }
+            }
+
+            status.reachable = true;
+            status.collectionsCount = ownCollections.length;
+            status.collections = ownCollections.slice(0, 8);
+            status.indexedPoints = indexedPoints;
+            return res.json({ success: true, status });
+        } catch (e) {
+            status.lastError = e.message;
+            status.backend = 'vectra-fallback-active';
+            return res.json({ success: true, status });
+        }
+    });
 
     app.get('/api/admin/invites', authMiddleware, adminMiddleware, (req, res) => {
         try {

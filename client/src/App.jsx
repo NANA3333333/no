@@ -72,6 +72,8 @@ function App() {
   // Use a ref to track which incoming messages we've already processed for unread badges and sounds
   const processedMessagesRef = useRef(new Set());
   const groupMsgSeqRef = useRef(0); // Unique sequence counter to prevent React batching from swallowing rapid WS group_message events
+  const cityRefreshRef = useRef(null);
+  const contactsRefreshRef = useRef(null);
 
   useEffect(() => {
     const handleCharacterDataWiped = (event) => {
@@ -135,6 +137,16 @@ function App() {
       })
       .catch(err => console.error('Failed to load contacts:', err));
   }, [token]);
+
+  const scheduleContactsRefresh = useCallback((delay = 350) => {
+    if (contactsRefreshRef.current) {
+      clearTimeout(contactsRefreshRef.current);
+    }
+    contactsRefreshRef.current = setTimeout(() => {
+      contactsRefreshRef.current = null;
+      fetchContacts();
+    }, delay);
+  }, [fetchContacts]);
 
   // 1. Fetch Contacts (Characters) and Profile on mount
   // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -216,10 +228,12 @@ function App() {
         const msg = JSON.parse(event.data);
         if (msg.type === 'new_message') {
           setIncomingMessageQueue(prev => [...prev, msg.data]);
+          scheduleContactsRefresh();
         } else if (msg.type === 'engine_state') {
           setEngineState(msg.data);
         } else if (msg.type === 'group_message') {
           setIncomingGroupMessageQueue(prev => [...prev, msg.data]);
+          scheduleContactsRefresh();
         } else if (msg.type === 'group_typing') {
           setGroupTyping(prev => {
             const key = msg.data.group_id;
@@ -242,7 +256,7 @@ function App() {
           }
         } else if (msg.type === 'refresh_contacts') {
           window.dispatchEvent(new Event('refresh_contacts'));
-          fetchContacts();
+          scheduleContactsRefresh(100);
         } else if (msg.type === 'announcement') {
           setGlobalAnnouncement(msg.content);
         } else if (msg.type === 'force_reload') {
@@ -259,6 +273,14 @@ function App() {
           console.log('[WS] Memory update received for character:', msg.characterId);
           window.dispatchEvent(new CustomEvent('memory_update', { detail: { characterId: msg.characterId } }));
         } else if (msg.type === 'city_update') {
+          window.dispatchEvent(new CustomEvent('city_update', { detail: msg }));
+          scheduleContactsRefresh();
+          if (!cityRefreshRef.current) {
+            cityRefreshRef.current = setTimeout(() => {
+              cityRefreshRef.current = null;
+              fetchContacts();
+            }, 1200);
+          }
           if (msg.action === 'schedule_generating') {
             setGeneratingSchedules(prev => ({ ...prev, [msg.charId]: true }));
           } else if (msg.action === 'schedule_updated') {
@@ -269,8 +291,18 @@ function App() {
         console.error('WS Parse Error', e);
       }
     };
-    return () => ws.close();
-  }, [token, fetchContacts]);
+    return () => {
+      if (contactsRefreshRef.current) {
+        clearTimeout(contactsRefreshRef.current);
+        contactsRefreshRef.current = null;
+      }
+      if (cityRefreshRef.current) {
+        clearTimeout(cityRefreshRef.current);
+        cityRefreshRef.current = null;
+      }
+      ws.close();
+    };
+  }, [token, fetchContacts, scheduleContactsRefresh]);
 
   // Update contact last message preview on new incoming message
   useEffect(() => {

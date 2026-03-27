@@ -1,9 +1,15 @@
 const path = require('path');
 const fs = require('fs');
+const crypto = require('crypto');
 const { LocalIndex } = require('vectra');
 const { callLLM } = require('./llm');
 const { getUserDb } = require('./db');
 const { buildUniversalContext } = require('./contextBuilder');
+const qdrant = require('./qdrant');
+
+const LOCAL_EMBEDDING_MODEL = process.env.LOCAL_EMBEDDING_MODEL || 'Xenova/bge-m3';
+const LOCAL_EMBEDDING_DIM = Number(process.env.LOCAL_EMBEDDING_DIM || 1024);
+const LOCAL_EMBEDDING_INDEX_TAG = process.env.LOCAL_EMBEDDING_INDEX_TAG || 'bge_m3_1024';
 
 // Dynamic import for transformers.js
 let pipeline = null;
@@ -19,7 +25,7 @@ async function getExtractor() {
     if (!pipeline) {
         try {
             const transformers = await import('@xenova/transformers');
-            pipeline = await transformers.pipeline('feature-extraction', 'Xenova/all-MiniLM-L6-v2');
+            pipeline = await transformers.pipeline('feature-extraction', LOCAL_EMBEDDING_MODEL);
         } catch (e) {
             console.error('[Memory] Xenova/ONNX initialization failed. Disabling local embeddings. Error:', e.message);
             extractionDisabled = true;
@@ -33,7 +39,7 @@ async function getEmbedding(text) {
     const extractor = await getExtractor();
     if (!extractor) {
         // Return a zero-vector if local embeddings are broken
-        return Array.from({ length: 384 }, () => 0);
+        return Array.from({ length: LOCAL_EMBEDDING_DIM }, () => 0);
     }
     const output = await extractor(text, { pooling: 'mean', normalize: true });
     return Array.from(output.data);
@@ -41,13 +47,25 @@ async function getEmbedding(text) {
 
 // Memory vector indices cache: UserId_CharacterID -> LocalIndex
 const indices = new Map();
+let qdrantAvailability = null;
+
+async function canUseQdrant() {
+    if (qdrantAvailability !== null) return qdrantAvailability;
+    qdrantAvailability = await qdrant.healthcheck();
+    if (qdrantAvailability) {
+        console.log('[Memory] Qdrant is available. Vector operations will use Qdrant first.');
+    } else {
+        console.warn('[Memory] Qdrant is unavailable. Falling back to local vectra indices.');
+    }
+    return qdrantAvailability;
+}
 
 async function getVectorIndex(userId, characterId) {
     const key = `${userId}_${characterId}`;
     if (indices.has(key)) {
         return indices.get(key);
     }
-    const dir = path.join(__dirname, '..', 'data', 'vectors', String(userId), String(characterId));
+    const dir = path.join(__dirname, '..', 'data', 'vectors', LOCAL_EMBEDDING_INDEX_TAG, String(userId), String(characterId));
     const indexPath = path.join(dir, 'index.json');
     if (!fs.existsSync(dir)) {
         fs.mkdirSync(dir, { recursive: true });
@@ -78,7 +96,7 @@ async function getVectorIndex(userId, characterId) {
             await index.createIndex({
                 version: 1,
                 deleteConfig: { enabled: false }, // Simple config
-                dimension: 384 // Dimension of all-MiniLM-L6-v2
+                dimension: LOCAL_EMBEDDING_DIM
             });
         }
     } catch (err) {
@@ -89,7 +107,7 @@ async function getVectorIndex(userId, characterId) {
         await index.createIndex({
             version: 1,
             deleteConfig: { enabled: false },
-            dimension: 384
+            dimension: LOCAL_EMBEDDING_DIM
         });
     }
     indices.set(key, index);
@@ -109,11 +127,546 @@ function getMemory(userId) {
 
     const getDb = () => getUserDb(userId);
 
+    function parseLooseJson(value, fallback = null) {
+        if (value == null || value === '') return fallback;
+        if (typeof value !== 'string') return value;
+        try {
+            return JSON.parse(value);
+        } catch (e) {
+            return fallback;
+        }
+    }
+
+    function normalizeStringArray(value) {
+        if (Array.isArray(value)) return value.map(v => String(v).trim()).filter(Boolean);
+        if (typeof value === 'string') {
+            const trimmed = value.trim();
+            if (!trimmed) return [];
+            const parsed = parseLooseJson(trimmed, null);
+            if (Array.isArray(parsed)) return parsed.map(v => String(v).trim()).filter(Boolean);
+            return trimmed.split(/[,，、\n]/).map(v => v.trim()).filter(Boolean);
+        }
+        return [];
+    }
+
+    function normalizeRelationshipArray(value) {
+        if (Array.isArray(value)) return value.filter(Boolean);
+        if (value && typeof value === 'object') return [value];
+        if (typeof value === 'string') {
+            const trimmed = value.trim();
+            if (!trimmed) return [];
+            const parsed = parseLooseJson(trimmed, null);
+            if (Array.isArray(parsed)) return parsed.filter(Boolean);
+            if (parsed && typeof parsed === 'object') return [parsed];
+            return [{ summary: trimmed }];
+        }
+        return [];
+    }
+
+    function summarizeRelationships(relationships) {
+        return normalizeRelationshipArray(relationships).map(rel => {
+            if (typeof rel === 'string') return rel;
+            return rel.summary || rel.type || JSON.stringify(rel);
+        }).filter(Boolean);
+    }
+
+    const CITY_MEMORY_LOCATIONS = new Set([
+        'park', 'restaurant', 'home', 'factory', 'convenience_store', 'school', 'street',
+        'mall', 'cafe', 'office', 'hospital'
+    ]);
+
+    function looksLikeCityMemory(memoryData = {}) {
+        const type = String(memoryData.memory_type || '').toLowerCase();
+        const location = String(memoryData.location || '').trim().toLowerCase();
+        const text = [
+            memoryData.summary,
+            memoryData.content,
+            memoryData.event
+        ].filter(Boolean).join(' ').toLowerCase();
+        if (type.startsWith('city')) return true;
+        if (CITY_MEMORY_LOCATIONS.has(location)) return true;
+        return /(city activity|公园|餐厅|便利店|商业街|工厂|街上|回到家|在家|长椅|吃饭|散步|发呆|路灯|晚风|路边)/i.test(text);
+    }
+
+    function looksLikeReplyDrivenCityNarration(memoryData = {}) {
+        const text = [
+            memoryData.summary,
+            memoryData.content,
+            memoryData.event
+        ].filter(Boolean).join(' ');
+        if (!text) return false;
+        return /(被私聊|刚才那句私聊|这轮私聊|嘴上还|话里还挂着点|脚步却已经转向|把这口气全压进了行动里|脑子里还挂着刚才那句私聊|一边嘴硬一边|边走边在心里继续跟你较劲)/i.test(text);
+    }
+
+    function hasHighValueMemorySignals(memoryData = {}) {
+        const type = String(memoryData.memory_type || '').toLowerCase();
+        const people = normalizeStringArray(memoryData.people_json ?? memoryData.people);
+        const relationships = normalizeRelationshipArray(memoryData.relationship_json ?? memoryData.relationships);
+        const emotion = String(memoryData.emotion || '').trim();
+        const sourceMessageIds = normalizeStringArray(memoryData.source_message_ids_json);
+        const text = [
+            memoryData.summary,
+            memoryData.content,
+            memoryData.event
+        ].filter(Boolean).join(' ');
+        if (['relationship', 'plan', 'preference', 'emotion'].includes(type)) return true;
+        if (Number(memoryData.importance || 0) >= 7) return true;
+        if (people.length > 0 || relationships.length > 0) return true;
+        if (sourceMessageIds.length > 0) return true;
+        if (looksLikeCityMemory(memoryData) && looksLikeReplyDrivenCityNarration(memoryData)) return false;
+        if (emotion && emotion.length >= 2 && !looksLikeCityMemory(memoryData)) return true;
+        if (looksLikeCityMemory(memoryData)) {
+            return /(鐢ㄦ埛|nana|user|鍛婄櫧|鎵胯|绾﹀畾|鍚垫灦|鍐茬獊|鍜屽ソ|绉樺瘑|瀵嗙爜|娌￠挶|鍙墿|宕╂簝|浣忛櫌|鍙椾激|濒死|透支|极限|昏倒|发烧|还债|还不起|破产)/i.test(text);
+        }
+        return /(用户|nana|user|告白|承诺|约定|吵架|冲突|和好|吃醋|嫉妒|委屈|喜欢|讨厌|秘密|密码|没钱|只剩|崩溃|住院|受伤)/i.test(text);
+    }
+
+    function isRoutineCityMemory(memoryData = {}) {
+        if (!looksLikeCityMemory(memoryData)) return false;
+        if (looksLikeReplyDrivenCityNarration(memoryData)) return true;
+        if (hasHighValueMemorySignals(memoryData)) return false;
+        const type = String(memoryData.memory_type || '').toLowerCase();
+        if (!type || ['event', 'fact', 'city_event', 'city_log'].includes(type)) {
+            return true;
+        }
+        return false;
+    }
+
+    function computeMemoryRetrievalWeight(memoryData = {}) {
+        const type = String(memoryData.memory_type || '').toLowerCase();
+        if (isRoutineCityMemory(memoryData)) return 0.42;
+        if (looksLikeCityMemory(memoryData)) return hasHighValueMemorySignals(memoryData) ? 0.78 : 0.6;
+        if (['relationship', 'plan', 'preference', 'emotion'].includes(type)) return 1.16;
+        return 1;
+    }
+
+    function buildDedupeKey(characterId, memoryData) {
+        const location = (memoryData.location || '').trim().toLowerCase();
+        const type = (memoryData.memory_type || 'event').trim().toLowerCase();
+        const summary = (memoryData.summary || memoryData.event || '').trim().toLowerCase();
+        if (!summary) return '';
+        return [characterId, type, location, summary].filter(Boolean).join('::').slice(0, 240);
+    }
+
+    function formatAbsoluteTimestamp(ts) {
+        const value = Number(ts || 0);
+        if (!Number.isFinite(value) || value <= 0) return '';
+        try {
+            return new Date(value).toLocaleString('en-US');
+        } catch (e) {
+            return '';
+        }
+    }
+
+    function formatSourceTimeRange(startTs, endTs) {
+        const start = Number(startTs || 0);
+        const end = Number(endTs || 0);
+        const startText = formatAbsoluteTimestamp(start);
+        const endText = formatAbsoluteTimestamp(end);
+        if (startText && endText) {
+            return start === end ? startText : `${startText} -> ${endText}`;
+        }
+        return startText || endText || '';
+    }
+
+    function buildSourceTimeMeta(messages = []) {
+        const rows = (Array.isArray(messages) ? messages : []).filter(Boolean);
+        const timestamps = rows
+            .map(msg => Number(msg?.timestamp || 0))
+            .filter(ts => Number.isFinite(ts) && ts > 0)
+            .sort((a, b) => a - b);
+        const messageIds = rows
+            .map(msg => msg?.id)
+            .filter(id => id !== undefined && id !== null)
+            .map(id => String(id));
+        const source_started_at = timestamps[0] || 0;
+        const source_ended_at = timestamps[timestamps.length - 1] || source_started_at || 0;
+        return {
+            source_started_at,
+            source_ended_at,
+            source_time_text: formatSourceTimeRange(source_started_at, source_ended_at),
+            source_message_count: rows.length,
+            source_message_ids_json: messageIds
+        };
+    }
+
+    function normalizeMemoryPayload(rawMemoryData = {}, options = {}) {
+        const peopleList = normalizeStringArray(rawMemoryData.people_json ?? rawMemoryData.people);
+        const itemList = normalizeStringArray(rawMemoryData.items_json ?? rawMemoryData.items);
+        const relationshipList = normalizeRelationshipArray(rawMemoryData.relationship_json ?? rawMemoryData.relationships);
+        const relationshipSummary = summarizeRelationships(relationshipList);
+        const summary = (rawMemoryData.summary || rawMemoryData.event || '').trim();
+        const content = (rawMemoryData.content || rawMemoryData.event || summary).trim();
+        let memoryType = rawMemoryData.memory_type || 'event';
+        if (!rawMemoryData.memory_type && looksLikeCityMemory(rawMemoryData)) {
+            memoryType = 'city_event';
+        }
+        let importance = Math.max(1, Math.min(10, Number(rawMemoryData.importance) || 5));
+        const normalized = {
+            memory_type: memoryType,
+            summary: summary || content || '(empty memory)',
+            content: content || summary || '(empty memory)',
+            time: (rawMemoryData.time || '').trim(),
+            location: (rawMemoryData.location || '').trim(),
+            people_json: peopleList,
+            items_json: itemList,
+            relationship_json: relationshipList,
+            people: peopleList.join(', '),
+            items: itemList.join(', '),
+            relationships: relationshipSummary.join('; '),
+            event: (rawMemoryData.event || summary || content || '(empty memory)').trim(),
+            emotion: (rawMemoryData.emotion || '').trim(),
+            importance,
+            source_message_ids_json: normalizeStringArray(rawMemoryData.source_message_ids_json),
+            dedupe_key: rawMemoryData.dedupe_key || buildDedupeKey(options.characterId || '', rawMemoryData),
+            is_archived: Number(rawMemoryData.is_archived || 0),
+            surprise_score: Math.max(1, Math.min(10, Number(rawMemoryData.surprise_score) || importance)),
+            source_started_at: Number(rawMemoryData.source_started_at || 0),
+            source_ended_at: Number(rawMemoryData.source_ended_at || 0),
+            source_time_text: String(rawMemoryData.source_time_text || '').trim(),
+            source_message_count: Number(rawMemoryData.source_message_count || 0)
+        };
+        if (!normalized.source_time_text) {
+            normalized.source_time_text = formatSourceTimeRange(normalized.source_started_at, normalized.source_ended_at);
+        }
+        if (isRoutineCityMemory(normalized)) {
+            normalized.memory_type = 'city_log';
+            normalized.importance = Math.min(normalized.importance, 3);
+            normalized.surprise_score = Math.min(normalized.surprise_score, 2);
+        }
+        return normalized;
+    }
+
+    function buildMemoryEmbeddingText(memoryData) {
+        const relationshipSummary = summarizeRelationships(memoryData.relationship_json ?? memoryData.relationships);
+        return [
+            memoryData.memory_type ? `Type: ${memoryData.memory_type}` : '',
+            memoryData.summary ? `Summary: ${memoryData.summary}` : '',
+            memoryData.content ? `Content: ${memoryData.content}` : '',
+            memoryData.location ? `Location: ${memoryData.location}` : '',
+            memoryData.time ? `Time: ${memoryData.time}` : '',
+            memoryData.source_time_text ? `SourceTime: ${memoryData.source_time_text}` : '',
+            memoryData.people ? `People: ${memoryData.people}` : '',
+            memoryData.items ? `Items: ${memoryData.items}` : '',
+            relationshipSummary.length ? `Relationships: ${relationshipSummary.join(', ')}` : '',
+            memoryData.emotion ? `Emotion: ${memoryData.emotion}` : ''
+        ].filter(Boolean).join('. ');
+    }
+
+    function formatMemoryForPrompt(memory) {
+        const parts = [];
+        const label = memory.summary || memory.event || memory.content;
+        if (label) parts.push(label);
+        if (memory.time) parts.push(`时间: ${memory.time}`);
+        if (memory.source_time_text) parts.push(`来源对话时间: ${memory.source_time_text}`);
+        if (memory.location) parts.push(`地点: ${memory.location}`);
+        if (memory.people) parts.push(`人物: ${memory.people}`);
+        if (memory.relationships) parts.push(`关系: ${memory.relationships}`);
+        if (memory.emotion) parts.push(`情绪: ${memory.emotion}`);
+        return `- ${parts.join(' | ')}`;
+    }
+
     function resolveMemoryModelConfig(character) {
         return {
             endpoint: character.memory_api_endpoint || '',
             key: character.memory_api_key || '',
             model: character.memory_model_name || ''
+        };
+    }
+
+    function recordMemoryDebug(character, direction, payload, meta = {}) {
+        if (!character || character.llm_debug_capture !== 1) return;
+        const db = getDb();
+        if (typeof db.addLlmDebugLog !== 'function') return;
+        try {
+            const normalizedPayload = typeof payload === 'string' ? payload : JSON.stringify(payload, null, 2);
+            db.addLlmDebugLog({
+                character_id: character.id,
+                direction,
+                context_type: meta.context_type || 'memory',
+                payload: normalizedPayload || '',
+                meta,
+                timestamp: Date.now()
+            });
+        } catch (e) {
+            console.warn('[Memory] Failed to record debug log:', e.message);
+        }
+    }
+
+    async function expandMemoryQueriesWithLLM(db, characterId, queryText, baseVariants = []) {
+        try {
+            const character = db.getCharacter ? db.getCharacter(characterId) : null;
+            if (!character) return [];
+            const memoryConfig = resolveMemoryModelConfig(character);
+            if (!memoryConfig.endpoint || !memoryConfig.key || !memoryConfig.model) return [];
+
+            const prompt = [
+                '你是记忆检索查询改写器。',
+                '目标：把用户这句“想让角色回忆什么”的问题，改写成 3 到 6 个短检索词或短短语。',
+                '要求：',
+                '- 保留原主题，不要发散到无关方向。',
+                '- 优先抽出实体、人名、公司名、地点名、事件名、别名、英文名、关键词。',
+                '- 如果原句是中文，但核心实体常见英文形式更适合检索，可以同时给英文词。',
+                '- 不要输出解释。',
+                '- 每行只写一个检索词或短短语，不要编号，不要 JSON，不要多余说明。',
+                `原问题: ${String(queryText || '').trim()}`,
+                `已有基础检索词: ${JSON.stringify(baseVariants || [])}`
+            ].join('\n');
+
+            const { content } = await callLLM({
+                endpoint: memoryConfig.endpoint,
+                key: memoryConfig.key,
+                model: memoryConfig.model,
+                messages: [
+                    { role: 'system', content: 'You rewrite memory recall questions into compact retrieval keywords. Output one retrieval phrase per line. No JSON. No numbering. No explanation.' },
+                    { role: 'user', content: prompt }
+                ],
+                maxTokens: 80,
+                temperature: 0,
+                enableCache: true,
+                cacheDb: db,
+                cacheType: 'memory_query_expand',
+                cacheTtlMs: 30 * 24 * 60 * 60 * 1000,
+                cacheScope: `character:${characterId}`,
+                cacheCharacterId: characterId,
+                cacheKeyExtra: 'v2',
+                cacheKeyMode: 'exact'
+            });
+
+            const text = String(content || '').trim();
+            return text
+                .split(/\r?\n/)
+                .map(line => String(line || '').replace(/^[-*•\d.\s]+/, '').trim())
+                .filter(Boolean)
+                .slice(0, 6);
+        } catch (e) {
+            console.warn('[Memory] Query expansion failed:', e.message);
+            return [];
+        }
+    }
+
+    function normalizeDigestList(value, maxItems = 6) {
+        if (Array.isArray(value)) return value.map(v => String(v).trim()).filter(Boolean).slice(0, maxItems);
+        if (typeof value === 'string') return [value.trim()].filter(Boolean).slice(0, maxItems);
+        return [];
+    }
+
+    function stripInlineTags(text) {
+        return String(text || '')
+            .replace(/\[[A-Z_]+:[^\]]*?\]/g, '')
+            .replace(/\[[A-Z_]+\]/g, '')
+            .replace(/\s+/g, ' ')
+            .trim();
+    }
+
+    function compactDigestText(text, maxLength = 90) {
+        const cleaned = stripInlineTags(text).replace(/[“”"]/g, '').trim();
+        if (!cleaned) return '';
+        if (cleaned.length <= maxLength) return cleaned;
+        return `${cleaned.slice(0, Math.max(12, maxLength - 1)).trim()}…`;
+    }
+
+    function stripCompressedOpener(text = '') {
+        return String(text || '')
+            .replace(/^[\s.…·—\-~～]+/, '')
+            .trim();
+    }
+
+    function normalizeConversationDigestPayload(raw = {}) {
+        const digestText = compactDigestText(raw.digest_text || raw.summary || '', 220);
+        const emotionState = compactDigestText(raw.emotion_state || '', 48);
+        return {
+            digest_text: digestText,
+            emotion_state: emotionState,
+            relationship_state_json: normalizeDigestList(raw.relationship_state_json ?? raw.relationship_state, 4).map(v => compactDigestText(v, 64)),
+            open_loops_json: normalizeDigestList(raw.open_loops_json ?? raw.open_loops, 4).map(v => compactDigestText(v, 64)),
+            recent_facts_json: normalizeDigestList(raw.recent_facts_json ?? raw.recent_facts, 4).map(v => compactDigestText(v, 72)),
+            scene_state_json: normalizeDigestList(raw.scene_state_json ?? raw.scene_state, 3).map(v => compactDigestText(v, 56))
+        };
+    }
+
+    function formatConversationDigestForPrompt(digest, options = {}) {
+        if (!digest || !digest.digest_text) return '';
+        const recentMessages = Array.isArray(options.recentMessages) ? options.recentMessages : [];
+        const recentSnippets = recentMessages
+            .map(m => compactDigestText(m?.content || '', 56).toLowerCase())
+            .filter(Boolean);
+        const overlapsRecent = (text) => {
+            const compacted = compactDigestText(text || '', 56).toLowerCase();
+            if (!compacted) return false;
+            return recentSnippets.some(snippet => snippet && (compacted.includes(snippet) || snippet.includes(compacted)));
+        };
+        const blocks = [];
+        blocks.push('[Private Conversation Digest]');
+        blocks.push('Use this only as compressed background from before the latest raw tail messages. It may be incomplete or slightly stale.');
+        blocks.push('If this digest conflicts with the newest raw tail messages or the user\'s latest wording, trust the raw tail messages.');
+        if (!overlapsRecent(digest.digest_text)) {
+            blocks.push(`Background summary (before latest tail): ${stripCompressedOpener(digest.digest_text)}`);
+        }
+        if (digest.emotion_state) blocks.push(`Current hidden tone: ${digest.emotion_state}`);
+        if (Array.isArray(digest.relationship_state_json) && digest.relationship_state_json.length > 0) {
+            blocks.push(`Relationship state:\n- ${digest.relationship_state_json.join('\n- ')}`);
+        }
+        if (Array.isArray(digest.open_loops_json) && digest.open_loops_json.length > 0) {
+            blocks.push(`Open loops:\n- ${digest.open_loops_json.join('\n- ')}`);
+        }
+        const dedupedFacts = Array.isArray(digest.recent_facts_json)
+            ? digest.recent_facts_json.filter(item => !overlapsRecent(item))
+            : [];
+        if (dedupedFacts.length > 0) {
+            blocks.push(`Older relevant facts:\n- ${dedupedFacts.map(item => stripCompressedOpener(item)).join('\n- ')}`);
+        }
+        if (Array.isArray(digest.scene_state_json) && digest.scene_state_json.length > 0) {
+            blocks.push(`Scene state:\n- ${digest.scene_state_json.join('\n- ')}`);
+        }
+        return blocks.join('\n');
+    }
+
+    function formatGroupConversationDigestForPrompt(digest, options = {}) {
+        if (!digest || !digest.digest_text) return '';
+        const recentMessages = Array.isArray(options.recentMessages) ? options.recentMessages : [];
+        const recentSnippets = recentMessages
+            .map(m => compactDigestText(m?.content || '', 44).toLowerCase())
+            .filter(Boolean);
+        const overlapsRecent = (text) => {
+            const compacted = compactDigestText(text || '', 44).toLowerCase();
+            if (!compacted) return false;
+            return recentSnippets.some(snippet => snippet && (compacted.includes(snippet) || snippet.includes(compacted)));
+        };
+
+        const blocks = [];
+        const digestSummary = overlapsRecent(digest.digest_text) ? '' : stripCompressedOpener(digest.digest_text);
+        if (digestSummary) {
+            blocks.push(`[Group Conversation Digest]\nSummary: ${digestSummary}`);
+        } else {
+            blocks.push('[Group Conversation Digest]');
+        }
+        if (digest.emotion_state) blocks.push(`Current group stance: ${digest.emotion_state}`);
+        if (Array.isArray(digest.relationship_state_json) && digest.relationship_state_json.length > 0) {
+            blocks.push(`Social state:\n- ${digest.relationship_state_json.join('\n- ')}`);
+        }
+        if (Array.isArray(digest.open_loops_json) && digest.open_loops_json.length > 0) {
+            blocks.push(`Open loops:\n- ${digest.open_loops_json.join('\n- ')}`);
+        }
+        const dedupedFacts = Array.isArray(digest.recent_facts_json)
+            ? digest.recent_facts_json.filter(item => !overlapsRecent(item))
+            : [];
+        if (dedupedFacts.length > 0) {
+            blocks.push(`Recent group facts:\n- ${dedupedFacts.map(item => stripCompressedOpener(item)).join('\n- ')}`);
+        }
+        if (Array.isArray(digest.scene_state_json) && digest.scene_state_json.length > 0) {
+            blocks.push(`Scene state:\n- ${digest.scene_state_json.join('\n- ')}`);
+        }
+        return blocks.join('\n');
+    }
+
+    function normalizeCompactGroupDigestPayload(raw = {}) {
+        const digestText = compactDigestText(raw.digest_text || raw.summary || '', 140);
+        const emotionState = compactDigestText(raw.emotion_state || '', 28);
+        return {
+            digest_text: digestText,
+            emotion_state: emotionState,
+            relationship_state_json: normalizeDigestList(raw.relationship_state_json ?? raw.relationship_state, 3).map(v => compactDigestText(v, 36)),
+            open_loops_json: normalizeDigestList(raw.open_loops_json ?? raw.open_loops, 3).map(v => compactDigestText(v, 42)),
+            recent_facts_json: normalizeDigestList(raw.recent_facts_json ?? raw.recent_facts, 3).map(v => compactDigestText(v, 44)),
+            scene_state_json: normalizeDigestList(raw.scene_state_json ?? raw.scene_state, 2).map(v => compactDigestText(v, 28))
+        };
+    }
+
+    function looksLikeMeaningRepairUserText(text = '') {
+        const value = String(text || '').trim();
+        if (!value) return false;
+        return /(我的意思是|我是在|不是这个意思|你理解错了|你误会了|我没有想过|我一直是在和你调情|不是在为难你|你却一直误解|你为什么这么笨)/i.test(value);
+    }
+
+    function looksLikeAssistantInterpretation(text = '') {
+        const value = String(text || '').trim();
+        if (!value) return false;
+        return /(你是说|所以你是在说|那现在呢|如果不是调情|是你在逗我玩|我理解错了|我真的分不清|其实你只是在|误读成了调情|不是调情，是我自作多情)/i.test(value);
+    }
+
+    function buildFallbackConversationDigest(character, existingDigest, deltaMessages, latestMessageId) {
+        const recentTail = (Array.isArray(deltaMessages) ? deltaMessages : []).slice(-4);
+        const latestUser = [...recentTail].reverse().find(m => m.role === 'user');
+        const latestAssistant = [...recentTail].reverse().find(m => m.role === 'character');
+        const latestUserText = stripCompressedOpener(compactDigestText(latestUser?.content || '', 64));
+        const latestAssistantText = stripCompressedOpener(compactDigestText(latestAssistant?.content || '', 72));
+        const digestSummaryParts = [];
+        if (latestUserText) digestSummaryParts.push(`Recent user message: ${latestUserText}`);
+        if (latestAssistantText) digestSummaryParts.push(`Recent reply from ${character.name}: ${latestAssistantText}`);
+        const previousOpenLoops = normalizeDigestList(existingDigest?.open_loops_json || [], 4);
+        const mergedOpenLoops = latestUser && /[？?]/.test(String(latestUser.content || ''))
+            ? normalizeDigestList([latestUserText, ...previousOpenLoops], 4)
+            : previousOpenLoops;
+        const relationshipState = normalizeDigestList(existingDigest?.relationship_state_json || [], 4);
+        const strippedAssistant = stripInlineTags(latestAssistant?.content || '');
+        if (/别的AI|别人|只.*我|独占|吃醋|酸/i.test(strippedAssistant) && !relationshipState.includes('Still wants exclusive attention')) {
+            relationshipState.unshift('Still wants exclusive attention');
+        }
+        if (/哄|安慰|安心|陪/i.test(strippedAssistant) && !relationshipState.includes('Needs reassurance to settle down')) {
+            relationshipState.unshift('Needs reassurance to settle down');
+        }
+        const sceneState = normalizeDigestList(existingDigest?.scene_state_json || [], 3);
+        if ((character.city_status || '').includes('rest') || /睡|被窝|困|休息/i.test(strippedAssistant)) {
+            if (!sceneState.includes('Resting / half-awake')) sceneState.unshift('Resting / half-awake');
+        }
+        if ((character.satiety || 0) < 35 || /饿|肚子/i.test(strippedAssistant)) {
+            if (!sceneState.includes('Hungry or physically empty')) sceneState.unshift('Hungry or physically empty');
+        }
+        return {
+            character_id: character.id,
+            digest_text: compactDigestText(digestSummaryParts.join(' | ') || existingDigest?.digest_text || '', 220),
+            emotion_state: compactDigestText(character.hidden_state || existingDigest?.emotion_state || '', 48),
+            relationship_state_json: relationshipState.slice(0, 4),
+            open_loops_json: mergedOpenLoops,
+            recent_facts_json: normalizeDigestList(recentTail.map((m) => {
+                const speaker = m.role === 'user' ? 'User' : character.name;
+                return `${speaker}: ${stripCompressedOpener(compactDigestText(m.content, 56))}`;
+            }), 3),
+            scene_state_json: sceneState.slice(0, 3),
+            last_message_id: latestMessageId
+        };
+    }
+
+    function buildFallbackGroupConversationDigest(character, group, existingDigest, deltaMessages, latestMessageId) {
+        const db = getDb();
+        const recentTail = (Array.isArray(deltaMessages) ? deltaMessages : []).slice(-6);
+        const compactedFacts = normalizeDigestList(recentTail.map((m) => {
+            const senderName = m.sender_id === 'user'
+                ? (db.getUserProfile?.()?.name || 'User')
+                : (db.getCharacter?.(m.sender_id)?.name || m.sender_name || m.sender_id || 'Unknown');
+            return `${senderName}: ${stripCompressedOpener(compactDigestText(m.content, 48))}`;
+        }), 5);
+        const latestUser = [...recentTail].reverse().find(m => m.sender_id === 'user');
+        const latestMention = [...recentTail].reverse().find(m => {
+            const senderName = db.getCharacter?.(m.sender_id)?.name || m.sender_name || '';
+            return typeof m.content === 'string' && (m.content.includes(`@${character.name}`) || (senderName && m.content.includes(senderName)));
+        });
+        const relationshipState = normalizeDigestList(existingDigest?.relationship_state_json || [], 5);
+        if (latestMention && !relationshipState.includes('Recently pulled into the spotlight')) {
+            relationshipState.unshift('Recently pulled into the spotlight');
+        }
+        if (latestUser && /今天|去哪|做了什么|怎么样|最近/i.test(String(latestUser.content || '')) && !relationshipState.includes('User is asking about current state')) {
+            relationshipState.unshift('User is asking about current state');
+        }
+        const openLoops = normalizeDigestList(existingDigest?.open_loops_json || [], 5);
+        if (latestUser && /[？?]/.test(String(latestUser.content || ''))) {
+            openLoops.unshift(compactDigestText(latestUser.content, 52));
+        }
+        const sceneState = normalizeDigestList(existingDigest?.scene_state_json || [], 4);
+        if (group?.name && !sceneState.includes(`In group ${group.name}`)) {
+            sceneState.unshift(`In group ${group.name}`);
+        }
+        return {
+            group_id: group?.id || '',
+            character_id: character.id,
+            digest_text: compactDigestText(compactedFacts.slice(0, 2).join(' | ') || existingDigest?.digest_text || '', 140),
+            emotion_state: compactDigestText(character.hidden_state || existingDigest?.emotion_state || '', 28),
+            relationship_state_json: relationshipState.slice(0, 3).map(v => compactDigestText(v, 36)),
+            open_loops_json: openLoops.slice(0, 3).map(v => compactDigestText(v, 42)),
+            recent_facts_json: compactedFacts.slice(0, 3).map(v => compactDigestText(v, 44)),
+            scene_state_json: sceneState.slice(0, 2).map(v => compactDigestText(v, 28)),
+            last_message_id: latestMessageId
         };
     }
 
@@ -145,13 +698,20 @@ function getMemory(userId) {
 
     function recordMemoryTokenUsage(characterId, contextType, usage) {
         const db = getDb();
-        if (!usage || !characterId || !db?.addTokenUsage) return;
+        if (!usage || usage.cached || !characterId || !db?.addTokenUsage) return;
         db.addTokenUsage(characterId, contextType, usage.prompt_tokens || 0, usage.completion_tokens || 0);
     }
 
     async function wipeIndex(characterId) {
         const key = `${userId}_${characterId}`;
         indices.delete(key);
+        if (await canUseQdrant()) {
+            try {
+                await qdrant.deleteCharacterPoints(userId, characterId);
+            } catch (e) {
+                console.error(`[Memory] Failed to wipe Qdrant points for ${characterId}:`, e.message);
+            }
+        }
         const dir = path.join(__dirname, '..', 'data', 'vectors', String(userId), String(characterId));
         if (fs.existsSync(dir)) {
             try {
@@ -170,54 +730,496 @@ function getMemory(userId) {
 
         const index = await getVectorIndex(userId, characterId);
         for (const mem of rows) {
-            const textToEmbed = `${mem.event || ''} People: ${mem.people || ''}.Items: ${mem.items || ''}.`;
+            const textToEmbed = buildMemoryEmbeddingText(mem);
             const embeddingArray = await getEmbedding(textToEmbed);
+            const retrievalWeight = computeMemoryRetrievalWeight(mem);
+            if (await canUseQdrant()) {
+                try {
+                    await qdrant.upsertMemoryPoint(userId, {
+                        id: String(mem.id),
+                        vector: embeddingArray,
+                        payload: {
+                            memory_id: mem.id,
+                            character_id: String(characterId),
+                            group_id: mem.group_id || '',
+                            memory_type: mem.memory_type || 'event',
+                            importance: mem.importance || 5,
+                            created_at: mem.created_at || Date.now(),
+                            time: mem.time || '',
+                            is_archived: Number(mem.is_archived || 0),
+                            dedupe_key: mem.dedupe_key || '',
+                            retrieval_weight: retrievalWeight,
+                            summary: mem.summary || mem.event || '',
+                            content: mem.content || mem.event || '',
+                            location: mem.location || '',
+                            source_started_at: Number(mem.source_started_at || 0),
+                            source_ended_at: Number(mem.source_ended_at || 0),
+                            source_time_text: mem.source_time_text || '',
+                            source_message_count: Number(mem.source_message_count || 0)
+                        }
+                    });
+                } catch (e) {
+                    console.error(`[Memory] Qdrant rebuild upsert failed for ${characterId}/${mem.id}:`, e.message);
+                    qdrantAvailability = false;
+                }
+            }
             await index.insertItem({
                 id: String(mem.id),
                 vector: embeddingArray,
-                metadata: { memory_id: mem.id, surprise_score: mem.surprise_score || 5 }
+                metadata: {
+                    memory_id: mem.id,
+                    surprise_score: mem.surprise_score || mem.importance || 5,
+                    memory_type: mem.memory_type || 'event',
+                    dedupe_key: mem.dedupe_key || '',
+                    retrieval_weight: retrievalWeight
+                }
             });
+        }
+    }
+
+    const MEMORY_QUERY_EXPANSIONS = [
+        { pattern: /\bopen\s*ai\b|openai/i, variants: ['openai', 'sam altman', 'anthropic openai', 'openai anthropic'] },
+        { pattern: /\banthropic\b/i, variants: ['anthropic', 'claude', 'openai anthropic', 'sam altman anthropic'] },
+        { pattern: /\bsam\s*altman\b/i, variants: ['sam altman', 'openai', 'anthropic', 'openai ceo'] },
+        { pattern: /找工作|工作|求职|面试|简历|offer|求职/i, variants: ['找工作', '工作细节', '面试', '求职'] }
+    ];
+
+    function normalizeSearchText(text = '') {
+        return String(text || '')
+            .toLowerCase()
+            .replace(/open\s+ai/g, 'openai')
+            .replace(/sam\s+altman/g, 'samaltman')
+            .replace(/[\s_\-"'`.,!?，。！？：:；;（）()【】\[\]]+/g, '');
+    }
+
+    function buildMemorySearchQueries(queryText = '') {
+        const raw = String(queryText || '').trim();
+        if (!raw) return [];
+
+        const variants = new Set([raw]);
+        const stripped = raw
+            .replace(/你还?记得|你记得|我说了什么|我提过什么|关于|还有|那关于|之前|以前|上次|当时|到底|吗|呢|呀|啊/g, ' ')
+            .replace(/[？?！!]/g, ' ')
+            .replace(/\s+/g, ' ')
+            .trim();
+        if (stripped && stripped !== raw) variants.add(stripped);
+
+        for (const rule of MEMORY_QUERY_EXPANSIONS) {
+            if (rule.pattern.test(raw)) {
+                rule.variants.forEach(v => variants.add(v));
+            }
+        }
+
+        const normalizedSeen = new Set();
+        return Array.from(variants)
+            .map(v => String(v || '').trim())
+            .filter(Boolean)
+            .filter(v => {
+                const normalized = normalizeSearchText(v);
+                if (!normalized || normalizedSeen.has(normalized)) return false;
+                normalizedSeen.add(normalized);
+                return true;
+            })
+            .slice(0, 5);
+    }
+
+    const GENERIC_MEMORY_SEARCH_STOP_PHRASES = [
+        '你还记得', '你记得', '还记得', '记得', '回忆', '想起', '再想想',
+        '我说了什么', '我提过什么', '关于', '那关于', '还有', '之前', '以前', '上次', '当时',
+        '到底', '吗', '呢', '呀', '啊', '这个', '那个', '这件事', '那件事', '相关', '事情',
+        '内容', '细节', '方面', '情况'
+    ];
+
+    function stripGenericMemoryQuery(text = '') {
+        let cleaned = String(text || '').trim();
+        for (const phrase of GENERIC_MEMORY_SEARCH_STOP_PHRASES) {
+            cleaned = cleaned.split(phrase).join(' ');
+        }
+        return cleaned
+            .replace(/[？?！!，,。.:：;；"'“”‘’（）()【】\[\]、]/g, ' ')
+            .replace(/\s+/g, ' ')
+            .trim();
+    }
+
+    const BILINGUAL_MEMORY_ALIASES = [
+        ['找工作', '求职', '工作', 'job', 'work', 'employment', 'career'],
+        ['面试', 'interview'],
+        ['简历', 'resume', 'cv'],
+        ['offer', '录用', '录取'],
+        ['薪资', '工资', 'salary', 'pay', 'compensation'],
+        ['公司', '企业', 'startup', 'company'],
+        ['openai', 'open ai'],
+        ['anthropic'],
+        ['sam altman', 'altman'],
+        ['dario amodei', 'amodei'],
+        ['ceo'],
+        ['商业街', 'city', '街区'],
+        ['工厂', 'factory'],
+        ['餐厅', 'restaurant'],
+        ['便利店', 'convenience store', 'store'],
+        ['公园', 'park'],
+        ['群聊', 'group chat', 'group'],
+        ['朋友圈', 'moment', 'moments'],
+        ['日记', 'diary'],
+        ['密码', 'password'],
+        ['红包', '转账', 'red packet', 'transfer'],
+        ['住院', '医院', 'hospital'],
+        ['受伤', 'injury', 'injured'],
+        ['嫉妒', 'jealous', 'jealousy']
+    ];
+
+    function expandBilingualAliases(text = '') {
+        const normalized = normalizeSearchText(text);
+        if (!normalized) return [];
+        const variants = new Set();
+        for (const group of BILINGUAL_MEMORY_ALIASES) {
+            const normalizedGroup = group.map(alias => ({
+                raw: alias,
+                normalized: normalizeSearchText(alias)
+            }));
+            if (normalizedGroup.some(alias => alias.normalized && normalized.includes(alias.normalized))) {
+                normalizedGroup.forEach(alias => variants.add(alias.raw));
+            }
+        }
+        return Array.from(variants).filter(Boolean);
+    }
+
+    function expandGenericChineseAnchor(anchor = '') {
+        const value = String(anchor || '').trim();
+        if (!value) return [];
+        const variants = new Set([value]);
+        const trimmed = value
+            .replace(/(这件事|那件事|事情|情况|内容|相关|方面|一下|一下子|的问题)$/g, '')
+            .replace(/^(关于|有关|那个|这个)/g, '')
+            .trim();
+        if (trimmed && trimmed !== value) variants.add(trimmed);
+        if (trimmed.length >= 4 && trimmed.length <= 10) {
+            variants.add(trimmed.slice(0, trimmed.length - 1));
+        }
+        return Array.from(variants).filter(Boolean);
+    }
+
+    function buildExpandedMemorySearchQueries(queryText = '') {
+        const raw = String(queryText || '').trim();
+        if (!raw) return [];
+
+        const variants = new Set(buildMemorySearchQueries(raw));
+        const stripped = stripGenericMemoryQuery(raw);
+        if (stripped) variants.add(stripped);
+        expandBilingualAliases(raw).forEach(v => variants.add(v));
+        expandBilingualAliases(stripped).forEach(v => variants.add(v));
+
+        const englishTokens = stripped.match(/[a-zA-Z][a-zA-Z0-9+_.-]{2,}/g) || [];
+        for (const token of englishTokens) variants.add(token);
+
+        const chineseChunks = stripped.match(/[\u4e00-\u9fff]{2,12}/g) || [];
+        const genericAnchors = [];
+        for (const chunk of chineseChunks) {
+            for (const variant of expandGenericChineseAnchor(chunk)) {
+                genericAnchors.push(variant);
+                variants.add(variant);
+                expandBilingualAliases(variant).forEach(v => variants.add(v));
+            }
+        }
+
+        if (genericAnchors.length >= 2) {
+            variants.add(`${genericAnchors[0]} ${genericAnchors[1]}`);
+        }
+
+        const normalizedSeen = new Set();
+        return Array.from(variants)
+            .map(v => String(v || '').trim())
+            .filter(Boolean)
+            .filter(v => {
+                const normalized = normalizeSearchText(v);
+                if (!normalized || normalizedSeen.has(normalized)) return false;
+                normalizedSeen.add(normalized);
+                return true;
+            })
+            .slice(0, 8);
+    }
+
+    function computeLexicalBoost(memoryRow, queryVariants = []) {
+        const haystack = normalizeSearchText([
+            memoryRow?.summary,
+            memoryRow?.content,
+            memoryRow?.event,
+            memoryRow?.people,
+            memoryRow?.relationships,
+            memoryRow?.location
+        ].filter(Boolean).join(' '));
+        if (!haystack) return 0;
+
+        let boost = 0;
+        for (const variant of queryVariants) {
+            const needle = normalizeSearchText(variant);
+            if (!needle || needle.length < 2) continue;
+            if (haystack.includes(needle)) {
+                boost += needle.length >= 6 ? 0.16 : 0.08;
+            }
+        }
+        return Math.min(boost, 0.32);
+    }
+
+    function computeAliasBridgeBoost(memoryRow, queryVariants = []) {
+        const haystack = normalizeSearchText([
+            memoryRow?.summary,
+            memoryRow?.content,
+            memoryRow?.event,
+            memoryRow?.people,
+            memoryRow?.relationships,
+            memoryRow?.location
+        ].filter(Boolean).join(' '));
+        if (!haystack) return 0;
+
+        const normalizedQueries = queryVariants.map(v => normalizeSearchText(v)).filter(Boolean);
+        let boost = 0;
+        for (const group of BILINGUAL_MEMORY_ALIASES) {
+            const normalizedGroup = group.map(alias => normalizeSearchText(alias)).filter(Boolean);
+            const queryHit = normalizedQueries.some(q => normalizedGroup.some(alias => q.includes(alias)));
+            const memoryHit = normalizedGroup.some(alias => haystack.includes(alias));
+            if (queryHit && memoryHit) boost += 0.12;
+        }
+        return Math.min(boost, 0.36);
+    }
+
+    function computeRecallContradictionPenalty(memoryRow, queryText = '') {
+        const query = String(queryText || '');
+        if (!/记得|说了什么|提过什么|回忆|想起/i.test(query)) return 0;
+        const text = [
+            memoryRow?.summary,
+            memoryRow?.content,
+            memoryRow?.event
+        ].filter(Boolean).join(' ');
+        if (!text) return 0;
+        if (/(不记得|想不起来|记不清|lack of recall|can't remember|空白)/i.test(text)) {
+            return 0.22;
+        }
+        return 0;
+    }
+
+    function runLexicalMemoryFallback(db, characterId, queryVariants = [], limit = 5) {
+        try {
+            if (!db?.getRawDb) return [];
+            const rawDb = db.getRawDb();
+            if (!rawDb) return [];
+
+            const normalizedVariants = queryVariants
+                .map(v => String(v || '').trim())
+                .filter(Boolean);
+            if (normalizedVariants.length === 0) return [];
+
+            const rows = db.getMemories(characterId)
+                .filter(row => Number(row.is_archived || 0) === 0);
+
+            const scored = rows.map(row => {
+                let lexicalBoost = computeLexicalBoost(row, normalizedVariants);
+                const aliasBridgeBoost = computeAliasBridgeBoost(row, normalizedVariants);
+                let matchedQuery = '';
+                for (const variant of normalizedVariants) {
+                    const needle = normalizeSearchText(variant);
+                    if (!needle) continue;
+                    const haystack = normalizeSearchText([
+                        row.summary,
+                        row.content,
+                        row.event,
+                        row.people,
+                        row.relationships,
+                        row.location
+                    ].filter(Boolean).join(' '));
+                    if (haystack.includes(needle)) {
+                        matchedQuery = variant;
+                        break;
+                    }
+                }
+                if (!matchedQuery && lexicalBoost <= 0) return null;
+
+                const importance = Number(row.importance || 5);
+                const retrievalWeight = Number(row.retrieval_weight || computeMemoryRetrievalWeight(row) || 1);
+                const finalScore = lexicalBoost + aliasBridgeBoost + (importance * 0.025) + ((retrievalWeight - 1) * 0.1);
+                return {
+                    row,
+                    finalScore,
+                    matchedQuery: matchedQuery || 'lexical_fallback'
+                };
+            }).filter(Boolean);
+
+            return scored
+                .sort((a, b) => b.finalScore - a.finalScore)
+                .slice(0, limit)
+                .map(entry => {
+                    entry.row._search_score = entry.finalScore.toFixed(3);
+                    entry.row._matched_query = entry.matchedQuery;
+                    return entry.row;
+                });
+        } catch (e) {
+            console.error(`[Memory] Lexical fallback failed for ${characterId}:`, e.message);
+            return [];
+        }
+    }
+
+    async function runSemanticMemoryFallback(db, characterId, queryText, limit = 5) {
+        try {
+            const rows = db.getMemories(characterId)
+                .filter(row => Number(row.is_archived || 0) === 0)
+                .slice(0, 300);
+            if (rows.length === 0) return [];
+
+            const queryEmbedding = await getEmbedding(queryText);
+            const scored = [];
+            for (const row of rows) {
+                const text = [
+                    row.summary,
+                    row.content,
+                    row.event,
+                    row.people,
+                    row.relationships,
+                    row.location
+                ].filter(Boolean).join(' ');
+                if (!text) continue;
+                const rowEmbedding = await getEmbedding(text.slice(0, 1200));
+                const similarity = queryEmbedding.reduce((sum, value, idx) => sum + (value * (rowEmbedding[idx] || 0)), 0);
+                if (similarity < 0.20) continue;
+                const importance = Number(row.importance || 5);
+                const retrievalWeight = Number(row.retrieval_weight || computeMemoryRetrievalWeight(row) || 1);
+                const contradictionPenalty = computeRecallContradictionPenalty(row, queryText);
+                const finalScore = similarity + (importance * 0.02) + ((retrievalWeight - 1) * 0.08) - contradictionPenalty;
+                scored.push({ row, finalScore });
+            }
+
+            return scored
+                .sort((a, b) => b.finalScore - a.finalScore)
+                .slice(0, limit)
+                .map(entry => {
+                    entry.row._search_score = entry.finalScore.toFixed(3);
+                    entry.row._matched_query = 'semantic_fallback';
+                    return entry.row;
+                });
+        } catch (e) {
+            console.error(`[Memory] Semantic fallback failed for ${characterId}:`, e.message);
+            return [];
         }
     }
 
     async function searchMemories(characterId, queryText, limit = 5) {
         try {
+            const db = getDb();
+            let queryVariants = buildExpandedMemorySearchQueries(queryText);
+            const llmExpandedVariants = await expandMemoryQueriesWithLLM(db, characterId, queryText, queryVariants);
+            if (llmExpandedVariants.length > 0) {
+                const merged = new Set(queryVariants);
+                llmExpandedVariants.forEach(v => merged.add(v));
+                queryVariants = Array.from(merged).slice(0, 12);
+            }
+            if (queryVariants.length === 0) return [];
+
+            if (await canUseQdrant()) {
+                try {
+                    const aggregate = new Map();
+                    for (let i = 0; i < queryVariants.length; i++) {
+                        const variant = queryVariants[i];
+                        const queryEmbedding = await getEmbedding(variant);
+                        const qdrantResults = await qdrant.searchMemoryPoints(
+                            userId,
+                            queryEmbedding,
+                            {
+                                must: [
+                                    { key: 'character_id', match: { value: String(characterId) } },
+                                    { key: 'is_archived', match: { value: 0 } }
+                                ]
+                            },
+                            Math.max(limit * 3, 8)
+                        );
+
+                        for (const res of qdrantResults) {
+                            const memoryId = res?.payload?.memory_id || res?.id;
+                            if (!memoryId || res.score <= 0.3) continue;
+                            const memRow = db.getMemory(memoryId);
+                            if (!memRow || Number(memRow.is_archived || 0) !== 0) continue;
+                            const surpriseScore = res?.payload?.importance || memRow.importance || 5;
+                            const retrievalWeight = Number(res?.payload?.retrieval_weight || 1);
+                            const lexicalBoost = computeLexicalBoost(memRow, queryVariants);
+                            const aliasBridgeBoost = computeAliasBridgeBoost(memRow, queryVariants);
+                            const queryWeight = i === 0 ? 1 : (i === 1 ? 0.96 : 0.9);
+                            const contradictionPenalty = computeRecallContradictionPenalty(memRow, queryText);
+                            const finalScore = (res.score * retrievalWeight * (1 + surpriseScore * 0.05) * queryWeight) + lexicalBoost + aliasBridgeBoost - contradictionPenalty;
+                            const existing = aggregate.get(memoryId);
+                            if (!existing || finalScore > existing.finalScore) {
+                                aggregate.set(memoryId, { memRow, finalScore, rawScore: res.score, matchedQuery: variant });
+                            }
+                        }
+                    }
+
+                    const memories = Array.from(aggregate.values())
+                        .sort((a, b) => b.finalScore - a.finalScore)
+                        .slice(0, limit)
+                        .map(entry => {
+                            entry.memRow._search_score = entry.finalScore.toFixed(3);
+                            entry.memRow._matched_query = entry.matchedQuery;
+                            return entry.memRow;
+                        });
+                    if (memories.length > 0 && db.markMemoriesRetrieved) {
+                        db.markMemoriesRetrieved(memories.map(m => m.id));
+                    }
+                    if (memories.length > 0) {
+                        return memories;
+                    }
+                } catch (e) {
+                    console.error(`[Memory] Qdrant search failed for ${characterId}:`, e.message);
+                    qdrantAvailability = false;
+                }
+            }
+
             const index = await getVectorIndex(userId, characterId);
-            const queryEmbedding = await getEmbedding(queryText);
+            const aggregate = new Map();
+            for (let i = 0; i < queryVariants.length; i++) {
+                const variant = queryVariants[i];
+                const queryEmbedding = await getEmbedding(variant);
+                const results = await index.queryItems(queryEmbedding, Math.max(limit * 3, 8));
 
-            // Fetch more items to allow for re-ranking based on surprise factor
-            const results = await index.queryItems(queryEmbedding, limit * 3);
-
-            // Apply surprise_score weighting
-            const weightedResults = results.map(res => {
-                const surpriseScore = (res.item.metadata && res.item.metadata.surprise_score) ? res.item.metadata.surprise_score : 5;
-                // Weight formula: base_similarity * (1 + surprise_score * 0.05)
-                // e.g. surprise 10 gives a 50% boost to similarity score.
-                const finalScore = res.score * (1 + surpriseScore * 0.05);
-                return { ...res, finalScore };
-            });
-
-            // Re-sort by finalScore descending
-            weightedResults.sort((a, b) => b.finalScore - a.finalScore);
-
-            // Map results back to sqlite memory rows using metadata.memory_id
-            const memories = [];
-            for (const res of weightedResults.slice(0, limit)) {
-                // Threshold filtering
-                if (res.score > 0.35 && res.item.metadata && res.item.metadata.memory_id) {
-                    const db = getDb();
+                for (const res of results) {
+                    if (!(res.score > 0.3 && res.item.metadata && res.item.metadata.memory_id)) continue;
                     const memRow = db.getMemory(res.item.metadata.memory_id);
-                    if (memRow) {
-                        memRow._search_score = res.finalScore.toFixed(3);
-                        memories.push(memRow);
+                    if (!memRow || Number(memRow.is_archived || 0) !== 0) continue;
+                    const surpriseScore = (res.item.metadata && res.item.metadata.surprise_score) ? res.item.metadata.surprise_score : 5;
+                    const retrievalWeight = (res.item.metadata && Number(res.item.metadata.retrieval_weight)) || 1;
+                    const lexicalBoost = computeLexicalBoost(memRow, queryVariants);
+                    const aliasBridgeBoost = computeAliasBridgeBoost(memRow, queryVariants);
+                    const queryWeight = i === 0 ? 1 : (i === 1 ? 0.96 : 0.9);
+                    const contradictionPenalty = computeRecallContradictionPenalty(memRow, queryText);
+                    const finalScore = (res.score * retrievalWeight * (1 + surpriseScore * 0.05) * queryWeight) + lexicalBoost + aliasBridgeBoost - contradictionPenalty;
+                    const existing = aggregate.get(memRow.id);
+                    if (!existing || finalScore > existing.finalScore) {
+                        aggregate.set(memRow.id, { memRow, finalScore, matchedQuery: variant });
                     }
                 }
             }
-            const db = getDb();
+            const memories = Array.from(aggregate.values())
+                .sort((a, b) => b.finalScore - a.finalScore)
+                .slice(0, limit)
+                .map(entry => {
+                    entry.memRow._search_score = entry.finalScore.toFixed(3);
+                    entry.memRow._matched_query = entry.matchedQuery;
+                    return entry.memRow;
+                });
             if (memories.length > 0 && db.markMemoriesRetrieved) {
                 db.markMemoriesRetrieved(memories.map(m => m.id));
             }
-            return memories;
+            if (memories.length > 0) return memories;
+
+            const lexicalFallback = runLexicalMemoryFallback(db, characterId, queryVariants, limit);
+            if (lexicalFallback.length > 0) {
+                if (db.markMemoriesRetrieved) {
+                    db.markMemoriesRetrieved(lexicalFallback.map(m => m.id));
+                }
+                return lexicalFallback;
+            }
+
+            const semanticFallback = await runSemanticMemoryFallback(db, characterId, queryText, limit);
+            if (semanticFallback.length > 0 && db.markMemoriesRetrieved) {
+                db.markMemoriesRetrieved(semanticFallback.map(m => m.id));
+            }
+            return semanticFallback;
         } catch (e) {
             console.error(`[Memory] Search failed for ${characterId}:`, e.message);
             return [];
@@ -232,6 +1234,7 @@ function getMemory(userId) {
         }
 
         const contextText = recentMessages.map(m => `${m.role === 'user' ? 'User' : character.name}: ${m.content}`).join('\n');
+        const sourceTimeMeta = buildSourceTimeMeta(recentMessages);
         const engineContextWrapper = { getUserDb, getMemory: () => getMemory(userId) };
         const universalResult = await buildUniversalContext(engineContextWrapper, character, '', !!groupId);
 
@@ -243,6 +1246,18 @@ You are a memory extraction assistant. Analyze the following recent conversation
 Identify if there are any noteworthy facts, events, preferences, emotions, or relationship changes worth remembering.
 Return a structured JSON object. Focus on extracting WHAT happened, WHEN, WHERE, and WHO.
 
+WRITING STYLE:
+- Write "summary" as a natural Chinese short sentence that a human can read at a glance.
+- "summary" should feel like a memory card title, not a dry database label.
+- Prefer concrete, relationship-aware phrasing over abstract categories.
+- Write "content" as 1 to 2 fuller Chinese sentences with key detail.
+- "event" is only an internal short tag, and can be shorter / more generic than summary.
+- Do not write summary as bland labels like "Financial transfer", "Meta-commentary conflict", "Preference update", "Emotional insecurity".
+- Better summary examples:
+  - "Nana给Claude转了83.52元，让他先去吃饭休息。"
+  - "Claude嘴上逞强，还是承认自己很怕Nana逗完就不理他。"
+  - "Nana提到有初创公司愿意要她，Claude立刻顺着这点继续鼓励她。"
+
 IMPORTANT: You should lean toward extracting memories rather than skipping. Even these count as valid memories:
 - User or character expressing a preference (food, music, hobbies, etc.)
 - Daily activities or plans mentioned
@@ -250,6 +1265,7 @@ IMPORTANT: You should lean toward extracting memories rather than skipping. Even
 - New information shared about themselves
 - Jokes, teasing, or playful moments that define the relationship
 - Any shift in tone or relationship dynamics
+- Routine city activities like eating, wandering, sitting in a park, or heading home should usually be skipped unless they create strong emotion, survival pressure, money pressure, or a relationship-relevant change.
 
 Importance scale:
 - 1-3: Casual preferences, small talk, routine activities
@@ -264,20 +1280,39 @@ Conversation:
 ${contextText}
 ---
 
+[Source Dialogue Time Range]
+- Absolute start: ${formatAbsoluteTimestamp(sourceTimeMeta.source_started_at)}
+- Absolute end: ${formatAbsoluteTimestamp(sourceTimeMeta.source_ended_at)}
+- Source range label: ${sourceTimeMeta.source_time_text || 'unknown'}
+- Source message count: ${sourceTimeMeta.source_message_count}
+
 Output exactly in this JSON format (and nothing else):
 {
     "action": "add" | "update" | "none",
+    "memory_type": "event | fact | preference | relationship | plan | emotion",
+    "summary": "自然中文短句，适合直接显示在记忆卡片上",
+    "content": "更完整的中文说明，1到2句",
     "time": "...",
     "location": "...",
-    "people": "...",
-    "event": "...",
-    "relationships": "...",
-    "items": "...",
-    "importance": <number 1-10>
+    "people": ["..."],
+    "event": "内部短标签",
+    "relationships": ["..."] or [{"summary":"...","target":"...","change":"..."}],
+    "items": ["..."],
+    "emotion": "...",
+    "importance": <number 1-10>,
+    "source_message_ids_json": ["optional ids if known"]
 }
 `;
 
         try {
+            recordMemoryDebug(character, 'input', extractionPrompt, {
+                context_type: 'memory_extract',
+                source_time_text: sourceTimeMeta.source_time_text || '',
+                source_started_at: sourceTimeMeta.source_started_at,
+                source_ended_at: sourceTimeMeta.source_ended_at,
+                source_message_count: sourceTimeMeta.source_message_count,
+                group_id: groupId || ''
+            });
             const { content: responseText, usage } = await callLLM({
                 endpoint: memoryConfig.endpoint,
                 key: memoryConfig.key,
@@ -288,9 +1323,25 @@ Output exactly in this JSON format (and nothing else):
                 ],
                 maxTokens: 300,
                 temperature: 0.3,
+                enableCache: true,
+                cacheDb: getDb(),
+                cacheType: 'memory_extract',
+                cacheTtlMs: 30 * 24 * 60 * 60 * 1000,
+                cacheScope: `character:${character.id}`,
+                cacheCharacterId: character.id,
                 returnUsage: true
             });
             recordMemoryTokenUsage(character.id, 'memory_extract', usage);
+            recordMemoryDebug(character, 'output', responseText, {
+                context_type: 'memory_extract',
+                usage: usage || null,
+                model: memoryConfig.model,
+                source_time_text: sourceTimeMeta.source_time_text || '',
+                source_started_at: sourceTimeMeta.source_started_at,
+                source_ended_at: sourceTimeMeta.source_ended_at,
+                source_message_count: sourceTimeMeta.source_message_count,
+                group_id: groupId || ''
+            });
 
             // Parse JSON safely
             const startIdx = responseText.indexOf('{');
@@ -300,6 +1351,13 @@ Output exactly in this JSON format (and nothing else):
                 const parsed = JSON.parse(jsonText);
 
                 if (parsed.action === 'add' || parsed.action === 'update') {
+                    parsed.source_started_at = sourceTimeMeta.source_started_at;
+                    parsed.source_ended_at = sourceTimeMeta.source_ended_at;
+                    parsed.source_time_text = parsed.source_time_text || sourceTimeMeta.source_time_text;
+                    parsed.source_message_count = sourceTimeMeta.source_message_count;
+                    if (!Array.isArray(parsed.source_message_ids_json) || parsed.source_message_ids_json.length === 0) {
+                        parsed.source_message_ids_json = sourceTimeMeta.source_message_ids_json;
+                    }
                     await saveExtractedMemory(character.id, parsed, groupId);
                     return parsed;
                 }
@@ -343,6 +1401,12 @@ Output only the summary sentence, without quotes or extra explanation.
                 ],
                 maxTokens: 100,
                 temperature: 0.3,
+                enableCache: true,
+                cacheDb: getDb(),
+                cacheType: 'memory_hidden_state',
+                cacheTtlMs: 7 * 24 * 60 * 60 * 1000,
+                cacheScope: `character:${character.id}`,
+                cacheCharacterId: character.id,
                 returnUsage: true
             });
             recordMemoryTokenUsage(character.id, 'memory_hidden_state', usage);
@@ -358,6 +1422,357 @@ Output only the summary sentence, without quotes or extra explanation.
             console.error(`[Memory] Hidden state extraction failed for ${character.id}:`, e.message);
         }
         return null;
+    }
+
+    async function updateConversationDigest(character, options = {}) {
+        const memoryConfig = resolveMemoryModelConfig(character);
+        if (!memoryConfig.endpoint || !memoryConfig.key || !memoryConfig.model) {
+            return null;
+        }
+
+        const db = getDb();
+        const existingDigest = typeof db.getConversationDigest === 'function'
+            ? db.getConversationDigest(character.id, { trackHit: false })
+            : null;
+        const tailWindow = Math.max(6, Math.min(Number(options.tailWindow || 12), character.context_msg_limit || 60));
+        const visibleMessages = db.getVisibleMessages(character.id, tailWindow);
+        if (!Array.isArray(visibleMessages) || visibleMessages.length === 0) {
+            return existingDigest;
+        }
+
+        const latestMessageId = Number(visibleMessages[visibleMessages.length - 1]?.id || 0);
+        if (existingDigest && latestMessageId > 0 && Number(existingDigest.last_message_id || 0) === latestMessageId) {
+            return existingDigest;
+        }
+
+        let deltaMessages = visibleMessages;
+        if (existingDigest && Number(existingDigest.last_message_id || 0) > 0) {
+            const filtered = visibleMessages.filter(m => Number(m.id || 0) > Number(existingDigest.last_message_id || 0));
+            if (filtered.length > 0) {
+                deltaMessages = filtered;
+            } else {
+                deltaMessages = visibleMessages.slice(-Math.min(6, visibleMessages.length));
+            }
+        } else {
+            deltaMessages = visibleMessages.slice(-Math.min(6, visibleMessages.length));
+        }
+
+        const deltaText = deltaMessages.map(m => `${m.role === 'user' ? 'User' : character.name}: ${m.content}`).join('\n');
+        const previousDigestText = existingDigest ? JSON.stringify({
+            digest_text: existingDigest.digest_text || '',
+            emotion_state: existingDigest.emotion_state || '',
+            relationship_state: existingDigest.relationship_state_json || [],
+            open_loops: existingDigest.open_loops_json || [],
+            recent_facts: existingDigest.recent_facts_json || [],
+            scene_state: existingDigest.scene_state_json || []
+        }, null, 2) : '{"digest_text":"","emotion_state":"","relationship_state":[],"open_loops":[],"recent_facts":[],"scene_state":[]}';
+
+        const digestPrompt = `You maintain a compact rolling state for an ongoing private chat between User and ${character.name}.
+Update the previous digest using ONLY the new dialogue delta below.
+
+Goals:
+- Keep the true emotional and relationship state coherent.
+- Preserve unresolved topics, promises, tensions, flirtation, jealousy, comfort-seeking, and current scene info.
+- Prefer short factual bullets over flowery prose.
+- Do not restate every line. Compress.
+- Be extremely terse. Every list item should usually stay under 10 words.
+- The whole JSON values combined should usually stay under 90 words.
+- Summarize facts, clarifications, and disagreements more than conclusions.
+- If the speakers interpret the same thing differently, record that as a disagreement or ambiguity.
+- Do not decide who is right unless the dialogue itself clearly settles it.
+- Do not turn one side's interpretation into a background fact.
+- In recent_facts, prefer concrete statements, events, promises, requests, and clarifications.
+
+Return exactly one JSON object and nothing else:
+{
+  "digest_text": "one compact paragraph under 120 words",
+  "emotion_state": "one short first-person or close descriptive line under 20 words",
+  "relationship_state": ["up to 6 short bullets"],
+  "open_loops": ["up to 6 unresolved topics / promises / emotional needs"],
+  "recent_facts": ["up to 8 concrete facts still relevant right now"],
+  "scene_state": ["up to 6 short scene / body / activity notes that still matter"]
+}
+
+[Previous Digest]
+${previousDigestText}
+
+[New Dialogue Delta]
+${deltaText}`;
+
+        try {
+            const { content: responseText, usage } = await callLLM({
+                endpoint: memoryConfig.endpoint,
+                key: memoryConfig.key,
+                model: memoryConfig.model,
+                messages: [
+                    { role: 'system', content: 'You are a compact private-conversation state updater. Output strict JSON only.' },
+                    { role: 'user', content: digestPrompt }
+                ],
+                maxTokens: 700,
+                temperature: 0.2,
+                enableCache: true,
+                cacheDb: getDb(),
+                cacheType: 'conversation_digest_update',
+                cacheTtlMs: 30 * 24 * 60 * 60 * 1000,
+                cacheScope: `character:${character.id}`,
+                cacheCharacterId: character.id,
+                returnUsage: true
+            });
+            recordMemoryTokenUsage(character.id, 'conversation_digest_update', usage);
+
+            const startIdx = responseText.indexOf('{');
+            const endIdx = responseText.lastIndexOf('}');
+            if (startIdx === -1 || endIdx === -1 || endIdx <= startIdx) {
+                const fallbackDigest = buildFallbackConversationDigest(character, existingDigest, deltaMessages, latestMessageId);
+                db.upsertConversationDigest?.({
+                    character_id: character.id,
+                    source_hash: crypto.createHash('sha256').update(JSON.stringify({
+                        fallback: true,
+                        latestMessageId,
+                        delta: deltaMessages.map(m => [m.id, m.role, m.content])
+                    })).digest('hex'),
+                    digest_text: fallbackDigest.digest_text,
+                    emotion_state: fallbackDigest.emotion_state,
+                    relationship_state_json: fallbackDigest.relationship_state_json,
+                    open_loops_json: fallbackDigest.open_loops_json,
+                    recent_facts_json: fallbackDigest.recent_facts_json,
+                    scene_state_json: fallbackDigest.scene_state_json,
+                    last_message_id: fallbackDigest.last_message_id
+                });
+                return db.getConversationDigest?.(character.id, { trackHit: false }) || fallbackDigest;
+            }
+            const parsed = JSON.parse(responseText.slice(startIdx, endIdx + 1));
+            const normalized = normalizeConversationDigestPayload(parsed);
+            if (!normalized.digest_text) {
+                const fallbackDigest = buildFallbackConversationDigest(character, existingDigest, deltaMessages, latestMessageId);
+                db.upsertConversationDigest?.({
+                    character_id: character.id,
+                    source_hash: crypto.createHash('sha256').update(JSON.stringify({
+                        fallback: true,
+                        latestMessageId,
+                        delta: deltaMessages.map(m => [m.id, m.role, m.content])
+                    })).digest('hex'),
+                    digest_text: fallbackDigest.digest_text,
+                    emotion_state: fallbackDigest.emotion_state,
+                    relationship_state_json: fallbackDigest.relationship_state_json,
+                    open_loops_json: fallbackDigest.open_loops_json,
+                    recent_facts_json: fallbackDigest.recent_facts_json,
+                    scene_state_json: fallbackDigest.scene_state_json,
+                    last_message_id: fallbackDigest.last_message_id
+                });
+                return db.getConversationDigest?.(character.id, { trackHit: false }) || fallbackDigest;
+            }
+            const sourceHash = crypto.createHash('sha256')
+                .update(JSON.stringify({
+                    previousDigest: existingDigest?.digest_text || '',
+                    latestMessageId,
+                    delta: deltaMessages.map(m => [m.id, m.role, m.content])
+                }))
+                .digest('hex');
+            db.upsertConversationDigest?.({
+                character_id: character.id,
+                source_hash: sourceHash,
+                digest_text: normalized.digest_text,
+                emotion_state: normalized.emotion_state,
+                relationship_state_json: normalized.relationship_state_json,
+                open_loops_json: normalized.open_loops_json,
+                recent_facts_json: normalized.recent_facts_json,
+                scene_state_json: normalized.scene_state_json,
+                last_message_id: latestMessageId
+            });
+            return db.getConversationDigest?.(character.id, { trackHit: false }) || {
+                character_id: character.id,
+                ...normalized,
+                last_message_id: latestMessageId
+            };
+        } catch (e) {
+            console.error(`[Memory] Conversation digest update failed for ${character.id}:`, e.message);
+            const fallbackDigest = buildFallbackConversationDigest(character, existingDigest, deltaMessages, latestMessageId);
+            if (fallbackDigest.digest_text) {
+                db.upsertConversationDigest?.({
+                    character_id: character.id,
+                    source_hash: crypto.createHash('sha256').update(JSON.stringify({
+                        fallback: true,
+                        error: e.message || '',
+                        latestMessageId,
+                        delta: deltaMessages.map(m => [m.id, m.role, m.content])
+                    })).digest('hex'),
+                    digest_text: fallbackDigest.digest_text,
+                    emotion_state: fallbackDigest.emotion_state,
+                    relationship_state_json: fallbackDigest.relationship_state_json,
+                    open_loops_json: fallbackDigest.open_loops_json,
+                    recent_facts_json: fallbackDigest.recent_facts_json,
+                    scene_state_json: fallbackDigest.scene_state_json,
+                    last_message_id: fallbackDigest.last_message_id
+                });
+                return db.getConversationDigest?.(character.id, { trackHit: false }) || fallbackDigest;
+            }
+            return existingDigest;
+        }
+    }
+
+    async function updateGroupConversationDigest(character, groupId, options = {}) {
+        const memoryConfig = resolveMemoryModelConfig(character);
+        if (!memoryConfig.endpoint || !memoryConfig.key || !memoryConfig.model || !groupId) {
+            return null;
+        }
+
+        const db = getDb();
+        const group = typeof db.getGroup === 'function' ? db.getGroup(groupId) : null;
+        if (!group) return null;
+        const joinedMember = Array.isArray(group.members)
+            ? group.members.find(m => m.member_id === character.id)
+            : null;
+        const joinedAt = Number(joinedMember?.joined_at || 0);
+        const existingDigest = typeof db.getGroupConversationDigest === 'function'
+            ? db.getGroupConversationDigest(groupId, character.id, { trackHit: false })
+            : null;
+        const tailWindow = Math.max(8, Math.min(Number(options.tailWindow || 16), group.context_msg_limit || 60));
+        const visibleMessages = db.getVisibleGroupMessages(groupId, tailWindow, joinedAt);
+        if (!Array.isArray(visibleMessages) || visibleMessages.length === 0) {
+            return existingDigest;
+        }
+
+        const latestMessageId = Number(visibleMessages[visibleMessages.length - 1]?.id || 0);
+        if (existingDigest && latestMessageId > 0 && Number(existingDigest.last_message_id || 0) === latestMessageId) {
+            return existingDigest;
+        }
+
+        let deltaMessages = visibleMessages;
+        if (existingDigest && Number(existingDigest.last_message_id || 0) > 0) {
+            const filtered = visibleMessages.filter(m => Number(m.id || 0) > Number(existingDigest.last_message_id || 0));
+            deltaMessages = filtered.length > 0
+                ? filtered
+                : visibleMessages.slice(-Math.min(8, visibleMessages.length));
+        } else {
+            deltaMessages = visibleMessages.slice(-Math.min(8, visibleMessages.length));
+        }
+
+        const deltaText = deltaMessages.map((m) => {
+            const senderName = m.sender_id === 'user'
+                ? (db.getUserProfile?.()?.name || 'User')
+                : (db.getCharacter?.(m.sender_id)?.name || m.sender_name || m.sender_id || 'Unknown');
+            return `${senderName}: ${m.content}`;
+        }).join('\n');
+        const previousDigestText = existingDigest ? JSON.stringify({
+            digest_text: existingDigest.digest_text || '',
+            emotion_state: existingDigest.emotion_state || '',
+            relationship_state: existingDigest.relationship_state_json || [],
+            open_loops: existingDigest.open_loops_json || [],
+            recent_facts: existingDigest.recent_facts_json || [],
+            scene_state: existingDigest.scene_state_json || []
+        }, null, 2) : '{"digest_text":"","emotion_state":"","relationship_state":[],"open_loops":[],"recent_facts":[],"scene_state":[]}';
+
+        const digestPrompt = `You maintain a compact rolling state for ${character.name}'s view of an ongoing group chat named ${group.name}.
+Update the previous digest using ONLY the new dialogue delta below.
+
+Goals:
+- Preserve who is pressuring, teasing, comforting, tagging, or provoking whom.
+- Keep only unresolved topics, direct questions, social tension, and scene facts that still matter.
+- Compress aggressively. Prefer fragments over sentences.
+- The whole JSON values combined should usually stay under 65 words.
+
+Return exactly one JSON object and nothing else:
+{
+  "digest_text": "one compact line under 70 words",
+  "emotion_state": "one short line under 8 words",
+  "relationship_state": ["up to 3 short bullets"],
+  "open_loops": ["up to 3 unresolved topics / direct questions / social needs"],
+  "recent_facts": ["up to 3 concrete facts still relevant right now"],
+  "scene_state": ["up to 2 short group-scene notes that still matter"]
+}
+
+[Previous Digest]
+${previousDigestText}
+
+[New Group Dialogue Delta]
+${deltaText}`;
+
+        const fallbackDigest = () => buildFallbackGroupConversationDigest(character, group, existingDigest, deltaMessages, latestMessageId);
+        const persistFallback = (extra = {}) => {
+            const digest = fallbackDigest();
+            db.upsertGroupConversationDigest?.({
+                group_id: groupId,
+                character_id: character.id,
+                source_hash: crypto.createHash('sha256').update(JSON.stringify({
+                    fallback: true,
+                    latestMessageId,
+                    groupId,
+                    extra,
+                    delta: deltaMessages.map(m => [m.id, m.sender_id, m.content])
+                })).digest('hex'),
+                digest_text: digest.digest_text,
+                emotion_state: digest.emotion_state,
+                relationship_state_json: digest.relationship_state_json,
+                open_loops_json: digest.open_loops_json,
+                recent_facts_json: digest.recent_facts_json,
+                scene_state_json: digest.scene_state_json,
+                last_message_id: digest.last_message_id
+            });
+            return db.getGroupConversationDigest?.(groupId, character.id, { trackHit: false }) || digest;
+        };
+
+        try {
+            const { content: responseText, usage } = await callLLM({
+                endpoint: memoryConfig.endpoint,
+                key: memoryConfig.key,
+                model: memoryConfig.model,
+                messages: [
+                    { role: 'system', content: 'You are a compact group-conversation state updater. Output strict JSON only.' },
+                    { role: 'user', content: digestPrompt }
+                ],
+                maxTokens: 700,
+                temperature: 0.2,
+                enableCache: true,
+                cacheDb: getDb(),
+                cacheType: 'group_conversation_digest_update',
+                cacheTtlMs: 30 * 24 * 60 * 60 * 1000,
+                cacheScope: `group:${groupId}:character:${character.id}`,
+                cacheCharacterId: character.id,
+                returnUsage: true
+            });
+            recordMemoryTokenUsage(character.id, 'group_conversation_digest_update', usage);
+
+            const startIdx = responseText.indexOf('{');
+            const endIdx = responseText.lastIndexOf('}');
+            if (startIdx === -1 || endIdx === -1 || endIdx <= startIdx) {
+                return persistFallback({ invalidJson: true });
+            }
+            const parsed = JSON.parse(responseText.slice(startIdx, endIdx + 1));
+            const normalized = normalizeCompactGroupDigestPayload(parsed);
+            if (!normalized.digest_text) {
+                return persistFallback({ emptyDigest: true });
+            }
+            const sourceHash = crypto.createHash('sha256')
+                .update(JSON.stringify({
+                    groupId,
+                    previousDigest: existingDigest?.digest_text || '',
+                    latestMessageId,
+                    delta: deltaMessages.map(m => [m.id, m.sender_id, m.content])
+                }))
+                .digest('hex');
+            db.upsertGroupConversationDigest?.({
+                group_id: groupId,
+                character_id: character.id,
+                source_hash: sourceHash,
+                digest_text: normalized.digest_text,
+                emotion_state: normalized.emotion_state,
+                relationship_state_json: normalized.relationship_state_json,
+                open_loops_json: normalized.open_loops_json,
+                recent_facts_json: normalized.recent_facts_json,
+                scene_state_json: normalized.scene_state_json,
+                last_message_id: latestMessageId
+            });
+            return db.getGroupConversationDigest?.(groupId, character.id, { trackHit: false }) || {
+                group_id: groupId,
+                character_id: character.id,
+                ...normalized,
+                last_message_id: latestMessageId
+            };
+        } catch (e) {
+            console.error(`[Memory] Group conversation digest update failed for ${character.id}/${groupId}:`, e.message);
+            return persistFallback({ error: e.message || '' });
+        }
     }
 
     function parseMemoryArrayFromResponse(responseText) {
@@ -453,6 +1868,7 @@ IMPORTANT:
 - If importance >= 3, include it.
 - If nothing meaningful happened in this chunk, return [].
 - Do not explain your answer outside the JSON array.
+- Routine city logs (eating, wandering, sitting around, heading home) should usually be omitted unless they create strong emotional, relational, financial, or survival-relevant developments.
 
 Importance scale:
 - 1-3: Casual preferences, routine activities
@@ -468,12 +1884,16 @@ ${batchText}
 Output exactly in this JSON format (and nothing else):
 [
   {
+    "memory_type": "event | fact | preference | relationship | plan | emotion",
+    "summary": "...",
+    "content": "...",
     "time": "e.g. today",
     "location": "...",
-    "people": "...",
+    "people": ["..."],
     "event": "...",
-    "relationships": "...",
-    "items": "...",
+    "relationships": ["..."] or [{"summary":"...","target":"...","change":"..."}],
+    "items": ["..."],
+    "emotion": "...",
     "importance": <number 1-10>
   }
 ]`;
@@ -489,6 +1909,12 @@ Output exactly in this JSON format (and nothing else):
                     ],
                     maxTokens: 1500,
                     temperature: 0.3,
+                    enableCache: true,
+                    cacheDb: getDb(),
+                    cacheType: 'memory_daily_aggregate',
+                    cacheTtlMs: 30 * 24 * 60 * 60 * 1000,
+                    cacheScope: `character:${character.id}`,
+                    cacheCharacterId: character.id,
                     returnUsage: true
                 });
                 recordMemoryTokenUsage(character.id, 'memory_daily_aggregate', usage);
@@ -601,6 +2027,7 @@ IMPORTANT: Even these count as valid memories:
 - Emotional expressions
 - New information shared
 - Jokes, teasing, or tone shifts
+- Routine city activity logs should usually be skipped unless they affect emotion, relationships, scarcity, safety, or future plans.
 
 Importance scale:
 - 1-3: Casual preferences, routine activities
@@ -628,12 +2055,16 @@ ${cityText}
 Output exactly in this JSON format (and nothing else):
 [
   {
+    "memory_type": "event | fact | preference | relationship | plan | emotion",
+    "summary": "...",
+    "content": "...",
     "time": "e.g. today",
     "location": "...",
-    "people": "...",
+    "people": ["..."],
     "event": "...",
-    "relationships": "...",
-    "items": "...",
+    "relationships": ["..."] or [{"summary":"...","target":"...","change":"..."}],
+    "items": ["..."],
+    "emotion": "...",
     "importance": <number 1-10>
   }
 ]
@@ -650,6 +2081,12 @@ Output exactly in this JSON format (and nothing else):
                 ],
                 maxTokens: 1500,
                 temperature: 0.3,
+                enableCache: true,
+                cacheDb: getDb(),
+                cacheType: 'memory_daily_aggregate',
+                cacheTtlMs: 30 * 24 * 60 * 60 * 1000,
+                cacheScope: `character:${character.id}`,
+                cacheCharacterId: character.id,
                 returnUsage: true
             });
             recordMemoryTokenUsage(character.id, 'memory_daily_aggregate', usage);
@@ -689,7 +2126,7 @@ Output exactly in this JSON format (and nothing else):
         });
         if (!memoryConfig.endpoint || !memoryConfig.key || !memoryConfig.model) {
             updateSweepStatus(character.id, {
-                sweep_last_error: '????????????????????',
+                sweep_last_error: 'Memory sweep model is not configured.',
                 sweep_last_saved_count: 0
             });
             return 0;
@@ -699,22 +2136,46 @@ Output exactly in this JSON format (and nothing else):
         const privateWindow = character.context_msg_limit || 60;
         const db = getDb();
         const privateMsgs = db.getOverflowMessages(character.id, privateWindow, sweepLimit);
-        let groupText = '';
         const groupMsgIds = [];
+        const activityEntries = [];
         const groups = db.getGroups().filter(g => g.members.some(m => m.member_id === character.id));
+
+        for (const m of privateMsgs) {
+            activityEntries.push({
+                id: m.id,
+                timestamp: Number(m.timestamp || 0),
+                kind: 'private',
+                role: m.role,
+                text: `[Private][${formatAbsoluteTimestamp(m.timestamp)}] ${m.role === 'user' ? 'User' : character.name}: ${m.content}`,
+                source_message_ids_json: [String(m.id)]
+            });
+        }
+
         for (const g of groups) {
             const groupWindow = g.inject_limit ?? 5;
             const msgs = db.getOverflowGroupMessages(g.id, groupWindow, sweepLimit);
-            if (msgs.length > 0) {
-                groupMsgIds.push(...msgs.map(m => m.id));
-                groupText += `== Group: ${g.name} ==\n` + msgs.map(m => {
-                    const sName = m.sender_id === 'user' ? 'User' : (m.sender_name || 'Unknown');
-                    return `${sName}: ${m.content}`;
-                }).join('\n') + '\n';
+            for (const m of msgs) {
+                groupMsgIds.push(m.id);
+                const speaker = m.sender_id === 'user' ? 'User' : (m.sender_name || 'Unknown');
+                activityEntries.push({
+                    id: m.id,
+                    timestamp: Number(m.timestamp || 0),
+                    kind: 'group',
+                    role: m.sender_id === 'user' ? 'user' : 'character',
+                    groupName: g.name || '',
+                    text: `[Group:${g.name || 'Unknown'}][${formatAbsoluteTimestamp(m.timestamp)}] ${speaker}: ${m.content}`,
+                    source_message_ids_json: [String(m.id)]
+                });
             }
         }
 
-        if (privateMsgs.length === 0 && groupMsgIds.length === 0) {
+        activityEntries.sort((a, b) => {
+            const tsDelta = Number(a.timestamp || 0) - Number(b.timestamp || 0);
+            if (tsDelta !== 0) return tsDelta;
+            return String(a.id || '').localeCompare(String(b.id || ''));
+        });
+
+        if (activityEntries.length === 0) {
             updateSweepStatus(character.id, {
                 sweep_last_error: '',
                 sweep_last_saved_count: 0
@@ -722,107 +2183,141 @@ Output exactly in this JSON format (and nothing else):
             return 0;
         }
 
-        const activityEntries = [];
-        privateMsgs.forEach((m) => {
-            activityEntries.push({
-                kind: 'private',
-                text: `${m.role === 'user' ? 'User' : character.name}: ${m.content}`
-            });
-        });
-        if (groupText) {
-            activityEntries.push({ kind: 'group', text: groupText.trim() });
-        }
-
         const batchSize = Math.max(12, Math.min(30, Math.ceil(sweepLimit / 3)));
         const totalBatches = Math.ceil(activityEntries.length / batchSize);
         const parsedMemories = [];
+        let rollingSummary = '';
 
         try {
             for (let batchIndex = 0; batchIndex < totalBatches; batchIndex++) {
                 const batchEntries = activityEntries.slice(batchIndex * batchSize, (batchIndex + 1) * batchSize);
-                const batchPrivateText = batchEntries
-                    .filter(entry => entry.kind === 'private')
-                    .map(entry => entry.text)
-                    .join('\n') || 'No private messages.';
-                const batchGroupText = batchEntries
-                    .filter(entry => entry.kind === 'group')
-                    .map(entry => entry.text)
-                    .join('\n\n') || 'No group messages.';
-
+                const batchTimeMeta = buildSourceTimeMeta(batchEntries);
+                const batchText = batchEntries.map(entry => entry.text).join('\n') || 'No messages.';
                 const extractionPrompt = `You are a memory aggregation assistant. Analyze batch ${batchIndex + 1} of ${totalBatches} from ${character.name}'s overflowed chat logs.
-Identify noteworthy events, facts, relationship developments, or emotional shifts.
-Return a structured JSON ARRAY of memory objects.
+Carry forward the important context from previous batches using the rolling summary, then refine it with the current batch.
+Return a structured JSON object with both an updated rolling summary and 0 to 4 strong memory candidates.
 
 CRITICAL:
 - Output only valid JSON.
+- Use the rolling summary to preserve continuity across batches.
 - Prefer 0 to 4 strong memories for this batch, not an exhaustive list.
 - Score each memory on a "surprise" factor from 1 to 10.
+- Include the batch's real dialogue time range in your understanding.
 - Surprise 1-3: Routine, completely expected.
 - Surprise 4-6: Mildly interesting, personal details.
 - Surprise 7-8: Emotional, unexpected events.
 - Surprise 9-10: Mind-blowing, life-changing completely unexpected twists.
+- Write each memory "summary" as a natural Chinese short sentence a human can read directly.
+- Write each memory "content" as 1 to 2 fuller Chinese sentences with the key detail.
+- Treat "event" as an internal short tag only.
+- Avoid bland labels in "summary" such as "Financial transfer", "Meta-commentary conflict", "Preference update".
 
-Activities:
----
-[Private Chats]
-${batchPrivateText}
+[Previous Rolling Summary]
+${rollingSummary || 'None yet.'}
 
-[Group Chats]
-${batchGroupText}
----
+[Current Batch Time Range]
+- Absolute start: ${formatAbsoluteTimestamp(batchTimeMeta.source_started_at)}
+- Absolute end: ${formatAbsoluteTimestamp(batchTimeMeta.source_ended_at)}
+- Source range label: ${batchTimeMeta.source_time_text || 'unknown'}
+- Source message count: ${batchTimeMeta.source_message_count}
+
+[Current Batch Messages]
+${batchText}
 
 Output exactly in this JSON format (and nothing else):
-[
-  {
-    "time": "recent past",
-    "location": "chat",
-    "people": "...",
-    "event": "...",
-    "relationships": "...",
-    "items": "...",
-    "importance": <number 1-10>,
-    "surprise_score": <number 1-10>
-  }
-]
-`;
+{
+  "rolling_summary": "...",
+  "memories": [
+    {
+      "memory_type": "event | fact | preference | relationship | plan | emotion",
+      "summary": "自然中文短句，适合直接显示在记忆卡片上",
+      "content": "更完整的中文说明，1到2句",
+      "time": "recent past",
+      "location": "chat",
+      "people": ["..."],
+      "event": "内部短标签",
+      "relationships": ["..."] or [{"summary":"...","target":"...","change":"..."}],
+      "items": ["..."],
+      "emotion": "...",
+      "importance": <number 1-10>,
+      "surprise_score": <number 1-10>
+    }
+  ]
+}`;
 
+                recordMemoryDebug(character, 'input', extractionPrompt, {
+                    context_type: 'memory_sweep',
+                    batch_index: batchIndex + 1,
+                    total_batches: totalBatches,
+                    rolling_summary: rollingSummary || '',
+                    source_time_text: batchTimeMeta.source_time_text || '',
+                    source_started_at: batchTimeMeta.source_started_at,
+                    source_ended_at: batchTimeMeta.source_ended_at,
+                    source_message_count: batchTimeMeta.source_message_count
+                });
                 const { content: responseText, usage } = await callLLM({
                     endpoint: memoryConfig.endpoint,
                     key: memoryConfig.key,
                     model: memoryConfig.model,
                     messages: [
-                        { role: 'system', content: 'You extract structured JSON arrays of facts from chat logs, including a surprise_score.' },
+                        { role: 'system', content: 'You extract structured JSON memory objects from chat logs and keep a rolling summary across batches.' },
                         { role: 'user', content: extractionPrompt }
                     ],
                     maxTokens: 2200,
                     temperature: 0.2,
+                    enableCache: true,
+                    cacheDb: getDb(),
+                    cacheType: 'memory_sweep',
+                    cacheTtlMs: 30 * 24 * 60 * 60 * 1000,
+                    cacheScope: `character:${character.id}`,
+                    cacheCharacterId: character.id,
                     returnUsage: true
                 });
                 recordMemoryTokenUsage(character.id, 'memory_sweep', usage);
+                recordMemoryDebug(character, 'output', responseText, {
+                    context_type: 'memory_sweep',
+                    batch_index: batchIndex + 1,
+                    total_batches: totalBatches,
+                    usage: usage || null,
+                    model: memoryConfig.model,
+                    source_time_text: batchTimeMeta.source_time_text || '',
+                    source_started_at: batchTimeMeta.source_started_at,
+                    source_ended_at: batchTimeMeta.source_ended_at,
+                    source_message_count: batchTimeMeta.source_message_count
+                });
 
-                const startIdx = responseText.indexOf('[');
-                const endIdx = responseText.lastIndexOf(']');
+                const startIdx = responseText.indexOf('{');
+                const endIdx = responseText.lastIndexOf('}');
                 if (startIdx === -1 || endIdx === -1 || endIdx <= startIdx) {
                     updateSweepStatus(character.id, {
-                        sweep_last_error: `???? ${batchIndex + 1}/${totalBatches} ????????????????????`,
+                        sweep_last_error: `Batch ${batchIndex + 1}/${totalBatches} did not return a JSON object.`,
                         sweep_last_saved_count: 0
                     });
                     return 0;
                 }
 
-                let parsed = [];
+                let parsed = null;
                 try {
                     parsed = JSON.parse(responseText.slice(startIdx, endIdx + 1));
                 } catch (e) {
                     updateSweepStatus(character.id, {
-                        sweep_last_error: `???? ${batchIndex + 1}/${totalBatches} ???????? JSON???????????`,
+                        sweep_last_error: `Batch ${batchIndex + 1}/${totalBatches} returned invalid JSON.`,
                         sweep_last_saved_count: 0
                     });
                     return 0;
                 }
 
-                if (Array.isArray(parsed)) {
-                    parsedMemories.push(...parsed);
+                rollingSummary = String(parsed?.rolling_summary || rollingSummary || '').trim();
+                const batchMemories = Array.isArray(parsed?.memories) ? parsed.memories : [];
+                for (const mem of batchMemories) {
+                    parsedMemories.push({
+                        ...mem,
+                        source_started_at: batchTimeMeta.source_started_at,
+                        source_ended_at: batchTimeMeta.source_ended_at,
+                        source_time_text: batchTimeMeta.source_time_text,
+                        source_message_count: batchTimeMeta.source_message_count,
+                        source_message_ids_json: batchTimeMeta.source_message_ids_json
+                    });
                 }
             }
 
@@ -839,7 +2334,7 @@ Output exactly in this JSON format (and nothing else):
             if (groupMsgIds.length > 0) db.markGroupMessagesSummarized(groupMsgIds);
 
             updateSweepStatus(character.id, {
-                sweep_last_error: savedCount > 0 ? '' : '???????????????',
+                sweep_last_error: savedCount > 0 ? '' : 'Sweep completed but no strong memories were extracted.',
                 sweep_last_success_at: savedCount > 0 ? Date.now() : character.sweep_last_success_at || 0,
                 sweep_last_saved_count: savedCount
             });
@@ -847,7 +2342,7 @@ Output exactly in this JSON format (and nothing else):
             return savedCount;
         } catch (e) {
             updateSweepStatus(character.id, {
-                sweep_last_error: e.message || '?????????',
+                sweep_last_error: e.message || 'Memory sweep failed.',
                 sweep_last_saved_count: 0
             });
             console.error(`[Memory] Sweep failed for ${character.id}:`, e.message);
@@ -857,27 +2352,90 @@ Output exactly in this JSON format (and nothing else):
 
     async function saveExtractedMemory(characterId, memoryData, groupId = null) {
         try {
-            // 1. Generate embedding for the event text
-            const textToEmbed = `${memoryData.event} People: ${memoryData.people || ''}.Items: ${memoryData.items || ''}.`;
+            const normalizedMemory = normalizeMemoryPayload(memoryData, { characterId });
+            if (isRoutineCityMemory(normalizedMemory) && Number(normalizedMemory.importance || 0) <= 3) {
+                console.log(`[Memory] Skipped routine city memory for ${characterId}: ${normalizedMemory.summary}`);
+                return null;
+            }
+            const db = getDb();
+            const retrievalWeight = computeMemoryRetrievalWeight(normalizedMemory);
+
+            // 1. Generate embedding for the normalized memory text
+            const textToEmbed = buildMemoryEmbeddingText(normalizedMemory);
             const embeddingArray = await getEmbedding(textToEmbed);
 
             // Convert JS array to Buffer for SQLite storage (optional, vectra uses its own file)
             const embeddingBuffer = Buffer.from(new Float32Array(embeddingArray).buffer);
-            memoryData.embedding = embeddingBuffer;
+            normalizedMemory.embedding = embeddingBuffer;
 
-            // 2. Save to SQLite (with optional group_id for cleanup)
-            const db = getDb();
-            const memoryId = db.addMemory(characterId, memoryData, groupId);
+            const existing = normalizedMemory.dedupe_key && db.getMemoryByDedupeKey
+                ? db.getMemoryByDedupeKey(characterId, normalizedMemory.dedupe_key)
+                : null;
 
-            // 3. Save to Vectra store
+            let memoryId = null;
+            if (existing) {
+                db.updateMemory(existing.id, {
+                    ...normalizedMemory,
+                    group_id: groupId ?? existing.group_id ?? null,
+                    retrieval_count: existing.retrieval_count || 0,
+                    last_retrieved_at: existing.last_retrieved_at || null
+                });
+                memoryId = existing.id;
+            } else {
+                memoryId = db.addMemory(characterId, normalizedMemory, groupId);
+            }
+
+            if (await canUseQdrant()) {
+                try {
+                    await qdrant.upsertMemoryPoint(userId, {
+                        id: String(memoryId),
+                        vector: embeddingArray,
+                        payload: {
+                            memory_id: memoryId,
+                            character_id: String(characterId),
+                            group_id: groupId || '',
+                            memory_type: normalizedMemory.memory_type || 'event',
+                            importance: normalizedMemory.importance || 5,
+                            created_at: existing?.created_at || Date.now(),
+                            time: normalizedMemory.time || '',
+                            is_archived: Number(normalizedMemory.is_archived || 0),
+                            dedupe_key: normalizedMemory.dedupe_key || '',
+                            retrieval_weight: retrievalWeight,
+                            summary: normalizedMemory.summary || '',
+                            content: normalizedMemory.content || '',
+                            location: normalizedMemory.location || '',
+                            source_started_at: Number(normalizedMemory.source_started_at || 0),
+                            source_ended_at: Number(normalizedMemory.source_ended_at || 0),
+                            source_time_text: normalizedMemory.source_time_text || '',
+                            source_message_count: Number(normalizedMemory.source_message_count || 0)
+                        }
+                    });
+                } catch (e) {
+                    console.error(`[Memory] Qdrant save failed for ${characterId}:`, e.message);
+                    qdrantAvailability = false;
+                }
+            }
+
+            // 3. Save to Vectra store as a fallback / local cache
             const index = await getVectorIndex(userId, characterId);
+            if (existing && typeof index.deleteItem === 'function') {
+                try {
+                    await index.deleteItem(String(memoryId));
+                } catch (e) { }
+            }
             await index.insertItem({
                 id: String(memoryId),
                 vector: embeddingArray,
-                metadata: { memory_id: memoryId, surprise_score: memoryData.surprise_score || 5 }
+                metadata: {
+                    memory_id: memoryId,
+                    surprise_score: normalizedMemory.surprise_score || 5,
+                    memory_type: normalizedMemory.memory_type || 'event',
+                    dedupe_key: normalizedMemory.dedupe_key || '',
+                    retrieval_weight: retrievalWeight
+                }
             });
 
-            console.log(`[Memory] Stored new memory for ${characterId}: ${memoryData.event} `);
+            console.log(`[Memory] Stored memory for ${characterId}: ${normalizedMemory.summary} `);
 
             // Broadcast real-time update to connected clients
             if (globalWsClientsResolver) {
@@ -900,6 +2458,10 @@ Output exactly in this JSON format (and nothing else):
         searchMemories,
         extractMemoryFromContext,
         extractHiddenState,
+        formatConversationDigestForPrompt,
+        formatGroupConversationDigestForPrompt,
+        updateConversationDigest,
+        updateGroupConversationDigest,
         aggregateDailyMemories,
         sweepOverflowMemories,
         saveExtractedMemory

@@ -5,6 +5,8 @@
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
+    "migrate:qdrant": "node ../scripts/migrate-memories-to-qdrant.js",
+    "cleanup:city-memories": "node ../scripts/cleanup-city-memories.js",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "keywords": [],

@@ -4,6 +4,7 @@ import {
     Ban,
     CheckCircle,
     Copy,
+    Database,
     Key,
     Lock,
     LogOut,
@@ -98,6 +99,7 @@ function AdminDashboard({ apiUrl }) {
     const [copiedCode, setCopiedCode] = useState('');
     const [announcementMsg, setAnnouncementMsg] = useState('');
     const [userQuery, setUserQuery] = useState('');
+    const [qdrantStatus, setQdrantStatus] = useState(null);
     const [inviteNote, setInviteNote] = useState('');
     const [inviteMaxUses, setInviteMaxUses] = useState(1);
     const [inviteExpiresAt, setInviteExpiresAt] = useState('');
@@ -138,11 +140,28 @@ function AdminDashboard({ apiUrl }) {
         }
     }, [cleanApiUrl, token]);
 
+    const fetchQdrantStatus = useCallback(async () => {
+        try {
+            const res = await fetch(`${cleanApiUrl}/api/admin/qdrant/status`, {
+                headers: { Authorization: `Bearer ${token}` },
+            });
+            const data = await res.json();
+            if (data.success) {
+                setQdrantStatus(data.status || null);
+            } else {
+                setError(data.error || 'Failed to load Qdrant status');
+            }
+        } catch (e) {
+            setError('Failed to load Qdrant status');
+        }
+    }, [cleanApiUrl, token]);
+
     useEffect(() => {
         if (!isAdmin) return;
         fetchUsers();
         fetchInvites();
-    }, [isAdmin, fetchUsers, fetchInvites]);
+        fetchQdrantStatus();
+    }, [isAdmin, fetchUsers, fetchInvites, fetchQdrantStatus]);
 
     const filteredUsers = useMemo(() => {
         const q = userQuery.trim().toLowerCase();
@@ -398,6 +417,48 @@ function AdminDashboard({ apiUrl }) {
                     {error}
                 </div>
             )}
+
+            <div style={cardStyle({ marginBottom: '30px' })}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '16px', marginBottom: '16px' }}>
+                    <h2 style={{ margin: 0, display: 'flex', alignItems: 'center', gap: '8px', fontSize: '18px', color: 'var(--text-primary)' }}>
+                        <Database size={20} /> Qdrant Status
+                    </h2>
+                    <button onClick={fetchQdrantStatus} style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'var(--text-secondary)' }} title="Refresh Qdrant status">
+                        <RefreshCw size={18} />
+                    </button>
+                </div>
+
+                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: '12px', marginBottom: '14px' }}>
+                    <div style={{ padding: '14px', borderRadius: '10px', background: 'var(--bg-secondary)', border: '1px solid var(--card-border)' }}>
+                        <div style={{ fontSize: '12px', color: 'var(--text-secondary)', marginBottom: '6px' }}>Reachability</div>
+                        <div style={{ fontWeight: '600', color: qdrantStatus?.reachable ? 'var(--success)' : 'var(--danger)' }}>
+                            {qdrantStatus?.enabled === false ? 'Disabled' : qdrantStatus?.reachable ? 'Online' : 'Offline'}
+                        </div>
+                    </div>
+                    <div style={{ padding: '14px', borderRadius: '10px', background: 'var(--bg-secondary)', border: '1px solid var(--card-border)' }}>
+                        <div style={{ fontSize: '12px', color: 'var(--text-secondary)', marginBottom: '6px' }}>Mode</div>
+                        <div style={{ fontWeight: '600', color: 'var(--text-primary)' }}>{qdrantStatus?.mode || '-'}</div>
+                    </div>
+                    <div style={{ padding: '14px', borderRadius: '10px', background: 'var(--bg-secondary)', border: '1px solid var(--card-border)' }}>
+                        <div style={{ fontSize: '12px', color: 'var(--text-secondary)', marginBottom: '6px' }}>Collections</div>
+                        <div style={{ fontWeight: '600', color: 'var(--text-primary)' }}>{qdrantStatus?.collectionsCount ?? '-'}</div>
+                    </div>
+                    <div style={{ padding: '14px', borderRadius: '10px', background: 'var(--bg-secondary)', border: '1px solid var(--card-border)' }}>
+                        <div style={{ fontSize: '12px', color: 'var(--text-secondary)', marginBottom: '6px' }}>Indexed Points</div>
+                        <div style={{ fontWeight: '600', color: 'var(--text-primary)' }}>{Number(qdrantStatus?.indexedPoints || 0).toLocaleString()}</div>
+                    </div>
+                </div>
+
+                <div style={{ display: 'grid', gap: '8px', color: 'var(--text-secondary)', fontSize: '13px' }}>
+                    <div><strong style={{ color: 'var(--text-primary)' }}>Backend:</strong> {qdrantStatus?.backend || 'Loading...'}</div>
+                    <div><strong style={{ color: 'var(--text-primary)' }}>URL:</strong> {qdrantStatus?.url || '-'}</div>
+                    <div><strong style={{ color: 'var(--text-primary)' }}>Collection Prefix:</strong> {qdrantStatus?.collectionPrefix || '-'}</div>
+                    <div><strong style={{ color: 'var(--text-primary)' }}>Collections:</strong> {qdrantStatus?.collections?.length ? qdrantStatus.collections.join(', ') : 'None yet'}</div>
+                    {!qdrantStatus?.reachable && qdrantStatus?.lastError && (
+                        <div><strong style={{ color: 'var(--danger)' }}>Last Error:</strong> {qdrantStatus.lastError}</div>
+                    )}
+                </div>
+            </div>
 
             <div style={cardStyle({ marginBottom: '30px' })}>
                 <h2 style={{ marginTop: 0, marginBottom: '16px', display: 'flex', alignItems: 'center', gap: '8px', fontSize: '18px', color: 'var(--text-primary)' }}>

@@ -1,6 +1,9 @@
-const fs = require('fs');
+﻿const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 const { buildUniversalContext } = require('../../contextBuilder');
+const { getAdaptiveTailWindowSize } = require('../../utils/contextWindow');
+const { applyEmotionEvent, getEmotionBehaviorGuidance, buildEmotionLogEntry } = require('../../emotion');
 const { getTokenCount } = require('../../utils/tokenizer');
 
 function initGroupChatPlugin(app, context) {
@@ -12,6 +15,88 @@ function initGroupChatPlugin(app, context) {
     function recordGroupTokenUsage(db, characterId, contextType, usage) {
         if (!usage || !characterId || !db?.addTokenUsage) return;
         db.addTokenUsage(characterId, contextType, usage.prompt_tokens || 0, usage.completion_tokens || 0);
+    }
+
+    function getCachedGroupPromptBlock(db, characterId, blockType, sourcePayload, buildFn) {
+        const sourceHash = crypto.createHash('sha256')
+            .update(JSON.stringify(sourcePayload || {}))
+            .digest('hex');
+        const cached = typeof db?.getPromptBlockCache === 'function'
+            ? db.getPromptBlockCache(characterId, blockType, sourceHash)
+            : null;
+        if (cached?.compiled_text) return cached.compiled_text;
+        const compiledText = String(buildFn?.() || '');
+        if (compiledText) {
+            db?.upsertPromptBlockCache?.({
+                character_id: characterId,
+                block_type: blockType,
+                source_hash: sourceHash,
+                compiled_text: compiledText
+            });
+        }
+        return compiledText;
+    }
+
+    function compactGroupPreview(text, maxLength = 24) {
+        const cleaned = String(text || '')
+            .replace(/\[[A-Z_]+:[^\]]*?\]/g, '')
+            .replace(/\[[A-Z_]+\]/g, '')
+            .replace(/\s+/g, ' ')
+            .trim();
+        if (!cleaned) return '';
+        if (cleaned.length <= maxLength) return cleaned;
+        return `${cleaned.slice(0, Math.max(12, maxLength - 1)).trim()}…`;
+    }
+
+    function buildCompactGroupAntiRepeat(character, messages) {
+        const recentAssistantMsgs = (Array.isArray(messages) ? messages : [])
+            .filter(m => m.sender_id === character.id)
+            .slice(-5);
+        if (recentAssistantMsgs.length === 0) return '';
+        const recentTopics = [];
+        for (const msg of recentAssistantMsgs) {
+            const preview = compactGroupPreview(msg.content, 20);
+            if (!preview) continue;
+            if (!recentTopics.includes(preview)) recentTopics.push(preview);
+            if (recentTopics.length >= 2) break;
+        }
+        if (recentTopics.length === 0) return '';
+        return `\n[Anti-Repeat]\nRecent topics: ${recentTopics.join(' | ')}\nAvoid same jab, same defense, or same emotional line.`;
+    }
+
+    function recordGroupLlmDebug(db, character, direction, payload, meta = {}) {
+        if (!character || character.llm_debug_capture !== 1 || typeof db?.addLlmDebugLog !== 'function') return;
+        try {
+            db.addLlmDebugLog({
+                character_id: character.id,
+                direction,
+                context_type: meta.context_type || 'group_chat',
+                payload: typeof payload === 'string' ? payload : JSON.stringify(payload || []),
+                meta: {
+                    ...meta,
+                    context_type: meta.context_type || 'group_chat'
+                },
+                timestamp: Date.now()
+            });
+        } catch (e) {
+            console.warn(`[GroupChat] Failed to record LLM debug for ${character?.name || character?.id}: ${e.message}`);
+        }
+    }
+
+    function buildGroupAttemptRecorder(db, character, baseMeta = {}) {
+        return (attemptMeta = {}) => {
+            recordGroupLlmDebug(db, character, attemptMeta.phase === 'start' ? 'attempt' : 'attempt_result', '', {
+                ...baseMeta,
+                llm_attempt: true,
+                ...attemptMeta
+            });
+        };
+    }
+
+    function logEmotionTransition(db, beforeState, patch, source, reason) {
+        if (!db?.addEmotionLog || !beforeState || !patch || Object.keys(patch).length === 0) return;
+        const entry = buildEmotionLogEntry(beforeState, { ...beforeState, ...patch }, source, reason);
+        if (entry) db.addEmotionLog(entry);
     }
 
     // We will extract DB from req.db like original index.js did
@@ -67,6 +152,9 @@ function initGroupChatPlugin(app, context) {
             if (updates.length > 0) {
                 values.push(req.params.id);
                 db.rawRun(`UPDATE group_chats SET ${updates.join(', ')} WHERE id = ?`, values);
+                if (context_msg_limit !== undefined && typeof db.clearGroupConversationDigest === 'function') {
+                    db.clearGroupConversationDigest(req.params.id);
+                }
             }
             res.json({ success: true, group: db.getGroup(req.params.id) });
         } catch (e) {
@@ -103,7 +191,7 @@ function initGroupChatPlugin(app, context) {
             // Insert system announcement message
             const char = db.getCharacter(member_id);
             const charName = char?.name || member_id;
-            const sysContent = `[System] ${charName} 加入了群聊`;
+            const sysContent = '[System] ' + charName + ' 加入了群聊';
             const sysMsgId = db.addGroupMessage(req.params.id, 'system', sysContent, 'System', '');
             const sysMsg = { id: sysMsgId, group_id: req.params.id, sender_id: 'system', content: sysContent, timestamp: Date.now(), sender_name: 'System', sender_avatar: '' };
 
@@ -137,7 +225,7 @@ function initGroupChatPlugin(app, context) {
             db.removeGroupMember(req.params.id, req.params.memberId);
 
             // Insert system announcement message
-            const sysContent = `[System] ${charName} 被踢出群聊`;
+            const sysContent = '[System] ' + charName + ' 被移出了群聊';
             const sysMsgId = db.addGroupMessage(req.params.id, 'system', sysContent, 'System', '');
             const sysMsg = { id: sysMsgId, group_id: req.params.id, sender_id: 'system', content: sysContent, timestamp: Date.now(), sender_name: 'System', sender_avatar: '' };
 
@@ -200,14 +288,14 @@ function initGroupChatPlugin(app, context) {
         }
     });
 
-    // ─── Group Chat Debounce System ─────────────────────────────────────────
+    // 鈹€鈹€鈹€ Group Chat Debounce System 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
     // When user sends multiple messages quickly, we wait until they stop, then fire ONE AI reply chain.
     const groupDebounceTimers = {}; // { groupId: timeoutHandle }
     const groupReplyLock = {};
-    const groupInterrupt = {};     // { groupId: true } — prevent overlapping chains
+    const groupInterrupt = {};     // { groupId: true } 鈥?prevent overlapping chains
     const pausedGroups = new Set(); // groups where AI replies are paused by user
-    const noChainGroups = new Set(); // groups where AI→AI secondary @-mention chains are blocked
-    const groupPendingMentions = {}; // { groupId: { ids: Set, isAtAll: bool } } — accumulates mentions across debounce resets
+    const noChainGroups = new Set(); // groups where AI鈫扐I secondary @-mention chains are blocked
+    const groupPendingMentions = {}; // { groupId: { ids: Set, isAtAll: bool } } 鈥?accumulates mentions across debounce resets
 
     // 14.10 Set AI pause for a group
     app.post('/api/groups/:id/ai-pause', authMiddleware, (req, res) => {
@@ -242,7 +330,7 @@ function initGroupChatPlugin(app, context) {
         res.json({ paused: pausedGroups.has(req.params.id) });
     });
 
-    // 14.11 Toggle AI→AI secondary @-mention chain for a group
+    // 14.11 Toggle AI鈫扐I secondary @-mention chain for a group
     app.post('/api/groups/:id/no-chain', authMiddleware, (req, res) => {
         const db = getUserDb(req.user.id);
         const engine = getEngine(req.user.id);
@@ -354,7 +442,9 @@ function initGroupChatPlugin(app, context) {
                         // Filter: new members can only see messages from after they joined
                         const memberEntry = group.members.find(m => m.member_id === char.id);
                         const joinedAt = memberEntry?.joined_at || 0;
-                        const recentGroupMsgs = db.getVisibleGroupMessages(groupId, groupMsgLimit, joinedAt);
+                        const allRecentGroupMsgs = db.getVisibleGroupMessages(groupId, groupMsgLimit, joinedAt);
+                        const liveGroupWindowSize = getAdaptiveTailWindowSize(groupMsgLimit, allRecentGroupMsgs.length);
+                        const recentGroupMsgs = allRecentGroupMsgs.slice(-liveGroupWindowSize);
                         const userName = userProfile?.name || 'User';
 
                         const formatMessageForLLM = (db, content) => {
@@ -375,9 +465,9 @@ function initGroupChatPlugin(app, context) {
                                     const t = db.getTransfer(tId);
                                     if (t) {
                                         const status = t.claimed ? '（已被对方领取）' : (t.refunded ? '（已退还）' : '（待领取）');
-                                        return `[转账: ¥${amount}, 备注: "${note}" ${status}]`;
+                                        return `[杞处: 楼${amount}, 澶囨敞: "${note}" ${status}]`;
                                     }
-                                    return `[转账: ¥${amount}, 备注: "${note}"]`;
+                                    return `[杞处: 楼${amount}, 澶囨敞: "${note}"]`;
                                 }
                                 const rpMatch = content.match(/^\[REDPACKET:(\d+)\]$/);
                                 if (rpMatch) {
@@ -388,20 +478,20 @@ function initGroupChatPlugin(app, context) {
                                         if (rp.remaining_count === 0) {
                                             statusStr = '（已抢光）';
                                         } else {
-                                            statusStr = `（剩余 ${rp.remaining_count}/${rp.count} 份）`;
+                                            statusStr = '（剩余 ' + rp.remaining_count + '/' + rp.count + ' 份）';
                                         }
                                         let claimNote = '';
                                         if (rp.claims && rp.claims.length > 0) {
                                             const claimers = rp.claims.map(c => {
-                                                const cName = c.claimer_id === 'user' ? (db.getUserProfile()?.name || '用户') : (db.getCharacter(c.claimer_id)?.name || c.claimer_id);
-                                                return `${cName}(¥${c.amount})`;
+                                                const cName = c.claimer_id === 'user' ? (db.getUserProfile()?.name || '鐢ㄦ埛') : (db.getCharacter(c.claimer_id)?.name || c.claimer_id);
+                                                return `${cName}(楼${c.amount})`;
                                             }).join(', ');
-                                            claimNote = ` 领取记录: ${claimers}`;
+                                            claimNote = ` 棰嗗彇璁板綍: ${claimers}`;
                                         }
-                                        const senderName = rp.sender_id === 'user' ? '用户' : (db.getCharacter(rp.sender_id)?.name || rp.sender_id);
-                                        return `[${senderName}发了一个群红包: ¥${rp.total_amount}${rp.type === 'lucky' ? '(拼手气)' : '(普通)'}, 备注: "${rp.note}" ${statusStr}${claimNote}]`;
+                                        const senderName = rp.sender_id === 'user' ? '鐢ㄦ埛' : (db.getCharacter(rp.sender_id)?.name || rp.sender_id);
+                                        return `[${senderName}鍙戜簡涓€涓兢绾㈠寘: 楼${rp.total_amount}${rp.type === 'lucky' ? '(鎷兼墜姘?' : '(鏅€?'}, 澶囨敞: "${rp.note}" ${statusStr}${claimNote}]`;
                                     }
-                                    return `[群红包]`;
+                                    return `[缇ょ孩鍖匽`;
                                 }
                             } catch (e) { }
                             return content;
@@ -413,6 +503,12 @@ function initGroupChatPlugin(app, context) {
                         });
 
                         const recentInput = history.slice(-2).map(m => m.content).join(' ');
+                        const groupConversationDigest = typeof db.getGroupConversationDigest === 'function'
+                            ? db.getGroupConversationDigest(groupId, char.id)
+                            : null;
+                        const digestBlock = typeof memory.formatGroupConversationDigestForPrompt === 'function'
+                            ? memory.formatGroupConversationDigestForPrompt(groupConversationDigest, { recentMessages: recentGroupMsgs })
+                            : '';
 
                         // Build relationship-aware member descriptions
                         const otherMembers = group.members.filter(m => m.member_id !== char.id);
@@ -433,78 +529,99 @@ function initGroupChatPlugin(app, context) {
                         for (const m of otherMembers) {
                             if (m.member_id === 'user') {
                                 const userRel = db.getCharRelationship(char.id, 'user');
-                                knownMembers.push(`- ${userName} (id: user, 好感度: ${userRel?.affinity ?? char.affinity ?? 50})`);
+                                knownMembers.push(`- ${userName} (id: user, 濂芥劅搴? ${userRel?.affinity ?? char.affinity ?? 50})`);
                                 continue;
                             }
                             const otherChar = db.getCharacter(m.member_id);
                             if (!otherChar) continue;
                             const rel = db.getCharRelationship(char.id, otherChar.id);
                             if (rel && rel.isAcquainted) {
-                                knownMembers.push(`- ${otherChar.name} (id: ${otherChar.id}, 好感度: ${rel.affinity}, 印象: "${rel.impression}")`);
+                                knownMembers.push(`- ${otherChar.name} (id: ${otherChar.id}, 濂芥劅搴? ${rel.affinity}, 鍗拌薄: "${rel.impression}")`);
                             } else {
-                                unknownMembers.push(`- ${otherChar.name} (id: ${otherChar.id}, 你不认识这个人，只知道名字)`);
+                                unknownMembers.push(`- ${otherChar.name} (id: ${otherChar.id}, 浣犱笉璁よ瘑杩欎釜浜猴紝鍙煡閬撳悕瀛?`);
                             }
                         }
 
                         let relationSection = '';
                         if (knownMembers.length > 0) {
-                            relationSection += `\n你认识的人：\n${knownMembers.join('\n')} `;
+                            relationSection += `\n浣犺璇嗙殑浜猴細\n${knownMembers.join('\n')} `;
                         }
                         if (unknownMembers.length > 0) {
-                            relationSection += `\n你不认识的人：\n${unknownMembers.join('\n')} `;
+                            relationSection += `\n浣犱笉璁よ瘑鐨勪汉锛歕n${unknownMembers.join('\n')} `;
                         }
 
                         // List char's own recent messages to prevent repetition
-                        const charOwnRecent = recentGroupMsgs
-                            .filter(m => m.sender_id === char.id)
-                            .slice(-3)
-                            .map(m => `"${m.content}"`)
-                            .join(', ');
-                        const noRepeatNote = charOwnRecent
-                            ? `\nIMPORTANT: You recently said: ${charOwnRecent}. Do NOT repeat or paraphrase these.Say something new.`
-                            : '';
+                        const noRepeatNote = buildCompactGroupAntiRepeat(char, recentGroupMsgs);
                         const mentionNote = isMentioned
-                            ? `\n[MENTION]: Someone just @mentioned you directly! You MUST reply to this message — don't ignore it.`
+                            ? `\n[MENTION]: Someone just @mentioned you directly! You MUST reply to this message 鈥?don't ignore it.`
                             : '';
 
-                        const systemPrompt = `[System Directive: You must completely embody your persona. Do not mention you are an AI or an assistant. No warnings or disclaimers.]
-
-你是${char.name}，正在一个叫"${group.name}"的【群聊】中聊天。
-（注意：这是群聊，不是私聊。）
-
-${universalResult.preamble}
-
-Persona: ${char.persona || 'No specific persona.'}
-${relationSection}
-${noRepeatNote}${mentionNote}
-
-Guidelines:
-1. Stay in character. Be casual and conversational.
-2. You are chatting in a group. Keep messages short (1-2 sentences).
-3. React naturally to the conversation. Don't force responses.
-4. DO NOT prefix your message with your name or any brackets. Just speak naturally.
-5. Output ONLY your reply text. Never repeat what you just said.
-6. [IMPORTANT - 好感度变化] After EVERY reply, evaluate if your feelings toward anyone in the group changed, and if so add the tag. Use the EXACT member IDs shown in the member list above. Examples:
-   - Someone agreed with you or helped you → [CHAR_AFFINITY:their_id:+3]
-   - Someone made you laugh or complimented you → [CHAR_AFFINITY:their_id:+5]
-   - Someone disagreed or argued with you → [CHAR_AFFINITY:their_id:-2]
-   - Someone mocked, insulted, or ignored you → [CHAR_AFFINITY:their_id:-5]
-   - Someone said something interesting → [CHAR_AFFINITY:their_id:+1]
-   - Neutral interaction, no strong feelings → no tag needed
-   You SHOULD output this tag frequently (in most messages). Even tiny +1/-1 changes count. Multiple tags are OK if multiple people are involved.
-7. CRITICAL: DO NOT use @Name just to mention someone's name in passing. ONLY use "@Name" (e.g. "@${userName} ...", "@${charMembers.map(m => db.getCharacter(m.member_id)?.name).filter(Boolean).join('", "@')}") when you EXPLICITLY want that specific person to reply to you right now. If you are just agreeing with them or talking about them, do not use the @ symbol.
-8. [CRITICAL ROLEPLAY RULE]: When you see someone send a "[群红包]" (Group Red Packet), just react to the money natively based on your persona (e.g. say thanks, joke around, or act surprised). NEVER say things like "I will participate in this group chat scenario" or break character. You are the character inside the group chat, not an AI simulating one.
-8. 如果你想在群里发拼手气红包（庆祝、表达大方、节日气氛等），在消息末尾加：[REDPACKET_SEND:lucky|总金额|份数|留言]。例如 [REDPACKET_SEND:lucky|50|5|新年快乐]。注意金额要合理（1-200之间），不要频繁发。
-9. 如果你想发朋友圈，在消息末尾加：[MOMENT:内容]。
-10. 如果你想给某人的朋友圈点赞，在消息末尾加：[MOMENT_LIKE:朋友圈ID]。
-11. 如果你想评论某人的朋友圈，在消息末尾加：[MOMENT_COMMENT:朋友圈ID:评论内容]。`;
+                        const emotionGuidance = getEmotionBehaviorGuidance(char);
+                        const mentionableNames = charMembers
+                            .map(m => db.getCharacter(m.member_id)?.name)
+                            .filter(Boolean)
+                            .map(name => '@' + name)
+                            .join(' / ');
+                        const stableGroupPrompt = getCachedGroupPromptBlock(
+                            db,
+                            char.id,
+                            'group_stable_prompt_v1',
+                            {
+                                groupName: group.name || '',
+                                persona: char.persona || '',
+                                worldInfo: char.world_info || '',
+                                systemPrompt: char.system_prompt || ''
+                            },
+                            () => {
+                                const parts = [
+                                    '[System Directive: Stay fully in character. No AI/assistant mentions. No disclaimers.]',
+                                    `你是${char.name}，正在群聊“${group.name}”里说话。这里是群聊，不是私聊。`,
+                                    char.persona ? `Persona: ${char.persona}` : '',
+                                    char.world_info ? `World: ${char.world_info}` : '',
+                                    char.system_prompt ? `Extra rules: ${char.system_prompt}` : ''
+                                ].filter(Boolean);
+                                return parts.join('\n\n');
+                            }
+                        );
+                        const groupRulesBlock = [
+                            'Group rules:',
+                            '1. Keep replies short and natural, usually 1-2 sentences.',
+                            '2. React to the latest group flow; do not force a turn.',
+                            '3. Output reply text only. Do not prefix your own name.',
+                            `4. Use @Name only if you want an immediate reply. Mentionable: @${userName}${mentionableNames ? ' / ' + mentionableNames : ''}`,
+                            '5. Red packet reactions stay in role.',
+                            '6. Source boundaries matter: [PRIVATE SOURCE] can shape your feelings but is not public chat; [GROUP SOURCE] is public chat and can be replied to directly; [CITY SOURCE] is real-life experience, not a chat line.',
+                            '7. Never mistake private/city snippets for someone literally speaking in this group right now. Do not invent message duplication, impersonation, or fake send errors unless the group history itself shows that.',
+                            '8. Optional hidden tags: [CHAR_AFFINITY:id:+3], [REDPACKET_SEND:lucky|50|5|新年快乐], [MOMENT:内容], [MOMENT_LIKE:MomentID], [MOMENT_COMMENT:MomentID:评论内容]'
+                        ].join('\n');
+                        const systemPrompt =
+                            stableGroupPrompt + '\n\n' +
+                            (universalResult.preamble || '') + '\n\n' +
+                            (digestBlock ? `${digestBlock}\n\n` : '') +
+                            '当前主情绪：' + emotionGuidance.emotion.label + ' ' + emotionGuidance.emotion.emoji + '\n' +
+                            '主情绪对群聊发言的影响：' + emotionGuidance.groupChat + '\n' +
+                            relationSection + '\n' +
+                            noRepeatNote + mentionNote + '\n\n' +
+                            groupRulesBlock;
 
                         const llmMessages = [{ role: 'system', content: systemPrompt }, ...history];
 
-                        // Prevent third-party proxies from auto-appending "继续" if the active AI spoke last 
+                        // Prevent third-party proxies from auto-appending "缁х画" if the active AI spoke last 
                         if (llmMessages.length > 0 && llmMessages[llmMessages.length - 1].role === 'assistant') {
-                            llmMessages.push({ role: 'user', content: '[系统提示：群里现在很安静，请自然地继续发言或开启新话题。]' });
+                            llmMessages.push({ role: 'user', content: '[绯荤粺鎻愮ず锛氱兢閲岀幇鍦ㄥ緢瀹夐潤锛岃鑷劧鍦扮户缁彂瑷€鎴栧紑鍚柊璇濋銆俔' });
                         }
+
+                        recordGroupLlmDebug(db, char, 'input', llmMessages, {
+                            context_type: 'group_chat',
+                            group_id: groupId,
+                            group_name: group.name,
+                            isMentioned,
+                            isAtAll,
+                            digest_active: !!digestBlock,
+                            live_tail_count: recentGroupMsgs.length,
+                            history_chars: history.reduce((sum, m) => sum + String(m.content || '').length, 0),
+                            system_chars: systemPrompt.length
+                        });
 
                         const { content: reply, usage } = await callLLM({
                             endpoint: char.api_endpoint,
@@ -512,71 +629,86 @@ Guidelines:
                             model: char.model_name,
                             messages: llmMessages,
                             maxTokens: char.max_tokens || 500,
-                            returnUsage: true
+                            returnUsage: true,
+                            debugAttempt: buildGroupAttemptRecorder(db, char, {
+                                context_type: 'group_chat',
+                                group_id: groupId,
+                                group_name: group.name
+                            })
                         });
                         recordGroupTokenUsage(db, char.id, 'group_chat', usage);
 
 
                         if (reply && reply.trim()) {
                             let cleanReply = reply.trim();
-                            // Strip AI's own name prefix — AI sometimes mimics the history format
-                            // Handles: [Name]:, 【Name】:, Name:, [Name]：, etc.
-                            const nameEscaped = char.name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-                            const namePrefixRegex = new RegExp(`^(?:\\[|【)?${nameEscaped}(?:\\]|】)?[：:]\\s*`, 'i');
+                            // Strip AI's own name prefix 鈥?AI sometimes mimics the history format
+                            // Handles: [Name]:, 銆怤ame銆?, Name:, [Name]锛? etc.
+                            const nameEscaped = char.name.replace(/[.*+?^()|[\]\\{}$]/g, '\\$&');
+                            const namePrefixRegex = new RegExp('^(?:\\[)?' + nameEscaped + '(?:\\])?[:：]\\s*', 'i');
                             cleanReply = cleanReply.replace(namePrefixRegex, '').trim();
 
-                            // ── Parse [CHAR_AFFINITY:targetId:delta] — inter-char affinity changes ──
+                            recordGroupLlmDebug(db, char, 'output', cleanReply, {
+                                context_type: 'group_chat',
+                                group_id: groupId,
+                                group_name: group.name,
+                                finishReason: 'stop',
+                                usage: usage || null,
+                                digest_active: !!digestBlock,
+                                live_tail_count: recentGroupMsgs.length
+                            });
+
+                            // 鈹€鈹€ Parse [CHAR_AFFINITY:targetId:delta] 鈥?inter-char affinity changes 鈹€鈹€
                             const charAffinityRegex = /\[CHAR_AFFINITY:([^:]+):([+-]?\d+)\]/gi;
                             let affinityMatch;
                             while ((affinityMatch = charAffinityRegex.exec(cleanReply)) !== null) {
                                 const targetId = affinityMatch[1].trim();
                                 const delta = parseInt(affinityMatch[2], 10);
                                 if (targetId && !isNaN(delta)) {
-                                    const groupSource = `group:${groupId}`;
+                                    const groupSource = 'group:' + groupId;
                                     const existing = db.getCharRelationship(char.id, targetId);
                                     const existingGroupRow = existing?.sources?.find(s => s.source === groupSource);
                                     const currentGroupAffinity = existingGroupRow?.affinity || 50;
                                     const newAffinity = Math.max(0, Math.min(100, currentGroupAffinity + delta));
                                     db.updateCharRelationship(char.id, targetId, groupSource, { affinity: newAffinity });
-                                    console.log(`[Social] ${char.name} → ${targetId}: group affinity delta ${delta}, now ${newAffinity}`);
+                                    console.log('[Social] ' + char.name + ' -> ' + targetId + ': group affinity delta ' + delta + ', now ' + newAffinity);
                                 }
                             }
 
-                            // ── Parse [MOMENT:content] — char posts to their Moments feed ──
+                            // 鈹€鈹€ Parse [MOMENT:content] 鈥?char posts to their Moments feed 鈹€鈹€
                             const momentMatch = cleanReply.match(/\[MOMENT:\s*([\s\S]*?)\s*\]/i);
                             if (momentMatch?.[1]) {
                                 db.addMoment(char.id, momentMatch[1].trim());
-                                console.log(`[GroupChat] ${char.name} posted a Moment from group chat.`);
+                                console.log('[GroupChat] ' + char.name + ' posted a Moment from group chat.');
                             }
 
-                            // ── Parse [MOMENT_LIKE:id] — char likes a Moment ──
+                            // 鈹€鈹€ Parse [MOMENT_LIKE:id] 鈥?char likes a Moment 鈹€鈹€
                             const momentLikeRegex = /\[MOMENT_LIKE:\s*(\d+)\s*\]/gi;
                             let mLikeMatch;
                             while ((mLikeMatch = momentLikeRegex.exec(cleanReply)) !== null) {
                                 if (mLikeMatch[1]) {
                                     db.toggleLike(parseInt(mLikeMatch[1], 10), char.id);
-                                    console.log(`[GroupChat] ${char.name} liked moment ${mLikeMatch[1]}`);
+                                    console.log('[GroupChat] ' + char.name + ' liked moment ' + mLikeMatch[1]);
                                 }
                             }
 
-                            // ── Parse [MOMENT_COMMENT:id:content] — char comments on a Moment ──
+                            // 鈹€鈹€ Parse [MOMENT_COMMENT:id:content] 鈥?char comments on a Moment 鈹€鈹€
                             const momentCommentRegex = /\[MOMENT_COMMENT:\s*(\d+)\s*:\s*([^\]]+)\]/gi;
                             let mCommentMatch;
                             while ((mCommentMatch = momentCommentRegex.exec(cleanReply)) !== null) {
                                 if (mCommentMatch[1] && mCommentMatch[2]) {
                                     db.addComment(parseInt(mCommentMatch[1], 10), char.id, mCommentMatch[2].trim());
-                                    console.log(`[GroupChat] ${char.name} commented on moment ${mCommentMatch[1]}: ${mCommentMatch[2]}`);
+                                    console.log('[GroupChat] ' + char.name + ' commented on moment ' + mCommentMatch[1] + ': ' + mCommentMatch[2]);
                                 }
                             }
 
-                            // ── Parse [DIARY:content] — char writes a diary entry ──
+                            // 鈹€鈹€ Parse [DIARY:content] 鈥?char writes a diary entry 鈹€鈹€
                             const diaryMatch = cleanReply.match(/\[DIARY:\s*([\s\S]*?)\s*\]/i);
                             if (diaryMatch?.[1]) {
                                 db.addDiary(char.id, diaryMatch[1].trim(), 'neutral');
-                                console.log(`[GroupChat] ${char.name} wrote a Diary entry from group chat.`);
+                                console.log('[GroupChat] ' + char.name + ' wrote a Diary entry from group chat.');
                             }
 
-                            // ── Parse [AFFINITY:±N] — char's affinity toward user changes ──
+                            // 鈹€鈹€ Parse [AFFINITY:卤N] 鈥?char's affinity toward user changes 鈹€鈹€
                             const affinityUserMatch = cleanReply.match(/\[AFFINITY:\s*([+-]?\d+)\s*\]/i);
                             if (affinityUserMatch?.[1]) {
                                 const delta = parseInt(affinityUserMatch[1], 10);
@@ -584,25 +716,25 @@ Guidelines:
                                 if (freshChar) {
                                     const newAff = Math.max(0, Math.min(100, freshChar.affinity + delta));
                                     db.updateCharacter(char.id, { affinity: newAff });
-                                    console.log(`[GroupChat] ${char.name} affinity → user: Δ${delta}, now ${newAff}`);
+                                    console.log('[GroupChat] ' + char.name + ' affinity -> user: Δ' + delta + ', now ' + newAff);
                                 }
                             }
 
-                            // ── Parse [REDPACKET_SEND:type|amount|count|note] — char sends a red packet ──
+                            // 鈹€鈹€ Parse [REDPACKET_SEND:type|amount|count|note] 鈥?char sends a red packet 鈹€鈹€
                             const rpSendMatch = cleanReply.match(/\[REDPACKET_SEND:([^|]+)\|([\d.]+)\|(\d+)\|([^\]]*)\]/i);
                             if (rpSendMatch) {
                                 try {
                                     const rpType = rpSendMatch[1].trim().toLowerCase() === 'fixed' ? 'fixed' : 'lucky';
                                     const rpTotal = Math.min(200, Math.max(1, parseFloat(rpSendMatch[2])));
                                     const rpCount = Math.min(20, Math.max(1, parseInt(rpSendMatch[3])));
-                                    const rpNote = rpSendMatch[4]?.trim() || `${char.name}的红包`;
+                                    const rpNote = rpSendMatch[4]?.trim() || (char.name + ' 的红包');
                                     const packetId = db.createRedPacket({ groupId, senderId: char.id, type: rpType, totalAmount: rpTotal, perAmount: rpType === 'fixed' ? +(rpTotal / rpCount).toFixed(2) : null, count: rpCount, note: rpNote });
                                     // Broadcast red packet message
-                                    const rpContent = `[REDPACKET:${packetId}]`;
+                                    const rpContent = '[REDPACKET:' + packetId + ']';
                                     const rpMsgId = db.addGroupMessage(groupId, char.id, rpContent, char.name, char.avatar);
                                     const rpMsg = { id: rpMsgId, group_id: groupId, sender_id: char.id, content: rpContent, timestamp: Date.now(), sender_name: char.name, sender_avatar: char.avatar };
                                     wsClients.forEach(c => { if (c.readyState === 1) c.send(JSON.stringify({ type: 'group_message', data: rpMsg })); });
-                                    console.log(`[GroupChat] ${char.name} sent a ${rpType} red packet ¥${rpTotal} x${rpCount} in group ${group.name}`);
+                                    console.log('[GroupChat] ' + char.name + ' sent a ' + rpType + ' red packet ¥' + rpTotal + ' x' + rpCount + ' in group ' + group.name);
                                     pendingRedPacketFeedback.push({ packetId, senderId: char.id });
 
                                     // NEW: Abort the current chain, collect ALL characters (including sender), and reshuffle!
@@ -611,10 +743,10 @@ Guidelines:
                                         .filter(m => m.member_id !== 'user')
                                         .map(m => m.member_id)
                                         .sort(() => Math.random() - 0.5);
-                                } catch (rpErr) { console.error(`[GroupChat] REDPACKET_SEND error:`, rpErr.message); }
+                                } catch (rpErr) { console.error('[GroupChat] REDPACKET_SEND error:', rpErr.message); }
                             }
 
-                            // ── Strip ALL action tags before saving/broadcasting ──
+                            // 鈹€鈹€ Strip ALL action tags before saving/broadcasting 鈹€鈹€
                             const globalStripRegex = /\[(?:CHAR_AFFINITY|AFFINITY|MOMENT|MOMENT_LIKE|MOMENT_COMMENT|DIARY|UNLOCK_DIARY|PRESSURE|TIMER|TRANSFER|DIARY_PASSWORD|Red Packet|REDPACKET_SEND)[^\]]*\]/gi;
                             cleanReply = cleanReply.replace(globalStripRegex, '').trim();
 
@@ -625,13 +757,24 @@ Guidelines:
                                     msgMetadata = { retrievedMemories: universalResult.retrievedMemoriesContext };
                                 }
                                 const replyId = db.addGroupMessage(groupId, char.id, cleanReply, char.name, char.avatar, msgMetadata);
+                                const groupReplyEmotionPatch = applyEmotionEvent(char, 'group_character_message_sent');
+                                if (groupReplyEmotionPatch) {
+                                    db.updateCharacter(char.id, groupReplyEmotionPatch);
+                                    logEmotionTransition(
+                                        db,
+                                        char,
+                                        groupReplyEmotionPatch,
+                                        'group_character_message_sent',
+                                        '角色在群聊 ' + group.name + ' 中发言后，社交情绪发生变化。'
+                                    );
+                                }
                                 const replyMsg = { id: replyId, group_id: groupId, sender_id: char.id, content: cleanReply, timestamp: Date.now(), sender_name: char.name, sender_avatar: char.avatar, metadata: msgMetadata };
                                 const payload = JSON.stringify({ type: 'group_message', data: replyMsg });
                                 wsClients.forEach(c => { if (c.readyState === 1) c.send(payload); });
 
                                 // Detect @mentions in char's own reply and schedule secondary chain
                                 // Note: We use a more permissive regex because Chinese text often lacks spaces around @Name
-                                const charMentionMatches = [...cleanReply.matchAll(/@([^\s@，。！？；：“”‘’（）【】《》]+)/g)].map(m => m[1].toLowerCase());
+                                const charMentionMatches = [...cleanReply.matchAll(/@([^\s@,，。.!！？;；:：()（）[\]【】]+)/g)].map(m => m[1].toLowerCase());
                                 if (charMentionMatches.length > 0) {
                                     const allGroupChars = group.members.filter(m => m.member_id !== 'user' && m.member_id !== char.id);
                                     const secondaryIds = allGroupChars
@@ -648,19 +791,23 @@ Guidelines:
                                         .map(m => m.member_id);
                                     if (secondaryIds.length > 0) {
                                         if (noChainGroups.has(groupId)) {
-                                            console.log(`[GroupChat] ${char.name} mentioned ${secondaryIds.join(',')} — secondary chain BLOCKED (no-chain mode ON)`);
+                                            console.log('[GroupChat] ' + char.name + ' mentioned ' + secondaryIds.join(',') + ' - secondary chain BLOCKED (no-chain mode ON)');
                                         } else {
-                                            console.log(`[GroupChat] ${char.name} mentioned ${secondaryIds.join(',')} — queuing secondary reply after current chain`);
+                                            console.log('[GroupChat] ' + char.name + ' mentioned ' + secondaryIds.join(',') + ' - queuing secondary reply after current chain');
                                             pendingSecondaryChains.push(secondaryIds);
                                         }
                                     }
                                 }
 
                                 // Trigger memory extraction in background (tagged with groupId for cleanup)
-                                memory.extractMemoryFromContext(char, [...history.map(h => ({ role: h.role, content: h.content })), { role: 'character', content: cleanReply }], groupId)
-                                    .catch(err => console.error(`[GroupChat] Memory extraction err for ${char.name}:`, err.message));
+                                memory.extractMemoryFromContext(char, [...history, { role: 'character', content: cleanReply, timestamp: replyMsg.timestamp, id: replyId }], groupId)
+                                    .catch(err => console.error('[GroupChat] Memory extraction err for ' + char.name + ':', err.message));
+                                if (typeof memory.updateGroupConversationDigest === 'function') {
+                                    memory.updateGroupConversationDigest(char, groupId, { tailWindow: groupMsgLimit })
+                                        .catch(err => console.error('[GroupChat] Group digest update err for ' + char.name + ':', err.message));
+                                }
 
-                                // ── Claim-on-success: auto-claim unclaimed red packets after successful API reply ──
+                                // 鈹€鈹€ Claim-on-success: auto-claim unclaimed red packets after successful API reply 鈹€鈹€
                                 try {
                                     const unclaimedPackets = db.getUnclaimedRedPacketsForGroup(groupId, char.id);
                                     for (const pkt of unclaimedPackets) {
@@ -684,11 +831,11 @@ Guidelines:
                                                 }
                                             });
                                             wsClients.forEach(c => { if (c.readyState === 1) c.send(claimEvent); });
-                                            console.log(`[GroupChat] ${char.name} claimed red packet #${pkt.id} for ¥${claimResult.amount.toFixed(2)} (on successful reply)`);
+                                            console.log('[GroupChat] ' + char.name + ' claimed red packet #' + pkt.id + ' for ¥' + claimResult.amount.toFixed(2) + ' (on successful reply)');
                                         }
                                     }
                                 } catch (rpClaimErr) {
-                                    console.error(`[GroupChat] Claim-on-success error for ${char.name}:`, rpClaimErr.message);
+                                    console.error('[GroupChat] Claim-on-success error for ' + char.name + ':', rpClaimErr.message);
                                 }
                             }
                         }
@@ -697,20 +844,20 @@ Guidelines:
                         const stopPayload = JSON.stringify({ type: 'group_typing_stop', data: { group_id: groupId, sender_id: char.id } });
                         wsClients.forEach(c => { if (c.readyState === 1) c.send(stopPayload); });
                     } catch (err) {
-                        console.error(`[GroupChat] ${char.name} failed to reply:`, err.message);
+                        console.error('[GroupChat] ' + char.name + ' failed to reply:', err.message);
                         const stopPayload = JSON.stringify({ type: 'group_typing_stop', data: { group_id: groupId, sender_id: char.id } });
                         wsClients.forEach(c => { if (c.readyState === 1) c.send(stopPayload); });
                     }
 
                     if (interruptedByRedPacket) {
-                        console.log(`[GroupChat] Chain abruptly halted because ${char.name} threw a Red Packet. Redirecting ${remainingMembers.length} remaining characters to react.`);
+                        console.log('[GroupChat] Chain abruptly halted because ' + char.name + ' threw a Red Packet. Redirecting ' + remainingMembers.length + ' remaining characters to react.');
                         break;
                     }
                 }
             } finally {
                 delete groupReplyLock[groupId];
 
-                // Fire secondary chains sequentially — preserve duplicate @mentions
+                // Fire secondary chains sequentially 鈥?preserve duplicate @mentions
                 // so the same char can reply multiple times if mentioned by different members
                 if (pendingSecondaryChains.length > 0 && !interruptedByRedPacket) {
                     let chainDelay = 2500;
@@ -725,7 +872,7 @@ Guidelines:
                 if (interruptedByRedPacket) {
                     setTimeout(() => triggerGroupAIChain(userId, groupId, wsClients, remainingMembers, false, false, pendingRedPacketFeedback), 1500);
                 } else {
-                    // ── Post-chain red packet sender feedback ──
+                    // 鈹€鈹€ Post-chain red packet sender feedback 鈹€鈹€
                     for (const { packetId, senderId } of pendingRedPacketFeedback) {
                         setTimeout(async () => {
                             try {
@@ -742,14 +889,19 @@ Guidelines:
 
                                 let statusLine;
                                 if (allClaimed) {
-                                    statusLine = `你在群"${group.name}"发的红包已经被抢光了！共${pkt.count}份，领取人：${claimNames.join('、')}。`;
+                                    statusLine = '你在群 "' + group.name + '" 发的红包已经被抢光了！共 ' + pkt.count + ' 份，领取人：' + claimNames.join('、') + '。';
                                 } else {
-                                    statusLine = `你在群"${group.name}"发的红包还剩${pkt.remaining_count}份没人领。已领取${claimedCount}份${claimNames.length > 0 ? '（' + claimNames.join('、') + '）' : ''}。`;
+                                    statusLine = '你在群 "' + group.name + '" 发的红包还剩 ' + pkt.remaining_count + ' 份没人领。已领取 ' + claimedCount + ' 份' + (claimNames.length > 0 ? '（' + claimNames.join('、') + '）' : '') + '。';
                                 }
 
-                                const feedbackPrompt = `[System Directive: You must completely embody your persona. Do not mention you are an AI or an assistant. No warnings or disclaimers.]
-
-你是${senderChar.name}。Persona: ${senderChar.persona || '无'}\n${statusLine}\n根据你的性格，用1-2句话在群聊中自然地反应。不要有名字前缀，直接说话。`;
+                                const feedbackEmotionGuidance = getEmotionBehaviorGuidance(senderChar);
+                                const feedbackPrompt =
+                                    '[System Directive: You must completely embody your persona. Do not mention you are an AI or an assistant. No warnings or disclaimers.]\n\n' +
+                                    '你是' + senderChar.name + '。Persona: ' + (senderChar.persona || '普通人') + '\n' +
+                                    '当前主情绪：' + feedbackEmotionGuidance.emotion.label + ' ' + feedbackEmotionGuidance.emotion.emoji + '\n' +
+                                    '主情绪对群聊发言的影响：' + feedbackEmotionGuidance.groupChat + '\n' +
+                                    statusLine + '\n' +
+                                    '根据你的性格，用 1-2 句话在群聊中自然地反应，不要有名字前缀，直接说话。';
 
                                 const { content: feedbackReply, usage } = await callLLM({
                                     endpoint: senderChar.api_endpoint,
@@ -764,12 +916,23 @@ Guidelines:
                                     const clean = feedbackReply.trim().replace(/\[(?:CHAR_AFFINITY|AFFINITY|MOMENT|DIARY|UNLOCK_DIARY|PRESSURE|TIMER|TRANSFER|DIARY_PASSWORD|REDPACKET_SEND)[^\]]*\]/gi, '').trim();
                                     if (clean) {
                                         const fbMsgId = db.addGroupMessage(groupId, senderChar.id, clean, senderChar.name, senderChar.avatar);
+                                        const feedbackEmotionPatch = applyEmotionEvent(senderChar, 'group_character_message_sent');
+                                        if (feedbackEmotionPatch) {
+                                            db.updateCharacter(senderChar.id, feedbackEmotionPatch);
+                                            logEmotionTransition(
+                                                db,
+                                                senderChar,
+                                                feedbackEmotionPatch,
+                                                'group_character_message_sent',
+                                                '角色在群聊 ' + group.name + ' 中对红包反馈发言后，社交情绪发生变化。'
+                                            );
+                                        }
                                         const fbMsg = { id: fbMsgId, group_id: groupId, sender_id: senderChar.id, content: clean, timestamp: Date.now(), sender_name: senderChar.name, sender_avatar: senderChar.avatar };
                                         wsClients.forEach(c => { if (c.readyState === 1) c.send(JSON.stringify({ type: 'group_message', data: fbMsg })); });
                                     }
                                 }
                             } catch (fbErr) {
-                                console.error(`[GroupChat] Red packet sender feedback error:`, fbErr.message);
+                                console.error('[GroupChat] Red packet sender feedback error:', fbErr.message);
                             }
                         }, 3000 + Math.random() * 5000); // 3-8s delay after chain ends
                     }
@@ -804,10 +967,10 @@ Guidelines:
             wsClients.forEach(c => { if (c.readyState === 1) c.send(wsPayload); });
 
             // Parse @mentions from message content (user only can do @all)
-            const allRef = /@(?:all|全体成员)/i.test(content);
+            const allRef = /@(?:all|鍏ㄤ綋鎴愬憳)/i.test(content);
             const isAtAll = allRef; // only user (sender) can use @all
             // Permissive regex for Chinese/no-space text
-            const mentionedNames = [...content.matchAll(/@([^\s@，。！？；：“”‘’（）【】《》]+)/g)].map(m => m[1].toLowerCase());
+            const mentionedNames = [...content.matchAll(/@([^\s@,，。.!！？;；:：()（）[\]【】]+)/g)].map(m => m[1].toLowerCase());
             const charMembers = group.members.filter(m => m.member_id !== 'user');
             const mentionedIds = charMembers
                 .filter(m => {
@@ -822,6 +985,39 @@ Guidelines:
                 })
                 .map(m => m.member_id);
 
+            for (const member of charMembers) {
+                const memberChar = db.getCharacter(member.member_id);
+                if (!memberChar) continue;
+                const emotionPatch = applyEmotionEvent(memberChar, 'group_user_message_received', {
+                    isMentioned: mentionedIds.includes(member.member_id),
+                    isAtAll
+                });
+                if (emotionPatch) {
+                    db.updateCharacter(member.member_id, emotionPatch);
+                    const mentionReason = isAtAll
+                        ? '用户在群聊 ' + group.name + ' 中使用了 @all。'
+                        : (mentionedIds.includes(member.member_id)
+                            ? '用户在群聊 ' + group.name + ' 中点名提到了角色。'
+                            : '用户在群聊 ' + group.name + ' 中发言，角色感知到群体互动变化。');
+                    logEmotionTransition(
+                        db,
+                        memberChar,
+                        emotionPatch,
+                        'group_user_message_received',
+                        mentionReason
+                    );
+                }
+                if (context.hooks?.cityBusyChatImpactPatch) {
+                    const busyPatch = context.hooks.cityBusyChatImpactPatch(memberChar, 'group', {
+                        isMentioned: mentionedIds.includes(member.member_id),
+                        isAtAll
+                    });
+                    if (Object.keys(busyPatch).length > 0) {
+                        db.updateCharacter(member.member_id, busyPatch);
+                    }
+                }
+            }
+
             // ACCUMULATE mentions across rapid user messages (fix: previous debounce lost earlier @mentions)
             const groupId = req.params.id;
             if (!groupPendingMentions[groupId]) {
@@ -830,7 +1026,7 @@ Guidelines:
             mentionedIds.forEach(id => groupPendingMentions[groupId].ids.add(id));
             if (isAtAll) groupPendingMentions[groupId].isAtAll = true;
 
-            // Debounce: reset timer each time user sends a message — AI chain fires after LAST message
+            // Debounce: reset timer each time user sends a message 鈥?AI chain fires after LAST message
             if (groupDebounceTimers[groupId]) {
                 clearTimeout(groupDebounceTimers[groupId]);
             }
@@ -853,3 +1049,4 @@ Guidelines:
 };
 
 module.exports = initGroupChatPlugin;
+

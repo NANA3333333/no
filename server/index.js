@@ -1,4 +1,4 @@
-process.on('uncaughtException', err => {
+﻿process.on('uncaughtException', err => {
     console.error('UNCAUGHT EXCEPTION:', err);
 });
 process.on('unhandledRejection', (reason, promise) => {
@@ -11,6 +11,7 @@ const http = require('http');
 const { WebSocketServer } = require('ws');
 const { getUserDb } = require('./db');
 const authDb = require('./authDb');
+const { deriveEmotion } = require('./emotion');
 const jwt = require('jsonwebtoken');
 const path = require('path');
 const fs = require('fs');
@@ -36,6 +37,14 @@ const JWT_SECRET = getJwtSecret();
 const { getEngine } = require('./engine');
 const { getMemory, extractMemoryFromContext, setWsClientsResolver } = require('./memory');
 const { getTokenCount } = require('./utils/tokenizer');
+const qdrant = require('./qdrant');
+
+function getDigestTailWindowSize(contextLimit, availableCount) {
+    const safeLimit = Math.max(0, Number(contextLimit) || 0);
+    const safeAvailable = Math.max(0, Number(availableCount) || 0);
+    if (safeAvailable <= 0) return 0;
+    return Math.min(safeAvailable, Math.max(3, Math.min(60, Math.ceil(safeLimit * 0.3))));
+}
 const multer = require('multer');
 const { callLLM } = require('./llm');
 const helmet = require('helmet');
@@ -146,6 +155,15 @@ wss.on('connection', (ws) => {
                 if (pluginContext.hooks?.groupChainCallback) {
                     engine.setGroupChainCallback(pluginContext.hooks.groupChainCallback);
                 }
+                if (pluginContext.hooks?.cityReplyStateSyncCallback) {
+                    engine.setCityReplyStateSyncCallback(pluginContext.hooks.cityReplyStateSyncCallback);
+                }
+                if (pluginContext.hooks?.cityReplyIntentCallback) {
+                    engine.setCityReplyIntentCallback(pluginContext.hooks.cityReplyIntentCallback);
+                }
+                if (pluginContext.hooks?.cityReplyActionCallback) {
+                    engine.setCityReplyActionCallback(pluginContext.hooks.cityReplyActionCallback);
+                }
                 engine.startEngine(clients);
                 if (typeof engine.startGroupProactiveTimers === 'function') {
                     engine.startGroupProactiveTimers(clients);
@@ -167,7 +185,7 @@ wss.on('connection', (ws) => {
 
 
 
-// ─── AUTHENTICATION MIDDLEWARE ──────────────────────────────────────────
+// 鈹€鈹€鈹€ AUTHENTICATION MIDDLEWARE 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 authDb.initAuthDb();
 
 const authMiddleware = (req, res, next) => {
@@ -230,7 +248,7 @@ app.post('/api/upload', authMiddleware, (req, res) => {
     });
 });
 
-// ─── AUTH ROUTES ────────────────────────────────────────────────────────
+// 鈹€鈹€鈹€ AUTH ROUTES 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 app.post('/api/auth/register', authLimiter, (req, res) => {
     try {
         const { username, password, inviteCode } = req.body;
@@ -262,7 +280,7 @@ app.get('/api/auth/me', authMiddleware, (req, res) => {
     res.json({ success: true, user: req.user });
 });
 
-// ─── SYSTEM ROUTES ────────────────────────────────────────────────────────
+// 鈹€鈹€鈹€ SYSTEM ROUTES 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 app.get('/api/system/announcement', authMiddleware, (req, res) => {
     try {
         const ann = authDb.getLatestAnnouncement();
@@ -273,7 +291,7 @@ app.get('/api/system/announcement', authMiddleware, (req, res) => {
 });
 
 
-// ─── PLUGIN MANAGER ────────────────────────────────────────────────────────
+// 鈹€鈹€鈹€ PLUGIN MANAGER 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 const pluginContext = {
     wss,
     getWsClients,
@@ -305,7 +323,7 @@ if (fs.existsSync(pluginsDir)) {
 }
 
 // REST API ROUTES
-// ─────────────────────────────────────────────────────────────
+// 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
 // 0.5 Get User Profile
 app.get('/api/user', authMiddleware, (req, res) => {
@@ -332,6 +350,215 @@ app.post('/api/user', authMiddleware, (req, res) => {
     }
 });
 
+app.get('/api/user/memory-status', authMiddleware, async (req, res) => {
+    const db = req.db;
+    try {
+        const config = qdrant.getQdrantConfig();
+        const collectionName = qdrant.getCollectionName(req.user.id);
+        const rawDb = typeof db.getRawDb === 'function' ? db.getRawDb() : null;
+        const characters = typeof db.getCharacters === 'function' ? db.getCharacters() : [];
+
+        const summaryRow = rawDb
+            ? rawDb.prepare(`
+                SELECT
+                    COUNT(*) AS memories_count,
+                    SUM(CASE WHEN embedding IS NOT NULL AND length(embedding) > 0 THEN 1 ELSE 0 END) AS embedded_count,
+                    SUM(CASE WHEN COALESCE(is_archived, 0) = 1 THEN 1 ELSE 0 END) AS archived_count,
+                    SUM(CASE WHEN COALESCE(summary, '') <> '' OR COALESCE(content, '') <> '' OR COALESCE(memory_type, '') <> '' THEN 1 ELSE 0 END) AS structured_count,
+                    COUNT(DISTINCT character_id) AS characters_with_memories,
+                    SUM(CASE WHEN COALESCE(last_retrieved_at, 0) > 0 OR COALESCE(retrieval_count, 0) > 0 THEN 1 ELSE 0 END) AS ever_retrieved_count,
+                    COALESCE(SUM(COALESCE(retrieval_count, 0)), 0) AS total_retrievals,
+                    MAX(COALESCE(updated_at, created_at, 0)) AS last_memory_at,
+                    MAX(COALESCE(last_retrieved_at, 0)) AS last_retrieved_at
+                FROM memories
+            `).get()
+            : null;
+
+        const tokenRow = rawDb
+            ? rawDb.prepare(`
+                SELECT
+                    COALESCE(SUM(prompt_tokens + completion_tokens), 0) AS token_total,
+                    COUNT(*) AS request_count,
+                    MAX(timestamp) AS last_token_at
+                FROM token_usage
+            `).get()
+            : null;
+
+        const cacheSummaryRow = rawDb
+            ? rawDb.prepare(`
+                SELECT
+                    COUNT(*) AS entries_count,
+                    COALESCE(SUM(hit_count), 0) AS hit_count,
+                    COUNT(DISTINCT CASE WHEN COALESCE(character_id, '') <> '' THEN character_id END) AS cached_characters_count,
+                    MAX(last_hit_at) AS last_cache_hit_at,
+                    MAX(created_at) AS last_cache_write_at
+                FROM llm_cache
+                WHERE expires_at > ?
+            `).get(Date.now())
+            : null;
+
+        const cacheStatsRow = typeof db.getLlmCacheStats === 'function'
+            ? db.getLlmCacheStats('global')
+            : null;
+
+        const cacheByCharacterRows = rawDb
+            ? rawDb.prepare(`
+                SELECT
+                    COALESCE(character_id, '') AS character_id,
+                    COUNT(*) AS entries_count,
+                    COALESCE(SUM(hit_count), 0) AS hit_count,
+                    MAX(last_hit_at) AS last_hit_at,
+                    MAX(created_at) AS last_write_at
+                FROM llm_cache
+                WHERE expires_at > ?
+                  AND COALESCE(character_id, '') <> ''
+                GROUP BY character_id
+                ORDER BY entries_count DESC, hit_count DESC
+                LIMIT 12
+            `).all(Date.now())
+            : [];
+
+        const promptBlockSummaryRow = rawDb
+            ? rawDb.prepare(`
+                SELECT
+                    COUNT(*) AS entries_count,
+                    COALESCE(SUM(COALESCE(hit_count, 0)), 0) AS hit_count,
+                    MAX(COALESCE(last_hit_at, 0)) AS last_hit_at,
+                    MAX(COALESCE(updated_at, created_at, 0)) AS last_write_at
+                FROM prompt_block_cache
+            `).get()
+            : null;
+
+        const digestSummaryRow = rawDb
+            ? rawDb.prepare(`
+                SELECT
+                    COALESCE(SUM(entries_count), 0) AS entries_count,
+                    COALESCE(SUM(hit_count), 0) AS hit_count,
+                    MAX(last_hit_at) AS last_hit_at,
+                    MAX(last_write_at) AS last_write_at
+                FROM (
+                    SELECT
+                        COUNT(*) AS entries_count,
+                        COALESCE(SUM(COALESCE(hit_count, 0)), 0) AS hit_count,
+                        MAX(COALESCE(last_hit_at, 0)) AS last_hit_at,
+                        MAX(COALESCE(updated_at, created_at, 0)) AS last_write_at
+                    FROM conversation_digest_cache
+                    UNION ALL
+                    SELECT
+                        COUNT(*) AS entries_count,
+                        COALESCE(SUM(COALESCE(hit_count, 0)), 0) AS hit_count,
+                        MAX(COALESCE(last_hit_at, 0)) AS last_hit_at,
+                        MAX(COALESCE(updated_at, created_at, 0)) AS last_write_at
+                    FROM group_conversation_digest_cache
+                )
+            `).get()
+            : null;
+
+        const status = {
+            enabled: !!config.enabled,
+            reachable: false,
+            url: config.url,
+            mode: config.enabled
+                ? (process.platform === 'win32' && fs.existsSync(path.join(__dirname, '..', 'tools', 'qdrant', 'current', 'qdrant.exe')) ? 'local' : (/127\.0\.0\.1|localhost/i.test(config.url) ? 'self-hosted' : 'external'))
+                : 'disabled',
+            backend: config.enabled ? 'qdrant-primary-with-vectra-fallback' : 'vectra-fallback-only',
+            collectionName,
+            collectionExists: false,
+            indexedPoints: 0,
+            indexingCoverage: 0,
+            indexingSource: config.enabled ? 'qdrant' : 'vectra-fallback',
+            charactersCount: characters.length,
+            charactersWithMemories: Number(summaryRow?.characters_with_memories || 0),
+            memoriesCount: Number(summaryRow?.memories_count || 0),
+            embeddedMemoriesCount: Number(summaryRow?.embedded_count || 0),
+            structuredMemoriesCount: Number(summaryRow?.structured_count || 0),
+            archivedMemoriesCount: Number(summaryRow?.archived_count || 0),
+            everRetrievedMemoriesCount: Number(summaryRow?.ever_retrieved_count || 0),
+            totalRetrievals: Number(summaryRow?.total_retrievals || 0),
+            healthyContextCacheEntriesCount: Number(promptBlockSummaryRow?.entries_count || 0) + Number(digestSummaryRow?.entries_count || 0),
+            healthyContextCacheHitCount: Number(promptBlockSummaryRow?.hit_count || 0) + Number(digestSummaryRow?.hit_count || 0),
+            promptBlockCacheEntriesCount: Number(promptBlockSummaryRow?.entries_count || 0),
+            promptBlockCacheHitCount: Number(promptBlockSummaryRow?.hit_count || 0),
+            digestCacheEntriesCount: Number(digestSummaryRow?.entries_count || 0),
+            digestCacheHitCount: Number(digestSummaryRow?.hit_count || 0),
+            healthyContextCacheLastHitAt: Math.max(Number(promptBlockSummaryRow?.last_hit_at || 0), Number(digestSummaryRow?.last_hit_at || 0)),
+            healthyContextCacheLastWriteAt: Math.max(Number(promptBlockSummaryRow?.last_write_at || 0), Number(digestSummaryRow?.last_write_at || 0)),
+            cacheEntriesCount: Number(cacheSummaryRow?.entries_count || 0),
+            cacheHitCount: Number(cacheSummaryRow?.hit_count || 0),
+            cacheLookupCount: Number(cacheStatsRow?.lookup_count || 0),
+            cacheRequestHitCount: Number(cacheStatsRow?.hit_count || 0),
+            cachedCharactersCount: Number(cacheSummaryRow?.cached_characters_count || 0),
+            lastCacheHitAt: Number(cacheSummaryRow?.last_cache_hit_at || 0),
+            lastCacheWriteAt: Number(cacheSummaryRow?.last_cache_write_at || 0),
+            tokenTotal: Number(tokenRow?.token_total || 0),
+            requestCount: Number(tokenRow?.request_count || 0),
+            lastMemoryAt: Number(summaryRow?.last_memory_at || 0),
+            lastRetrievedAt: Number(summaryRow?.last_retrieved_at || 0),
+            lastTokenAt: Number(tokenRow?.last_token_at || 0),
+            cacheByCharacter: Array.isArray(cacheByCharacterRows) ? cacheByCharacterRows.map(row => {
+                const char = characters.find(item => String(item.id) === String(row.character_id));
+                return {
+                    character_id: row.character_id,
+                    character_name: char?.name || row.character_id,
+                    entries_count: Number(row.entries_count || 0),
+                    hit_count: Number(row.hit_count || 0),
+                    last_hit_at: Number(row.last_hit_at || 0),
+                    last_write_at: Number(row.last_write_at || 0)
+                };
+            }) : [],
+            statusNoteCode: '',
+            statusNote: '',
+            lastError: ''
+        };
+
+        const applyIndexedStats = (points, source) => {
+            const numericPoints = Math.max(0, Number(points || 0));
+            status.indexedPoints = numericPoints;
+            status.indexingSource = source || status.indexingSource || 'unknown';
+            status.indexingCoverage = status.memoriesCount > 0
+                ? Math.min(100, Math.round((numericPoints / status.memoriesCount) * 100))
+                : 0;
+        };
+
+        if (!config.enabled) {
+            applyIndexedStats(status.embeddedMemoriesCount, 'vectra-fallback');
+            return res.json({ success: true, status });
+        }
+
+        try {
+            const info = await qdrant.getCollectionInfo(collectionName);
+            status.reachable = true;
+            status.collectionExists = true;
+            const qdrantPoints = Number(
+                info?.points_count ??
+                info?.vectors_count ??
+                info?.indexed_vectors_count ??
+                0
+            );
+            applyIndexedStats(Math.max(qdrantPoints, status.embeddedMemoriesCount), qdrantPoints > 0 ? 'qdrant' : 'vectra-fallback');
+            return res.json({ success: true, status });
+        } catch (e) {
+            const healthy = await qdrant.healthcheck();
+            status.reachable = healthy;
+            status.backend = healthy ? 'qdrant-online-collection-pending' : 'vectra-fallback-active';
+            if (healthy && /doesn't exist|not found/i.test(String(e.message || ''))) {
+                applyIndexedStats(status.embeddedMemoriesCount, status.embeddedMemoriesCount > 0 ? 'vectra-fallback' : 'qdrant');
+                status.statusNoteCode = status.memoriesCount > 0
+                    ? 'collection_pending_existing_memories'
+                    : 'collection_pending_first_memory';
+            } else {
+                if (status.embeddedMemoriesCount > 0) {
+                    applyIndexedStats(status.embeddedMemoriesCount, 'vectra-fallback');
+                }
+                status.lastError = e.message;
+            }
+            return res.json({ success: true, status });
+        }
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
 // 1. Get all characters (Contacts list)
 app.get('/api/characters', authMiddleware, (req, res) => {
     const db = req.db;
@@ -352,11 +579,18 @@ app.get('/api/characters', authMiddleware, (req, res) => {
         }
 
         // Attach unread_count so the frontend can initialise badges correctly on load/refresh
-        const enriched = characters.map(c => ({
-            ...c,
-            unread_count: db.getUnreadCount(c.id),
-            inventory: typeof db.city?.getInventory === 'function' ? db.city.getInventory(c.id) : []
-        }));
+        const enriched = characters.map(c => {
+            const emotion = deriveEmotion(c);
+            return {
+                ...c,
+                unread_count: db.getUnreadCount(c.id),
+                inventory: typeof db.city?.getInventory === 'function' ? db.city.getInventory(c.id) : [],
+                emotion_state: emotion.state,
+                emotion_label: emotion.label,
+                emotion_emoji: emotion.emoji,
+                emotion_color: emotion.color
+            };
+        });
         res.json(enriched);
     } catch (e) {
         res.status(500).json({ error: e.message });
@@ -372,9 +606,25 @@ app.post('/api/characters', authMiddleware, (req, res) => {
     try {
         const data = req.body;
         if (!data.id || !data.name) return res.status(400).json({ error: 'Missing ID or Name' });
+        const prevCharacter = typeof db.getCharacter === 'function' ? db.getCharacter(data.id) : null;
 
         db.updateCharacter(data.id, data);
-        // Reset proactive timer after settings change (do NOT call handleUserMessage —
+        if (prevCharacter && Object.prototype.hasOwnProperty.call(data, 'context_msg_limit')) {
+            const prevLimit = Number(prevCharacter.context_msg_limit || 60);
+            const nextLimit = Number(data.context_msg_limit || prevLimit);
+            if (prevLimit !== nextLimit) {
+                db.clearConversationDigest?.(data.id);
+                const rawDb = typeof db.getRawDb === 'function' ? db.getRawDb() : null;
+                rawDb?.prepare('DELETE FROM history_window_cache WHERE character_id = ?').run(data.id);
+                const nextCharacter = typeof db.getCharacter === 'function' ? db.getCharacter(data.id) : null;
+                if (nextCharacter && typeof memory?.updateConversationDigest === 'function') {
+                    memory.updateConversationDigest(nextCharacter).catch(err => {
+                        console.warn(`[API] Failed to rebuild conversation digest for ${nextCharacter.name}: ${err.message}`);
+                    });
+                }
+            }
+        }
+        // Reset proactive timer after settings change (do NOT call handleUserMessage 鈥?
         // that would echo the character's own last message back to the AI as user input)
         engine.stopTimer(data.id);
 
@@ -387,12 +637,54 @@ app.post('/api/characters', authMiddleware, (req, res) => {
 // 2.1 Update Character Fields (Partial)
 app.put('/api/characters/:id', authMiddleware, (req, res) => {
     const db = req.db;
+    const memory = req.memory;
     try {
         const id = req.params.id;
         const data = req.body;
         if (!id) return res.status(400).json({ error: 'Missing ID' });
+        const prevCharacter = typeof db.getCharacter === 'function' ? db.getCharacter(id) : null;
 
         db.updateCharacter(id, data);
+        if (prevCharacter && Object.prototype.hasOwnProperty.call(data, 'context_msg_limit')) {
+            const prevLimit = Number(prevCharacter.context_msg_limit || 60);
+            const nextLimit = Number(data.context_msg_limit || prevLimit);
+            if (prevLimit !== nextLimit) {
+                db.clearConversationDigest?.(id);
+                const rawDb = typeof db.getRawDb === 'function' ? db.getRawDb() : null;
+                rawDb?.prepare('DELETE FROM history_window_cache WHERE character_id = ?').run(id);
+                const nextCharacter = typeof db.getCharacter === 'function' ? db.getCharacter(id) : null;
+                if (nextCharacter && typeof memory?.updateConversationDigest === 'function') {
+                    memory.updateConversationDigest(nextCharacter).catch(err => {
+                        console.warn(`[API] Failed to rebuild conversation digest for ${nextCharacter.name}: ${err.message}`);
+                    });
+                }
+            }
+        }
+        res.json({ success: true, character: db.getCharacter(id) });
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
+app.post('/api/characters/:id/reset-physical-state', authMiddleware, (req, res) => {
+    const db = req.db;
+    try {
+        const id = req.params.id;
+        if (!id) return res.status(400).json({ error: 'Missing ID' });
+        const character = typeof db.getCharacter === 'function' ? db.getCharacter(id) : null;
+        if (!character) return res.status(404).json({ error: 'Character not found' });
+
+        const patch = {
+            energy: 100,
+            sleep_debt: 0,
+            sleep_pressure: 0,
+            stress: 0,
+            pressure_level: 0,
+            work_distraction: 0,
+            sleep_disruption: 0
+        };
+
+        db.updateCharacter(id, patch);
         res.json({ success: true, character: db.getCharacter(id) });
     } catch (e) {
         res.status(500).json({ error: e.message });
@@ -449,8 +741,34 @@ app.get('/api/messages/:characterId', authMiddleware, (req, res) => {
     }
 });
 
+app.get('/api/characters/:characterId/emotion-logs', authMiddleware, (req, res) => {
+    const db = req.db;
+    try {
+        const limit = Math.max(1, Math.min(100, parseInt(req.query.limit, 10) || 50));
+        const logs = typeof db.getEmotionLogs === 'function'
+            ? db.getEmotionLogs(req.params.characterId, limit)
+            : [];
+        res.json({ success: true, logs });
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
+app.get('/api/characters/:characterId/llm-debug-logs', authMiddleware, (req, res) => {
+    const db = req.db;
+    try {
+        const limit = Math.max(1, Math.min(200, parseInt(req.query.limit, 10) || 50));
+        const logs = typeof db.getLlmDebugLogs === 'function'
+            ? db.getLlmDebugLogs(req.params.characterId, limit)
+            : [];
+        res.json({ success: true, logs });
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
 // 4. Send a message to a character (User initiates)
-app.post('/api/messages', authMiddleware, (req, res) => {
+app.post('/api/messages', authMiddleware, async (req, res) => {
     const db = req.db;
     const engine = req.engine;
     const memory = req.memory;
@@ -469,8 +787,16 @@ app.post('/api/messages', authMiddleware, (req, res) => {
             return res.json({ success: true, blocked: true, message: savedMessage });
         }
 
+        if (pluginContext.hooks?.cityBusyChatImpactPatch) {
+            const busyPatch = pluginContext.hooks.cityBusyChatImpactPatch(charObj, 'private');
+            if (Object.keys(busyPatch).length > 0) {
+                db.updateCharacter(characterId, busyPatch);
+            }
+        }
+
         // Add user message to DB
         const { id: msgId, timestamp: msgTs } = db.addMessage(characterId, 'user', content);
+        db.updateCharacter(characterId, { last_user_msg_time: msgTs });
         const savedMessage = { id: msgId, character_id: characterId, role: 'user', content, timestamp: msgTs };
 
         // Mark previous character messages as read
@@ -533,7 +859,7 @@ app.post('/api/messages/batch-delete', authMiddleware, (req, res) => {
             db.deleteMessage(id);
             deleted++;
         }
-        console.log(`[Messages] Batch deleted ${deleted} messages.`);
+        console.log('[Messages] Batch deleted ' + deleted + ' messages.');
         res.json({ success: true, deleted });
     } catch (e) {
         res.status(500).json({ error: e.message });
@@ -627,7 +953,7 @@ The JSON MUST have the EXACT following keys:
 `;
 
         const existingChars = db.getCharacters();
-        const usedEmojis = Array.from(new Set(existingChars.map(c => c.emoji).filter(e => e && e !== '👤')));
+        const usedEmojis = Array.from(new Set(existingChars.map(c => c.emoji).filter(e => e && e !== '馃懁')));
         const excludeEmojiStr = usedEmojis.length > 0
             ? `\nCRITICAL EMOJI RULE: Do NOT use any of these emojis because they are already taken by other characters: ${usedEmojis.join(', ')}. You MUST pick a unique one.`
             : '';
@@ -667,7 +993,7 @@ The JSON MUST have the EXACT following keys:
             parsed.model_name = model_name;
             parsed.sys_timer = 1;
             parsed.sys_proactive = 1;
-            parsed.emoji = parsed.target_emoji || '👤';
+            parsed.emoji = parsed.target_emoji || '馃懁';
             delete parsed.target_emoji;
 
             return res.json({ success: true, character: parsed });
@@ -704,7 +1030,7 @@ app.delete('/api/data/:characterId', authMiddleware, async (req, res) => {
     try {
         const id = req.params.characterId;
 
-        // ⚡ Stop the engine timer FIRST to minimize race-condition window
+        // 鈿?Stop the engine timer FIRST to minimize race-condition window
         engine.stopTimer(id);
 
         // Clear all data
@@ -782,7 +1108,9 @@ app.get('/api/memories/:characterId', authMiddleware, (req, res) => {
     const memory = req.memory;
     const wsClients = getWsClients(req.user.id);
     try {
-        const mems = db.getMemories(req.params.characterId);
+        const includeArchived = String(req.query.include_archived || '').trim() === '1';
+        const mems = db.getMemories(req.params.characterId)
+            .filter(mem => includeArchived || Number(mem.is_archived || 0) === 0);
         res.json(mems);
     } catch (e) {
         res.status(500).json({ error: e.message });
@@ -979,7 +1307,7 @@ app.post('/api/moments/:id/like', authMiddleware, (req, res) => {
                     const char = db.getCharacter(moment.character_id);
                     if (char && !char.is_blocked) {
                         const userName = userProfile?.name || 'User';
-                        const contextContent = `[System] ${userName} 刚刚赞了你的朋友圈动态："${moment.content.substring(0, 50)}"。你可以在私聊中提及这件事。`;
+                        const contextContent = '[System] ' + userName + ' 刚刚赞了你的朋友圈动态：“' + moment.content.substring(0, 50) + '”。你可以在私聊中提及这件事。';
                         db.addMessage(char.id, 'system', contextContent);
                         console.log(`[Moments] User liked ${char.name}'s moment. Triggering reaction (Rate: ${reactionRate}%).`);
                         setTimeout(() => {
@@ -1022,7 +1350,7 @@ app.post('/api/moments/:id/comment', authMiddleware, (req, res) => {
                     const char = db.getCharacter(moment.character_id);
                     if (char && !char.is_blocked) {
                         const userName = userProfile?.name || 'User';
-                        const contextContent = `[System] ${userName} 刚刚评论了你的朋友圈动态："${moment.content.substring(0, 50)}"，评论说："${content}"。你可以在私聊中回应。`;
+                        const contextContent = '[System] ' + userName + ' 刚刚评论了你的朋友圈动态：“' + moment.content.substring(0, 50) + '”，评论说：“' + content + '”。你可以在私聊中回应。';
                         db.addMessage(char.id, 'system', contextContent);
                         console.log(`[Moments] User commented on ${char.name}'s moment. Triggering reaction (Rate: ${reactionRate}%).`);
                         setTimeout(() => {
@@ -1117,7 +1445,7 @@ app.put('/api/user', authMiddleware, (req, res) => {
 });
 
 // 11.5 Theme Generation Helper & 11.6 AI Theme Generation
-// ── MOVED TO DLC: server/plugins/theme/index.js ──
+// 鈹€鈹€ MOVED TO DLC: server/plugins/theme/index.js 鈹€鈹€
 
 // 11.8 Context Token Stats
 app.get('/api/characters/:id/context-stats', authMiddleware, async (req, res) => {
@@ -1129,6 +1457,7 @@ app.get('/api/characters/:id/context-stats', authMiddleware, async (req, res) =>
 
         const { getUserDb } = require('./db');
         const { getMemory } = require('./memory');
+        const memory = getMemory(req.user.id);
         const engineContextWrapper = { getUserDb, getMemory, userId: req.user.id };
 
         // relationships exist in the DLC, so fallback to just friends or a raw DB query if method doesn't exist
@@ -1145,13 +1474,114 @@ app.get('/api/characters/:id/context-stats', authMiddleware, async (req, res) =>
         }
 
         const { buildUniversalContext } = require('./contextBuilder');
-        const { breakdown } = await buildUniversalContext(engineContextWrapper, character, '', false, activeTargets);
+        const { getDefaultGuidelines } = require('./engine');
+        const universalResult = await buildUniversalContext(engineContextWrapper, character, '', false, activeTargets);
+        const breakdown = { ...(universalResult.breakdown || {}) };
+
+        const conversationDigest = typeof db.getConversationDigest === 'function'
+            ? db.getConversationDigest(charId, { trackHit: false })
+            : null;
 
         // Calculate X (Recent Chat History - based on context_msg_limit)
         const contextLimit = character.context_msg_limit || 60;
         const recentMsgs = db.getVisibleMessages(charId, contextLimit);
-        const x_chat_text = recentMsgs.map(m => m.content || '').join('\n');
+        const liveHistoryWindowSize = conversationDigest?.digest_text
+            ? getDigestTailWindowSize(contextLimit, recentMsgs.length)
+            : recentMsgs.length;
+        const liveMsgs = conversationDigest?.digest_text
+            ? recentMsgs.slice(-liveHistoryWindowSize)
+            : recentMsgs;
+        const x_chat_text = liveMsgs.map(m => m.content || '').join('\n');
         breakdown.x_chat = getTokenCount(x_chat_text);
+
+        const systemPromptPreamble = `You are playing the role of ${character.name}.\nPersona:\n${character.persona || 'No specific persona given.'}\n\nWorld Info:\n${character.world_info || 'No specific world info.'}\n\nContext:\n${universalResult.preamble}`;
+        let finalSystemPrompt = systemPromptPreamble;
+
+        try {
+            const unclaimed = typeof db.getUnclaimedTransfersFrom === 'function'
+                ? db.getUnclaimedTransfersFrom(character.id, character.id)
+                : [];
+            if (unclaimed && unclaimed.length > 0) {
+                const recent = unclaimed.filter(t => (Date.now() - t.created_at) < (24 * 60 * 60 * 1000));
+                if (recent.length > 0) {
+                    const total = recent.reduce((s, t) => s + t.amount, 0).toFixed(2);
+                    const minutesAgo = Math.round((Date.now() - recent[0].created_at) / 60000);
+                    const unclaimedNote = recent[0].note ? `（留言：“${recent[0].note}”）` : '';
+                    finalSystemPrompt += `\n[系统提示] 你在 ${minutesAgo} 分钟前给 ${db.getUserProfile()?.name || '用户'} 转了一笔账，共 ¥${total}${unclaimedNote}，但对方还没有领取。你可以按自己的性格顺手提一句，也可以不提。\n`;
+                }
+            }
+        } catch (e) { /* ignore */ }
+
+        finalSystemPrompt += `\n${getDefaultGuidelines()}`;
+        const supplementalCharacterPrompt = String(character.system_prompt || '').trim();
+        if (supplementalCharacterPrompt) {
+            finalSystemPrompt += `\n\n[Character-Specific Supplemental Rules]\n${supplementalCharacterPrompt}`;
+        }
+        let digestBlock = '';
+        if (conversationDigest?.digest_text && typeof memory.formatConversationDigestForPrompt === 'function') {
+            digestBlock = memory.formatConversationDigestForPrompt(conversationDigest);
+            if (digestBlock) {
+                finalSystemPrompt += `\n\n${digestBlock}`;
+            }
+        }
+
+        const ownRecentMsgs = recentMsgs
+            .filter(m => m.role === 'character')
+            .slice(-6)
+            .map(m => `"${String(m.content || '').substring(0, 200)}"`)
+            .join(', ');
+        let antiRepeat = '';
+        if (ownRecentMsgs) {
+            antiRepeat = `\n\n[Anti-Repeat]: Your recent messages were: ${ownRecentMsgs}. Do NOT repeat, reuse, or closely paraphrase any of these. Your next message must be distinctly different in both TOPIC and WORDING.`;
+            if ((character.pressure_level || 0) >= 2) {
+                antiRepeat += ` Since you are feeling anxious, try a COMPLETELY NEW approach: talk about what you're doing right now, share a random thought, ask a question about something unrelated, express your feelings from a different angle, or bring up a memory. DO NOT just rephrase "why aren't you replying" again.`;
+            }
+            finalSystemPrompt += antiRepeat;
+        }
+
+        const transformedHistory = liveMsgs.map(m => ({
+            role: m.role === 'character' ? 'assistant' : 'user',
+            content: String(m.content || '')
+        }));
+        const transformedFullHistory = recentMsgs.map(m => ({
+            role: m.role === 'character' ? 'assistant' : 'user',
+            content: String(m.content || '')
+        }));
+        const estimatedHistoryTokens = transformedHistory.reduce((sum, msg) => sum + getTokenCount(msg.content) + 6, 0);
+        const estimatedFullHistoryTokens = transformedFullHistory.reduce((sum, msg) => sum + getTokenCount(msg.content) + 6, 0);
+        const estimatedSystemPromptTokens = getTokenCount(finalSystemPrompt);
+        const estimatedSystemPromptWithoutDigestTokens = getTokenCount(`${systemPromptPreamble}\n${getDefaultGuidelines()}${supplementalCharacterPrompt ? `\n\n[Character-Specific Supplemental Rules]\n${supplementalCharacterPrompt}` : ''}${antiRepeat}`);
+        const estimatedMessageEnvelopeTokens = 8 + transformedHistory.length * 2;
+        const estimatedFullMessageEnvelopeTokens = 8 + transformedFullHistory.length * 2;
+        const finalPromptEstimate = estimatedSystemPromptTokens + estimatedHistoryTokens + estimatedMessageEnvelopeTokens;
+
+        const estimatedDigestTokens = conversationDigest?.digest_text
+            ? getTokenCount(memory.formatConversationDigestForPrompt(conversationDigest) || '')
+            : 0;
+        const estimatedTailTokens = getTokenCount(x_chat_text);
+        const estimatedWithoutCacheTokens = estimatedSystemPromptWithoutDigestTokens + estimatedFullHistoryTokens + estimatedFullMessageEnvelopeTokens;
+        const estimatedWithCacheTokens = estimatedSystemPromptTokens + estimatedHistoryTokens + estimatedMessageEnvelopeTokens;
+        const estimatedWithoutCacheBaseTokens = Math.max(
+            0,
+            estimatedWithoutCacheTokens
+            - estimatedFullHistoryTokens
+            - (breakdown.city_x_y || 0)
+            - (breakdown.z_memory || 0)
+            - (breakdown.moments || 0)
+            - (breakdown.q_impression || 0)
+        );
+        const estimatedWithCacheBaseTokens = Math.max(
+            0,
+            estimatedWithCacheTokens
+            - estimatedHistoryTokens
+            - (breakdown.city_x_y || 0)
+            - (breakdown.z_memory || 0)
+            - (breakdown.moments || 0)
+            - (breakdown.q_impression || 0)
+        );
+        breakdown.system_full = estimatedSystemPromptTokens;
+        breakdown.history_full = estimatedHistoryTokens;
+        breakdown.message_envelope = estimatedMessageEnvelopeTokens;
 
         let unsummarizedCount = 0;
         if (!character.sweep_initialized && typeof db.initializeSweepBaseline === 'function' && typeof db.getGroups === 'function') {
@@ -1179,30 +1609,312 @@ app.get('/api/characters/:id/context-stats', authMiddleware, async (req, res) =>
             total = Object.values(breakdown).reduce((sum, val) => sum + (typeof val === 'number' ? val : 0), 0);
         }
 
+        const rawDb = typeof db.getRawDb === 'function' ? db.getRawDb() : null;
         const actualUsage = typeof db.getTokenUsageSummary === 'function'
             ? db.getTokenUsageSummary(charId)
             : { request_count: 0, prompt_tokens: 0, completion_tokens: 0, by_context: [] };
+        const mainUsageRow = rawDb
+            ? rawDb.prepare(`
+                SELECT
+                    COUNT(*) AS request_count,
+                    COALESCE(SUM(prompt_tokens), 0) AS prompt_tokens,
+                    COALESCE(SUM(completion_tokens), 0) AS completion_tokens
+                FROM token_usage
+                WHERE character_id = ?
+                  AND context_type NOT LIKE 'memory_%'
+                  AND context_type NOT IN ('chat_intent', 'conversation_digest_update')
+            `).get(charId)
+            : null;
+        const auxiliaryUsageRow = rawDb
+            ? rawDb.prepare(`
+                SELECT
+                    COUNT(*) AS request_count,
+                    COALESCE(SUM(prompt_tokens), 0) AS prompt_tokens,
+                    COALESCE(SUM(completion_tokens), 0) AS completion_tokens
+                FROM token_usage
+                WHERE character_id = ?
+                  AND (
+                    context_type LIKE 'memory_%'
+                    OR context_type IN ('chat_intent', 'conversation_digest_update')
+                  )
+            `).get(charId)
+            : null;
+        const latestUsageRow = rawDb
+            ? rawDb.prepare('SELECT context_type, prompt_tokens, completion_tokens, timestamp FROM token_usage WHERE character_id = ? ORDER BY id DESC LIMIT 1').get(charId)
+            : null;
+        const latestConversationUsageRow = rawDb
+            ? rawDb.prepare(`
+                SELECT context_type, prompt_tokens, completion_tokens, timestamp
+                FROM token_usage
+                WHERE character_id = ?
+                  AND context_type = 'chat'
+                ORDER BY id DESC
+                LIMIT 1
+            `).get(charId)
+            : null;
+        const cacheUsageRow = rawDb
+            ? rawDb.prepare(`
+                SELECT
+                    COUNT(*) AS entries_count,
+                    COALESCE(SUM(hit_count), 0) AS hit_count,
+                    COALESCE(SUM(prompt_tokens * hit_count), 0) AS saved_prompt_tokens,
+                    COALESCE(SUM(completion_tokens * hit_count), 0) AS saved_completion_tokens,
+                    MAX(last_hit_at) AS last_cache_hit_at
+                FROM llm_cache
+                WHERE character_id = ?
+                  AND expires_at > ?
+            `).get(charId, Date.now())
+            : null;
+        const promptBlockUsageRow = rawDb
+            ? rawDb.prepare(`
+                SELECT
+                    COUNT(*) AS entries_count,
+                    COALESCE(SUM(hit_count), 0) AS hit_count,
+                    MAX(last_hit_at) AS last_hit_at,
+                    MAX(updated_at) AS last_write_at
+                FROM prompt_block_cache
+                WHERE character_id = ?
+            `).get(charId)
+            : null;
+        const historyWindowUsageRow = rawDb
+            ? rawDb.prepare(`
+                SELECT
+                    COUNT(*) AS entries_count,
+                    COALESCE(SUM(hit_count), 0) AS hit_count,
+                    MAX(last_hit_at) AS last_hit_at,
+                    MAX(updated_at) AS last_write_at
+                FROM history_window_cache
+                WHERE character_id = ?
+            `).get(charId)
+            : null;
+        const conversationDigestRow = rawDb
+            ? rawDb.prepare(`
+                SELECT
+                    COUNT(*) AS entries_count,
+                    COALESCE(SUM(hit_count), 0) AS hit_count,
+                    MAX(last_hit_at) AS last_hit_at,
+                    MAX(updated_at) AS last_write_at,
+                    MAX(last_message_id) AS last_message_id
+                FROM conversation_digest_cache
+                WHERE character_id = ?
+            `).get(charId)
+            : null;
 
         res.json({
             success: true,
             stats: {
                 ...breakdown,
-                total,
+                total: finalPromptEstimate || total,
+                total_breakdown_only: total,
                 w_unsummarized_count: unsummarizedCount,
                 w_sweep_limit: character.sweep_limit || 30,
                 w_last_error: character.sweep_last_error || '',
                 w_last_run_at: character.sweep_last_run_at || 0,
                 w_last_success_at: character.sweep_last_success_at || 0,
                 w_last_saved_count: character.sweep_last_saved_count || 0,
-                actual_prompt_tokens_total: actualUsage?.prompt_tokens || 0,
-                actual_completion_tokens_total: actualUsage?.completion_tokens || 0,
-                actual_request_count: actualUsage?.request_count || 0,
-                actual_total_tokens: (actualUsage?.prompt_tokens || 0) + (actualUsage?.completion_tokens || 0),
-                actual_by_context: actualUsage?.by_context || []
+                estimated_system_prompt_tokens: estimatedSystemPromptTokens,
+                estimated_history_tokens: estimatedHistoryTokens,
+                estimated_message_envelope_tokens: estimatedMessageEnvelopeTokens,
+                estimated_digest_tokens: estimatedDigestTokens,
+                estimated_without_cache_tokens: estimatedWithoutCacheTokens,
+                estimated_with_cache_tokens: estimatedWithCacheTokens,
+                estimated_tail_tokens: estimatedTailTokens,
+                estimated_full_history_tokens: estimatedFullHistoryTokens,
+                estimated_full_message_envelope_tokens: estimatedFullMessageEnvelopeTokens,
+                estimated_without_cache_base_tokens: estimatedWithoutCacheBaseTokens,
+                estimated_with_cache_base_tokens: estimatedWithCacheBaseTokens,
+                actual_prompt_tokens_total: mainUsageRow?.prompt_tokens || 0,
+                actual_completion_tokens_total: mainUsageRow?.completion_tokens || 0,
+                actual_request_count: mainUsageRow?.request_count || 0,
+                actual_total_tokens: (mainUsageRow?.prompt_tokens || 0) + (mainUsageRow?.completion_tokens || 0),
+                auxiliary_prompt_tokens_total: auxiliaryUsageRow?.prompt_tokens || 0,
+                auxiliary_completion_tokens_total: auxiliaryUsageRow?.completion_tokens || 0,
+                auxiliary_request_count: auxiliaryUsageRow?.request_count || 0,
+                auxiliary_total_tokens: (auxiliaryUsageRow?.prompt_tokens || 0) + (auxiliaryUsageRow?.completion_tokens || 0),
+                raw_all_prompt_tokens_total: actualUsage?.prompt_tokens || 0,
+                raw_all_completion_tokens_total: actualUsage?.completion_tokens || 0,
+                raw_all_request_count: actualUsage?.request_count || 0,
+                raw_all_total_tokens: (actualUsage?.prompt_tokens || 0) + (actualUsage?.completion_tokens || 0),
+                actual_by_context: actualUsage?.by_context || [],
+                cache_entries_count: cacheUsageRow?.entries_count || 0,
+                cache_hit_count: cacheUsageRow?.hit_count || 0,
+                cache_saved_prompt_tokens: cacheUsageRow?.saved_prompt_tokens || 0,
+                cache_saved_completion_tokens: cacheUsageRow?.saved_completion_tokens || 0,
+                cache_saved_total_tokens: (cacheUsageRow?.saved_prompt_tokens || 0) + (cacheUsageRow?.saved_completion_tokens || 0),
+                cache_last_hit_at: cacheUsageRow?.last_cache_hit_at || 0,
+                block_cache_entries_count: promptBlockUsageRow?.entries_count || 0,
+                block_cache_hit_count: promptBlockUsageRow?.hit_count || 0,
+                block_cache_last_hit_at: promptBlockUsageRow?.last_hit_at || 0,
+                block_cache_last_write_at: promptBlockUsageRow?.last_write_at || 0,
+                history_cache_entries_count: historyWindowUsageRow?.entries_count || 0,
+                history_cache_hit_count: historyWindowUsageRow?.hit_count || 0,
+                history_cache_last_hit_at: historyWindowUsageRow?.last_hit_at || 0,
+                history_cache_last_write_at: historyWindowUsageRow?.last_write_at || 0,
+                digest_cache_entries_count: conversationDigestRow?.entries_count || 0,
+                digest_cache_hit_count: conversationDigestRow?.hit_count || 0,
+                digest_cache_last_hit_at: conversationDigestRow?.last_hit_at || 0,
+                digest_cache_last_write_at: conversationDigestRow?.last_write_at || 0,
+                digest_cache_last_message_id: conversationDigestRow?.last_message_id || 0,
+                digest_active: !!conversationDigest?.digest_text,
+                digest_live_history_window_size: liveHistoryWindowSize,
+                last_actual_prompt_tokens: latestUsageRow?.prompt_tokens || 0,
+                last_actual_completion_tokens: latestUsageRow?.completion_tokens || 0,
+                last_actual_context_type: latestUsageRow?.context_type || '',
+                last_actual_timestamp: latestUsageRow?.timestamp || 0,
+                last_conversation_prompt_tokens: latestConversationUsageRow?.prompt_tokens || 0,
+                last_conversation_completion_tokens: latestConversationUsageRow?.completion_tokens || 0,
+                last_conversation_context_type: latestConversationUsageRow?.context_type || '',
+                last_conversation_timestamp: latestConversationUsageRow?.timestamp || 0
             }
         });
     } catch (e) {
         console.error('[API] Context Stats error:', e.message);
+        res.status(500).json({ error: e.message });
+    }
+});
+
+app.get('/api/characters/:id/cache-stats', authMiddleware, (req, res) => {
+    const db = req.db;
+    try {
+        const charId = req.params.id;
+        const character = typeof db.getCharacter === 'function' ? db.getCharacter(charId) : null;
+        if (!character) return res.status(404).json({ error: 'Character not found' });
+
+        const rawDb = typeof db.getRawDb === 'function' ? db.getRawDb() : null;
+        const statsRow = rawDb
+            ? rawDb.prepare(`
+                SELECT
+                    COUNT(*) AS entries_count,
+                    COALESCE(SUM(hit_count), 0) AS hit_count,
+                    MAX(last_hit_at) AS last_hit_at,
+                    MAX(created_at) AS last_write_at,
+                    MAX(expires_at) AS last_expires_at
+                FROM llm_cache
+                WHERE character_id = ?
+                  AND expires_at > ?
+            `).get(charId, Date.now())
+            : null;
+        const typeRows = rawDb
+            ? rawDb.prepare(`
+                SELECT
+                    cache_type,
+                    COUNT(*) AS entries_count,
+                    COALESCE(SUM(hit_count), 0) AS hit_count
+                FROM llm_cache
+                WHERE character_id = ?
+                  AND expires_at > ?
+                GROUP BY cache_type
+                ORDER BY entries_count DESC, hit_count DESC
+            `).all(charId, Date.now())
+            : [];
+        const promptBlockRows = rawDb
+            ? rawDb.prepare(`
+                SELECT
+                    block_type,
+                    COUNT(*) AS entries_count,
+                    COALESCE(SUM(hit_count), 0) AS hit_count,
+                    MAX(last_hit_at) AS last_hit_at,
+                    MAX(updated_at) AS last_write_at
+                FROM prompt_block_cache
+                WHERE character_id = ?
+                GROUP BY block_type
+                ORDER BY entries_count DESC, hit_count DESC
+            `).all(charId)
+            : [];
+        const historyWindowRows = rawDb
+            ? rawDb.prepare(`
+                SELECT
+                    window_type,
+                    COUNT(*) AS entries_count,
+                    COALESCE(SUM(hit_count), 0) AS hit_count,
+                    MAX(last_hit_at) AS last_hit_at,
+                    MAX(updated_at) AS last_write_at
+                FROM history_window_cache
+                WHERE character_id = ?
+                GROUP BY window_type
+                ORDER BY entries_count DESC, hit_count DESC
+            `).all(charId)
+            : [];
+        const promptBlockSummary = rawDb
+            ? rawDb.prepare(`
+                SELECT
+                    COUNT(*) AS entries_count,
+                    COALESCE(SUM(hit_count), 0) AS hit_count,
+                    MAX(last_hit_at) AS last_hit_at,
+                    MAX(updated_at) AS last_write_at
+                FROM prompt_block_cache
+                WHERE character_id = ?
+            `).get(charId)
+            : null;
+        const historyWindowSummary = rawDb
+            ? rawDb.prepare(`
+                SELECT
+                    COUNT(*) AS entries_count,
+                    COALESCE(SUM(hit_count), 0) AS hit_count,
+                    MAX(last_hit_at) AS last_hit_at,
+                    MAX(updated_at) AS last_write_at
+                FROM history_window_cache
+                WHERE character_id = ?
+            `).get(charId)
+            : null;
+        const conversationDigestSummary = rawDb
+            ? rawDb.prepare(`
+                SELECT
+                    COUNT(*) AS entries_count,
+                    COALESCE(SUM(hit_count), 0) AS hit_count,
+                    MAX(last_hit_at) AS last_hit_at,
+                    MAX(updated_at) AS last_write_at,
+                    MAX(last_message_id) AS last_message_id
+                FROM conversation_digest_cache
+                WHERE character_id = ?
+            `).get(charId)
+            : null;
+
+        res.json({
+            success: true,
+            stats: {
+                character_id: charId,
+                character_name: character.name || charId,
+                entries_count: Number(statsRow?.entries_count || 0),
+                hit_count: Number(statsRow?.hit_count || 0),
+                last_hit_at: Number(statsRow?.last_hit_at || 0),
+                last_write_at: Number(statsRow?.last_write_at || 0),
+                last_expires_at: Number(statsRow?.last_expires_at || 0),
+                prompt_block_entries_count: Number(promptBlockSummary?.entries_count || 0),
+                prompt_block_hit_count: Number(promptBlockSummary?.hit_count || 0),
+                prompt_block_last_hit_at: Number(promptBlockSummary?.last_hit_at || 0),
+                prompt_block_last_write_at: Number(promptBlockSummary?.last_write_at || 0),
+                history_window_entries_count: Number(historyWindowSummary?.entries_count || 0),
+                history_window_hit_count: Number(historyWindowSummary?.hit_count || 0),
+                history_window_last_hit_at: Number(historyWindowSummary?.last_hit_at || 0),
+                history_window_last_write_at: Number(historyWindowSummary?.last_write_at || 0),
+                digest_entries_count: Number(conversationDigestSummary?.entries_count || 0),
+                digest_hit_count: Number(conversationDigestSummary?.hit_count || 0),
+                digest_last_hit_at: Number(conversationDigestSummary?.last_hit_at || 0),
+                digest_last_write_at: Number(conversationDigestSummary?.last_write_at || 0),
+                digest_last_message_id: Number(conversationDigestSummary?.last_message_id || 0),
+                by_type: Array.isArray(typeRows) ? typeRows.map(row => ({
+                    cache_type: row.cache_type,
+                    entries_count: Number(row.entries_count || 0),
+                    hit_count: Number(row.hit_count || 0)
+                })) : [],
+                prompt_blocks: Array.isArray(promptBlockRows) ? promptBlockRows.map(row => ({
+                    block_type: row.block_type,
+                    entries_count: Number(row.entries_count || 0),
+                    hit_count: Number(row.hit_count || 0),
+                    last_hit_at: Number(row.last_hit_at || 0),
+                    last_write_at: Number(row.last_write_at || 0)
+                })) : [],
+                history_windows: Array.isArray(historyWindowRows) ? historyWindowRows.map(row => ({
+                    window_type: row.window_type,
+                    entries_count: Number(row.entries_count || 0),
+                    hit_count: Number(row.hit_count || 0),
+                    last_hit_at: Number(row.last_hit_at || 0),
+                    last_write_at: Number(row.last_write_at || 0)
+                })) : []
+            }
+        });
+    } catch (e) {
         res.status(500).json({ error: e.message });
     }
 });
@@ -1256,16 +1968,16 @@ app.delete('/api/characters/:id', authMiddleware, async (req, res) => {
 });
 
 // 13. Friendships & Relationships
-// ── MOVED TO DLC: server/plugins/relationships/index.js ──
+// 鈹€鈹€ MOVED TO DLC: server/plugins/relationships/index.js 鈹€鈹€
 
-// ─── Economy System (Transfers, Wallet, Red Packets) ── MOVED TO DLC ─────
+// 鈹€鈹€鈹€ Economy System (Transfers, Wallet, Red Packets) 鈹€鈹€ MOVED TO DLC 鈹€鈹€鈹€鈹€鈹€
 // See: server/plugins/economy/index.js
 
 
-// ─────────────────────────────────────────────────────────────
+// 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 // Serve React Frontend (Production)
-// ─────────────────────────────────────────────────────────────
-const clientDistPath = path.join(__dirname, 'public');
+// 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+const clientDistPath = path.join(__dirname, '..', 'client', 'dist');
 app.use(express.static(clientDistPath));
 
 // Catch-all route to serve the React app for any unhandled paths (client-side routing)
@@ -1285,7 +1997,7 @@ app.use((req, res, next) => {
 });
 
 
-// ─────────────────────────────────────────────────────────────
+// 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 // Start listening
 console.log('[Express] Attempting to listen on port 8000...');
 const PORT = process.env.PORT || 8000;
@@ -1294,3 +2006,4 @@ server.listen(PORT, () => {
 });
 
 // Private background engines are now dynamically started via WS Auth
+

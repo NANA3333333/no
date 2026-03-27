@@ -19,6 +19,119 @@ function getUserDb(userId) {
     // --- ENCLOSED DB FUNCTIONS ---
 
 
+    function safeParseJson(value, fallback) {
+        if (value == null || value === '') return fallback;
+        if (typeof value !== 'string') return value;
+        try {
+            return JSON.parse(value);
+        } catch (e) {
+            return fallback;
+        }
+    }
+
+    function normalizeArrayField(value, fallback = []) {
+        if (Array.isArray(value)) {
+            return value.filter(Boolean);
+        }
+        if (typeof value === 'string') {
+            const trimmed = value.trim();
+            if (!trimmed) return fallback;
+            const parsed = safeParseJson(trimmed, null);
+            if (Array.isArray(parsed)) return parsed.filter(Boolean);
+            return trimmed.split(/[,，、\n]/).map(v => v.trim()).filter(Boolean);
+        }
+        return fallback;
+    }
+
+    function normalizeRelationshipField(value, fallback = []) {
+        if (Array.isArray(value)) return value.filter(Boolean);
+        if (value && typeof value === 'object') return [value];
+        if (typeof value === 'string') {
+            const trimmed = value.trim();
+            if (!trimmed) return fallback;
+            const parsed = safeParseJson(trimmed, null);
+            if (Array.isArray(parsed)) return parsed.filter(Boolean);
+            if (parsed && typeof parsed === 'object') return [parsed];
+            return [{ summary: trimmed }];
+        }
+        return fallback;
+    }
+
+    function stringifyJson(value, fallback = '[]') {
+        try {
+            return JSON.stringify(value);
+        } catch (e) {
+            return fallback;
+        }
+    }
+
+    function normalizeMemoryRow(row) {
+        if (!row) return row;
+        const peopleList = normalizeArrayField(row.people_json ?? row.people, []);
+        const itemList = normalizeArrayField(row.items_json ?? row.items, []);
+        const relationshipList = normalizeRelationshipField(row.relationship_json ?? row.relationships, []);
+        const sourceMessageIds = normalizeArrayField(row.source_message_ids_json, []);
+        const summary = (row.summary || row.event || '').trim();
+        const content = (row.content || row.event || summary).trim();
+        return {
+            ...row,
+            memory_type: row.memory_type || 'event',
+            summary,
+            content,
+            people_json: peopleList,
+            items_json: itemList,
+            relationship_json: relationshipList,
+            source_message_ids_json: sourceMessageIds,
+            people: row.people || peopleList.join(', '),
+            items: row.items || itemList.join(', '),
+            relationships: row.relationships || relationshipList.map(rel => {
+                if (typeof rel === 'string') return rel;
+                return rel.summary || rel.type || JSON.stringify(rel);
+            }).join('; '),
+            event: row.event || summary || content,
+            emotion: row.emotion || '',
+            dedupe_key: row.dedupe_key || '',
+            updated_at: row.updated_at || row.created_at || Date.now(),
+            is_archived: Number(row.is_archived || 0),
+            source_started_at: Number(row.source_started_at || 0),
+            source_ended_at: Number(row.source_ended_at || 0),
+            source_time_text: row.source_time_text || '',
+            source_message_count: Number(row.source_message_count || 0)
+        };
+    }
+
+    function normalizeConversationDigestRow(row) {
+        if (!row) return row;
+        return {
+            ...row,
+            relationship_state_json: normalizeArrayField(row.relationship_state_json, []),
+            open_loops_json: normalizeArrayField(row.open_loops_json, []),
+            recent_facts_json: normalizeArrayField(row.recent_facts_json, []),
+            scene_state_json: normalizeArrayField(row.scene_state_json, []),
+            last_message_id: Number(row.last_message_id || 0),
+            hit_count: Number(row.hit_count || 0),
+            created_at: Number(row.created_at || row.updated_at || 0),
+            last_hit_at: Number(row.last_hit_at || 0),
+            updated_at: Number(row.updated_at || 0)
+        };
+    }
+
+    function normalizeGroupConversationDigestRow(row) {
+        if (!row) return row;
+        return {
+            ...row,
+            relationship_state_json: normalizeArrayField(row.relationship_state_json, []),
+            open_loops_json: normalizeArrayField(row.open_loops_json, []),
+            recent_facts_json: normalizeArrayField(row.recent_facts_json, []),
+            scene_state_json: normalizeArrayField(row.scene_state_json, []),
+            last_message_id: Number(row.last_message_id || 0),
+            hit_count: Number(row.hit_count || 0),
+            created_at: Number(row.created_at || row.updated_at || 0),
+            last_hit_at: Number(row.last_hit_at || 0),
+            updated_at: Number(row.updated_at || 0)
+        };
+    }
+
     function initDb() {
         db.exec(`
         CREATE TABLE IF NOT EXISTS characters (
@@ -53,6 +166,18 @@ function getUserDb(userId) {
             stat_int INTEGER DEFAULT 50,
             stat_sta INTEGER DEFAULT 50,
             stat_cha INTEGER DEFAULT 50,
+            energy INTEGER DEFAULT 100,
+            sleep_debt INTEGER DEFAULT 0,
+            sleep_pressure INTEGER DEFAULT 20,
+            mood INTEGER DEFAULT 50,
+            stress INTEGER DEFAULT 20,
+            social_need INTEGER DEFAULT 50,
+            health INTEGER DEFAULT 100,
+            satiety INTEGER DEFAULT 45,
+            stomach_load INTEGER DEFAULT 0,
+            work_distraction INTEGER DEFAULT 0,
+            sleep_disruption INTEGER DEFAULT 0,
+            llm_debug_capture INTEGER DEFAULT 0,
             sweep_limit INTEGER DEFAULT 30,
             sweep_initialized INTEGER DEFAULT 1,
             sweep_last_error TEXT DEFAULT '',
@@ -89,6 +214,22 @@ function getUserDb(userId) {
             created_at INTEGER NOT NULL,
             last_retrieved_at INTEGER,
             retrieval_count INTEGER DEFAULT 0,
+            group_id TEXT DEFAULT NULL,
+            memory_type TEXT DEFAULT 'event',
+            summary TEXT DEFAULT '',
+            content TEXT DEFAULT '',
+            people_json TEXT DEFAULT '[]',
+            items_json TEXT DEFAULT '[]',
+            relationship_json TEXT DEFAULT '[]',
+            emotion TEXT DEFAULT '',
+            source_message_ids_json TEXT DEFAULT '[]',
+            dedupe_key TEXT DEFAULT '',
+            updated_at INTEGER DEFAULT 0,
+            is_archived INTEGER DEFAULT 0,
+            source_started_at INTEGER DEFAULT 0,
+            source_ended_at INTEGER DEFAULT 0,
+            source_time_text TEXT DEFAULT '',
+            source_message_count INTEGER DEFAULT 0,
             FOREIGN KEY (character_id) REFERENCES characters(id)
         );
 
@@ -158,6 +299,132 @@ function getUserDb(userId) {
             completion_tokens INTEGER DEFAULT 0,
             timestamp INTEGER NOT NULL
         );
+
+        CREATE TABLE IF NOT EXISTS llm_cache (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            cache_key TEXT NOT NULL UNIQUE,
+            cache_type TEXT NOT NULL DEFAULT 'generic',
+            cache_scope TEXT DEFAULT '',
+            character_id TEXT DEFAULT '',
+            model TEXT DEFAULT '',
+            prompt_hash TEXT DEFAULT '',
+            prompt_preview TEXT DEFAULT '',
+            response_text TEXT DEFAULT '',
+            response_meta TEXT DEFAULT '{}',
+            prompt_tokens INTEGER DEFAULT 0,
+            completion_tokens INTEGER DEFAULT 0,
+            hit_count INTEGER DEFAULT 0,
+            created_at INTEGER NOT NULL,
+            last_hit_at INTEGER NOT NULL,
+            expires_at INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_llm_cache_type_expires ON llm_cache(cache_type, expires_at);
+        CREATE INDEX IF NOT EXISTS idx_llm_cache_last_hit ON llm_cache(last_hit_at);
+
+        CREATE TABLE IF NOT EXISTS llm_cache_stats (
+            scope TEXT PRIMARY KEY,
+            lookup_count INTEGER NOT NULL DEFAULT 0,
+            hit_count INTEGER NOT NULL DEFAULT 0,
+            updated_at INTEGER NOT NULL DEFAULT 0
+        );
+
+        CREATE TABLE IF NOT EXISTS emotion_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            character_id TEXT NOT NULL,
+            source TEXT NOT NULL,
+            reason TEXT DEFAULT '',
+            old_state TEXT DEFAULT '',
+            new_state TEXT DEFAULT '',
+            old_mood INTEGER,
+            new_mood INTEGER,
+            old_stress INTEGER,
+            new_stress INTEGER,
+            old_social_need INTEGER,
+            new_social_need INTEGER,
+            old_pressure INTEGER,
+            new_pressure INTEGER,
+            old_jealousy INTEGER,
+            new_jealousy INTEGER,
+            timestamp INTEGER NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS llm_debug_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            character_id TEXT NOT NULL,
+            direction TEXT NOT NULL,
+            context_type TEXT DEFAULT 'chat',
+            payload TEXT NOT NULL,
+            meta TEXT DEFAULT '{}',
+            timestamp INTEGER NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS prompt_block_cache (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            character_id TEXT NOT NULL,
+            block_type TEXT NOT NULL,
+            source_hash TEXT NOT NULL,
+            compiled_text TEXT NOT NULL,
+            hit_count INTEGER NOT NULL DEFAULT 0,
+            created_at INTEGER NOT NULL DEFAULT 0,
+            last_hit_at INTEGER NOT NULL DEFAULT 0,
+            updated_at INTEGER NOT NULL,
+            UNIQUE(character_id, block_type)
+        );
+        CREATE INDEX IF NOT EXISTS idx_prompt_block_cache_lookup ON prompt_block_cache(character_id, block_type, source_hash);
+
+        CREATE TABLE IF NOT EXISTS history_window_cache (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            character_id TEXT NOT NULL,
+            window_type TEXT NOT NULL,
+            window_size INTEGER NOT NULL DEFAULT 0,
+            source_hash TEXT NOT NULL,
+            message_ids_json TEXT NOT NULL DEFAULT '[]',
+            compiled_json TEXT NOT NULL DEFAULT '[]',
+            hit_count INTEGER NOT NULL DEFAULT 0,
+            created_at INTEGER NOT NULL DEFAULT 0,
+            last_hit_at INTEGER NOT NULL DEFAULT 0,
+            updated_at INTEGER NOT NULL,
+            UNIQUE(character_id, window_type, window_size)
+        );
+        CREATE INDEX IF NOT EXISTS idx_history_window_cache_lookup ON history_window_cache(character_id, window_type, window_size, source_hash);
+
+        CREATE TABLE IF NOT EXISTS conversation_digest_cache (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            character_id TEXT NOT NULL UNIQUE,
+            source_hash TEXT NOT NULL DEFAULT '',
+            digest_text TEXT NOT NULL DEFAULT '',
+            emotion_state TEXT NOT NULL DEFAULT '',
+            relationship_state_json TEXT NOT NULL DEFAULT '[]',
+            open_loops_json TEXT NOT NULL DEFAULT '[]',
+            recent_facts_json TEXT NOT NULL DEFAULT '[]',
+            scene_state_json TEXT NOT NULL DEFAULT '[]',
+            last_message_id INTEGER NOT NULL DEFAULT 0,
+            hit_count INTEGER NOT NULL DEFAULT 0,
+            created_at INTEGER NOT NULL DEFAULT 0,
+            last_hit_at INTEGER NOT NULL DEFAULT 0,
+            updated_at INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_conversation_digest_lookup ON conversation_digest_cache(character_id, source_hash);
+
+        CREATE TABLE IF NOT EXISTS group_conversation_digest_cache (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            group_id TEXT NOT NULL,
+            character_id TEXT NOT NULL,
+            source_hash TEXT NOT NULL DEFAULT '',
+            digest_text TEXT NOT NULL DEFAULT '',
+            emotion_state TEXT NOT NULL DEFAULT '',
+            relationship_state_json TEXT NOT NULL DEFAULT '[]',
+            open_loops_json TEXT NOT NULL DEFAULT '[]',
+            recent_facts_json TEXT NOT NULL DEFAULT '[]',
+            scene_state_json TEXT NOT NULL DEFAULT '[]',
+            last_message_id INTEGER NOT NULL DEFAULT 0,
+            hit_count INTEGER NOT NULL DEFAULT 0,
+            created_at INTEGER NOT NULL DEFAULT 0,
+            last_hit_at INTEGER NOT NULL DEFAULT 0,
+            updated_at INTEGER NOT NULL,
+            UNIQUE(group_id, character_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_group_conversation_digest_lookup ON group_conversation_digest_cache(group_id, character_id, source_hash);
 
         CREATE TABLE IF NOT EXISTS group_chats (
             id TEXT PRIMARY KEY,
@@ -437,9 +704,39 @@ function getUserDb(userId) {
             db.prepare("UPDATE characters SET max_tokens = 2000 WHERE max_tokens IS NULL OR max_tokens <= 800").run();
         } catch (e) { }
 
-        // Add group_id to memories (tracks which group a memory came from)
+        // Upgrade memories table for structured long-term memory storage
+        try { db.prepare('ALTER TABLE memories ADD COLUMN group_id TEXT DEFAULT NULL').run(); } catch (e) { }
+        try { db.prepare("ALTER TABLE memories ADD COLUMN memory_type TEXT DEFAULT 'event'").run(); } catch (e) { }
+        try { db.prepare("ALTER TABLE memories ADD COLUMN summary TEXT DEFAULT ''").run(); } catch (e) { }
+        try { db.prepare("ALTER TABLE memories ADD COLUMN content TEXT DEFAULT ''").run(); } catch (e) { }
+        try { db.prepare("ALTER TABLE memories ADD COLUMN people_json TEXT DEFAULT '[]'").run(); } catch (e) { }
+        try { db.prepare("ALTER TABLE memories ADD COLUMN items_json TEXT DEFAULT '[]'").run(); } catch (e) { }
+        try { db.prepare("ALTER TABLE memories ADD COLUMN relationship_json TEXT DEFAULT '[]'").run(); } catch (e) { }
+        try { db.prepare("ALTER TABLE memories ADD COLUMN emotion TEXT DEFAULT ''").run(); } catch (e) { }
+        try { db.prepare("ALTER TABLE memories ADD COLUMN source_message_ids_json TEXT DEFAULT '[]'").run(); } catch (e) { }
+        try { db.prepare("ALTER TABLE memories ADD COLUMN dedupe_key TEXT DEFAULT ''").run(); } catch (e) { }
+        try { db.prepare("ALTER TABLE memories ADD COLUMN updated_at INTEGER DEFAULT 0").run(); } catch (e) { }
+        try { db.prepare("ALTER TABLE memories ADD COLUMN is_archived INTEGER DEFAULT 0").run(); } catch (e) { }
+        try { db.prepare("ALTER TABLE memories ADD COLUMN source_started_at INTEGER DEFAULT 0").run(); } catch (e) { }
+        try { db.prepare("ALTER TABLE memories ADD COLUMN source_ended_at INTEGER DEFAULT 0").run(); } catch (e) { }
+        try { db.prepare("ALTER TABLE memories ADD COLUMN source_time_text TEXT DEFAULT ''").run(); } catch (e) { }
+        try { db.prepare("ALTER TABLE memories ADD COLUMN source_message_count INTEGER DEFAULT 0").run(); } catch (e) { }
         try {
-            db.prepare('ALTER TABLE memories ADD COLUMN group_id TEXT DEFAULT NULL').run();
+            db.prepare(`
+                UPDATE memories
+                SET
+                    summary = CASE WHEN COALESCE(summary, '') = '' THEN COALESCE(event, '') ELSE summary END,
+                    content = CASE WHEN COALESCE(content, '') = '' THEN COALESCE(event, '') ELSE content END,
+                    people_json = CASE WHEN COALESCE(people_json, '') = '' THEN json_array() ELSE people_json END,
+                    items_json = CASE WHEN COALESCE(items_json, '') = '' THEN json_array() ELSE items_json END,
+                    relationship_json = CASE WHEN COALESCE(relationship_json, '') = '' THEN json_array() ELSE relationship_json END,
+                    source_message_ids_json = CASE WHEN COALESCE(source_message_ids_json, '') = '' THEN json_array() ELSE source_message_ids_json END,
+                    updated_at = CASE WHEN COALESCE(updated_at, 0) = 0 THEN COALESCE(created_at, strftime('%s','now') * 1000) ELSE updated_at END,
+                    source_started_at = CASE WHEN COALESCE(source_started_at, 0) = 0 THEN COALESCE(created_at, 0) ELSE source_started_at END,
+                    source_ended_at = CASE WHEN COALESCE(source_ended_at, 0) = 0 THEN COALESCE(updated_at, created_at, 0) ELSE source_ended_at END,
+                    source_time_text = CASE WHEN COALESCE(source_time_text, '') = '' AND COALESCE(time, '') <> '' THEN COALESCE(time, '') ELSE source_time_text END,
+                    source_message_count = CASE WHEN COALESCE(source_message_count, 0) = 0 THEN CASE WHEN json_valid(source_message_ids_json) THEN json_array_length(source_message_ids_json) ELSE 0 END ELSE source_message_count END
+            `).run();
         } catch (e) { }
 
         // Add hidden column to group_messages (context hide mechanic)
@@ -490,6 +787,7 @@ function getUserDb(userId) {
         try { db.prepare('ALTER TABLE user_profile ADD COLUMN theme TEXT DEFAULT "default"').run(); } catch (e) { }
         try { db.prepare('ALTER TABLE user_profile ADD COLUMN custom_css TEXT DEFAULT ""').run(); } catch (e) { }
         try { db.prepare('ALTER TABLE user_profile ADD COLUMN theme_config TEXT DEFAULT "{}"').run(); } catch (e) { }
+        try { db.prepare('ALTER TABLE user_profile ADD COLUMN response_style_constitution TEXT DEFAULT ""').run(); } catch (e) { }
 
         // Add per-group inject_limit (how many messages from this group get injected into private/other group contexts)
         try { db.prepare('ALTER TABLE group_chats ADD COLUMN inject_limit INTEGER DEFAULT 5').run(); } catch (e) { }
@@ -518,6 +816,28 @@ function getUserDb(userId) {
         try { db.prepare('ALTER TABLE characters ADD COLUMN stat_int INTEGER DEFAULT 50').run(); } catch (e) { }
         try { db.prepare('ALTER TABLE characters ADD COLUMN stat_sta INTEGER DEFAULT 50').run(); } catch (e) { }
         try { db.prepare('ALTER TABLE characters ADD COLUMN stat_cha INTEGER DEFAULT 50').run(); } catch (e) { }
+        try { db.prepare('ALTER TABLE characters ADD COLUMN energy INTEGER DEFAULT 100').run(); } catch (e) { }
+        try { db.prepare('ALTER TABLE characters ADD COLUMN sleep_debt INTEGER DEFAULT 0').run(); } catch (e) { }
+        try { db.prepare('ALTER TABLE characters ADD COLUMN sleep_pressure INTEGER DEFAULT 20').run(); } catch (e) { }
+        try { db.prepare('ALTER TABLE characters ADD COLUMN mood INTEGER DEFAULT 50').run(); } catch (e) { }
+        try { db.prepare('ALTER TABLE characters ADD COLUMN stress INTEGER DEFAULT 20').run(); } catch (e) { }
+        try { db.prepare('ALTER TABLE characters ADD COLUMN social_need INTEGER DEFAULT 50').run(); } catch (e) { }
+        try { db.prepare('ALTER TABLE characters ADD COLUMN health INTEGER DEFAULT 100').run(); } catch (e) { }
+        try { db.prepare('ALTER TABLE characters ADD COLUMN satiety INTEGER DEFAULT 45').run(); } catch (e) { }
+        try { db.prepare('ALTER TABLE characters ADD COLUMN stomach_load INTEGER DEFAULT 0').run(); } catch (e) { }
+        try { db.prepare('ALTER TABLE characters ADD COLUMN work_distraction INTEGER DEFAULT 0').run(); } catch (e) { }
+        try { db.prepare('ALTER TABLE characters ADD COLUMN sleep_disruption INTEGER DEFAULT 0').run(); } catch (e) { }
+        try { db.prepare('ALTER TABLE characters ADD COLUMN llm_debug_capture INTEGER DEFAULT 0').run(); } catch (e) { }
+        try { db.prepare("ALTER TABLE llm_cache ADD COLUMN cache_scope TEXT DEFAULT ''").run(); } catch (e) { }
+        try { db.prepare("ALTER TABLE llm_cache ADD COLUMN character_id TEXT DEFAULT ''").run(); } catch (e) { }
+        try { db.prepare('CREATE INDEX IF NOT EXISTS idx_llm_cache_character ON llm_cache(character_id, expires_at)').run(); } catch (e) { }
+        try { db.prepare('CREATE TABLE IF NOT EXISTS llm_cache_stats (scope TEXT PRIMARY KEY, lookup_count INTEGER NOT NULL DEFAULT 0, hit_count INTEGER NOT NULL DEFAULT 0, updated_at INTEGER NOT NULL DEFAULT 0)').run(); } catch (e) { }
+        try { db.prepare('ALTER TABLE prompt_block_cache ADD COLUMN hit_count INTEGER NOT NULL DEFAULT 0').run(); } catch (e) { }
+        try { db.prepare('ALTER TABLE prompt_block_cache ADD COLUMN created_at INTEGER NOT NULL DEFAULT 0').run(); } catch (e) { }
+        try { db.prepare('ALTER TABLE prompt_block_cache ADD COLUMN last_hit_at INTEGER NOT NULL DEFAULT 0').run(); } catch (e) { }
+        try { db.prepare('ALTER TABLE history_window_cache ADD COLUMN hit_count INTEGER NOT NULL DEFAULT 0').run(); } catch (e) { }
+        try { db.prepare('ALTER TABLE history_window_cache ADD COLUMN created_at INTEGER NOT NULL DEFAULT 0').run(); } catch (e) { }
+        try { db.prepare('ALTER TABLE history_window_cache ADD COLUMN last_hit_at INTEGER NOT NULL DEFAULT 0').run(); } catch (e) { }
 
         console.log('[DB] Database initialized successfully.');
     }
@@ -539,7 +859,8 @@ function getUserDb(userId) {
         'status', 'pressure_level', 'last_user_msg_time', 'is_blocked', 'system_prompt', 'max_tokens',
         'sys_proactive', 'sys_timer', 'sys_pressure', 'sys_jealousy', 'is_diary_unlocked', 'diary_password', 'wallet', 'emoji', 'last_moment_at',
         'jealousy_level', 'jealousy_target', 'city_reply_pending', 'city_ignore_streak', 'city_last_outreach_at', 'city_post_ignore_reaction',
-        'stat_int', 'stat_sta', 'stat_cha', 'sweep_limit', 'sweep_last_error', 'sweep_last_run_at', 'sweep_last_success_at', 'sweep_last_saved_count',
+        'stat_int', 'stat_sta', 'stat_cha', 'energy', 'sleep_debt', 'sleep_pressure', 'mood', 'stress', 'social_need', 'health', 'satiety', 'stomach_load', 'work_distraction', 'sleep_disruption', 'llm_debug_capture',
+        'sweep_limit', 'sweep_last_error', 'sweep_last_run_at', 'sweep_last_success_at', 'sweep_last_saved_count',
         // City DLC fields
         'calories', 'city_status', 'location', 'education', 'sys_survival', 'sys_city_notify', 'sys_city_social',
         'impression_q_limit', 'is_scheduled', 'city_action_frequency', 'context_msg_limit'
@@ -613,6 +934,65 @@ function getUserDb(userId) {
         db.prepare('UPDATE characters SET hidden_state = ? WHERE id = ?').run(hidden_state || '', id);
     }
 
+    function addEmotionLog(entry) {
+        const stmt = db.prepare(`
+            INSERT INTO emotion_logs (
+                character_id, source, reason, old_state, new_state,
+                old_mood, new_mood, old_stress, new_stress,
+                old_social_need, new_social_need,
+                old_pressure, new_pressure,
+                old_jealousy, new_jealousy,
+                timestamp
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `);
+        const ts = entry.timestamp || Date.now();
+        stmt.run(
+            entry.character_id,
+            entry.source || 'system',
+            entry.reason || '',
+            entry.old_state || '',
+            entry.new_state || '',
+            entry.old_mood ?? null,
+            entry.new_mood ?? null,
+            entry.old_stress ?? null,
+            entry.new_stress ?? null,
+            entry.old_social_need ?? null,
+            entry.new_social_need ?? null,
+            entry.old_pressure ?? null,
+            entry.new_pressure ?? null,
+            entry.old_jealousy ?? null,
+            entry.new_jealousy ?? null,
+            ts
+        );
+        return ts;
+    }
+
+    function getEmotionLogs(characterId, limit = 50) {
+        return db.prepare('SELECT * FROM emotion_logs WHERE character_id = ? ORDER BY id DESC LIMIT ?')
+            .all(characterId, limit);
+    }
+
+    function addLlmDebugLog(entry) {
+        const stmt = db.prepare(`
+            INSERT INTO llm_debug_logs (
+                character_id, direction, context_type, payload, meta, timestamp
+            ) VALUES (?, ?, ?, ?, ?, ?)
+        `);
+        stmt.run(
+            entry.character_id,
+            entry.direction || 'unknown',
+            entry.context_type || 'chat',
+            entry.payload || '',
+            typeof entry.meta === 'string' ? entry.meta : JSON.stringify(entry.meta || {}),
+            entry.timestamp || Date.now()
+        );
+    }
+
+    function getLlmDebugLogs(characterId, limit = 50) {
+        return db.prepare('SELECT * FROM llm_debug_logs WHERE character_id = ? ORDER BY id DESC LIMIT ?')
+            .all(characterId, limit);
+    }
+
     // ─── Message Queries ────────────────────────────────────────────────────
 
     function getMessages(characterId, limit = 100) {
@@ -642,6 +1022,12 @@ function getUserDb(userId) {
     function getVisibleMessagesSince(characterId, sinceTimestamp = 0) {
         return db.prepare('SELECT * FROM messages WHERE character_id = ? AND hidden = 0 AND timestamp >= ? ORDER BY timestamp ASC')
             .all(characterId, sinceTimestamp);
+    }
+
+    function getLastUserMessageTimestamp(characterId) {
+        const row = db.prepare('SELECT timestamp FROM messages WHERE character_id = ? AND role = ? ORDER BY id DESC LIMIT 1')
+            .get(characterId, 'user');
+        return row ? row.timestamp : 0;
     }
 
     // Hide a range of messages by index (0-based from oldest)
@@ -772,6 +1158,8 @@ function getUserDb(userId) {
 
     function clearMessages(characterId) {
         db.prepare('DELETE FROM messages WHERE character_id = ?').run(characterId);
+        db.prepare('DELETE FROM history_window_cache WHERE character_id = ?').run(characterId);
+        db.prepare('DELETE FROM conversation_digest_cache WHERE character_id = ?').run(characterId);
     }
 
     function clearMemories(characterId) {
@@ -797,6 +1185,18 @@ function getUserDb(userId) {
         db.prepare('DELETE FROM diaries WHERE character_id = ?').run(characterId);
     }
 
+    function clearConversationDigest(characterId) {
+        db.prepare('DELETE FROM conversation_digest_cache WHERE character_id = ?').run(characterId);
+    }
+
+    function clearGroupConversationDigest(groupId, characterId = null) {
+        if (characterId) {
+            db.prepare('DELETE FROM group_conversation_digest_cache WHERE group_id = ? AND character_id = ?').run(groupId, characterId);
+            return;
+        }
+        db.prepare('DELETE FROM group_conversation_digest_cache WHERE group_id = ?').run(groupId);
+    }
+
     function exportCharacterData(characterId) {
         const character = getCharacter(characterId);
         if (!character) return null;
@@ -809,34 +1209,117 @@ function getUserDb(userId) {
     // ─── Memory Queries ─────────────────────────────────────────────────────
 
     function getMemories(characterId) {
-        return db.prepare(`
+        const rows = db.prepare(`
             SELECT * FROM memories
             WHERE character_id = ?
             ORDER BY
-                CASE WHEN last_retrieved_at IS NULL THEN 1 ELSE 0 END ASC,
-                last_retrieved_at DESC,
+                COALESCE(updated_at, created_at) DESC,
                 created_at DESC
         `).all(characterId);
+        return rows.map(normalizeMemoryRow);
     }
 
     function getMemory(id) {
-        return db.prepare('SELECT * FROM memories WHERE id = ?').get(id);
+        return normalizeMemoryRow(db.prepare('SELECT * FROM memories WHERE id = ?').get(id));
+    }
+
+    function getMemoryByDedupeKey(characterId, dedupeKey) {
+        if (!characterId || !dedupeKey) return null;
+        return normalizeMemoryRow(db.prepare(`
+            SELECT * FROM memories
+            WHERE character_id = ? AND dedupe_key = ?
+            ORDER BY COALESCE(updated_at, created_at) DESC
+            LIMIT 1
+        `).get(characterId, dedupeKey));
     }
 
     function addMemory(characterId, memoryData, groupId = null) {
-        const { time, location, people, event, relationships, items, importance, embedding } = memoryData;
+        const now = Date.now();
+        const peopleList = normalizeArrayField(memoryData.people_json ?? memoryData.people, []);
+        const itemList = normalizeArrayField(memoryData.items_json ?? memoryData.items, []);
+        const relationshipList = normalizeRelationshipField(memoryData.relationship_json ?? memoryData.relationships, []);
+        const sourceMessageIds = normalizeArrayField(memoryData.source_message_ids_json, []);
+        const summary = (memoryData.summary || memoryData.event || '').trim();
+        const content = (memoryData.content || memoryData.event || summary).trim();
+        const legacyPeople = (memoryData.people || peopleList.join(', ')).trim();
+        const legacyItems = (memoryData.items || itemList.join(', ')).trim();
+        const legacyRelationships = (memoryData.relationships || relationshipList.map(rel => {
+            if (typeof rel === 'string') return rel;
+            return rel.summary || rel.type || JSON.stringify(rel);
+        }).join('; ')).trim();
         const info = db.prepare(`
         INSERT INTO memories 
-        (character_id, time, location, people, event, relationships, items, importance, embedding, created_at, group_id) 
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(characterId, time, location, people, event, relationships, items, importance, embedding, Date.now(), groupId);
+        (character_id, time, location, people, event, relationships, items, importance, embedding, created_at, group_id, memory_type, summary, content, people_json, items_json, relationship_json, emotion, source_message_ids_json, dedupe_key, updated_at, is_archived, source_started_at, source_ended_at, source_time_text, source_message_count) 
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+            characterId,
+            memoryData.time || '',
+            memoryData.location || '',
+            legacyPeople,
+            memoryData.event || summary || content || '(empty memory)',
+            legacyRelationships,
+            legacyItems,
+            memoryData.importance ?? 5,
+            memoryData.embedding || null,
+            now,
+            groupId,
+            memoryData.memory_type || 'event',
+            summary,
+            content,
+            stringifyJson(peopleList),
+            stringifyJson(itemList),
+            stringifyJson(relationshipList),
+            memoryData.emotion || '',
+            stringifyJson(sourceMessageIds),
+            memoryData.dedupe_key || '',
+            memoryData.updated_at || now,
+            Number(memoryData.is_archived || 0),
+            Number(memoryData.source_started_at || 0),
+            Number(memoryData.source_ended_at || 0),
+            memoryData.source_time_text || '',
+            Number(memoryData.source_message_count || sourceMessageIds.length || 0)
+        );
         return info.lastInsertRowid;
     }
 
     function updateMemory(id, memoryData) {
-        const fields = Object.keys(memoryData);
+        const patch = { ...memoryData };
+        if (Object.prototype.hasOwnProperty.call(patch, 'people_json') || Object.prototype.hasOwnProperty.call(patch, 'people')) {
+            const peopleList = normalizeArrayField(patch.people_json ?? patch.people, []);
+            patch.people_json = stringifyJson(peopleList);
+            patch.people = patch.people || peopleList.join(', ');
+        }
+        if (Object.prototype.hasOwnProperty.call(patch, 'items_json') || Object.prototype.hasOwnProperty.call(patch, 'items')) {
+            const itemList = normalizeArrayField(patch.items_json ?? patch.items, []);
+            patch.items_json = stringifyJson(itemList);
+            patch.items = patch.items || itemList.join(', ');
+        }
+        if (Object.prototype.hasOwnProperty.call(patch, 'relationship_json') || Object.prototype.hasOwnProperty.call(patch, 'relationships')) {
+            const relationshipList = normalizeRelationshipField(patch.relationship_json ?? patch.relationships, []);
+            patch.relationship_json = stringifyJson(relationshipList);
+            patch.relationships = patch.relationships || relationshipList.map(rel => {
+                if (typeof rel === 'string') return rel;
+                return rel.summary || rel.type || JSON.stringify(rel);
+            }).join('; ');
+        }
+        if (Object.prototype.hasOwnProperty.call(patch, 'source_message_ids_json')) {
+            patch.source_message_ids_json = stringifyJson(normalizeArrayField(patch.source_message_ids_json, []));
+        }
+        if (Object.prototype.hasOwnProperty.call(patch, 'summary') || Object.prototype.hasOwnProperty.call(patch, 'content') || Object.prototype.hasOwnProperty.call(patch, 'event')) {
+            const summary = (patch.summary || patch.event || '').trim();
+            const content = (patch.content || patch.event || summary).trim();
+            if (summary) {
+                patch.summary = summary;
+                patch.event = patch.event || summary;
+            }
+            if (content) {
+                patch.content = content;
+            }
+        }
+        patch.updated_at = patch.updated_at || Date.now();
+        const fields = Object.keys(patch);
         const setClause = fields.map(f => `${f} = ?`).join(', ');
-        const values = fields.map(f => memoryData[f]);
+        const values = fields.map(f => patch[f]);
         db.prepare(`UPDATE memories SET ${setClause} WHERE id = ?`).run(...values, id);
     }
 
@@ -1055,6 +1538,15 @@ function getUserDb(userId) {
             profile = db.prepare('SELECT * FROM user_profile WHERE id = ?').get('default');
         }
         if (profile) {
+            if (!String(profile.response_style_constitution || '').trim()) {
+                profile.response_style_constitution = [
+                    '这是最高优先级的长期表达风格约束。',
+                    '避免连续几轮使用相同句式骨架、相同情绪推进、相同emoji顺序。',
+                    '不要把回复写成固定模板，不要总是同一种委屈、安抚、阴阳怪气节奏。',
+                    '可以保留角色性格，但表达方式必须有变化感。',
+                    '除非角色本来就极度依赖表情，否则emoji默认少用，并避免固定排列。'
+                ].join('\n');
+            }
             // Older DBs may still store percentages as whole numbers instead of 0-1 decimals.
             if (typeof profile.group_skip_rate === 'number' && profile.group_skip_rate > 1) {
                 profile.group_skip_rate = profile.group_skip_rate / 100;
@@ -1204,6 +1696,7 @@ function getUserDb(userId) {
     function deleteGroup(id) {
         db.prepare('DELETE FROM group_messages WHERE group_id = ?').run(id);
         db.prepare('DELETE FROM group_members WHERE group_id = ?').run(id);
+        db.prepare('DELETE FROM group_conversation_digest_cache WHERE group_id = ?').run(id);
         db.prepare('DELETE FROM char_relationships WHERE source = ?').run(`group:${id}`);
         db.prepare('DELETE FROM memories WHERE group_id = ?').run(id);
         db.prepare('DELETE FROM group_chats WHERE id = ?').run(id);
@@ -1314,6 +1807,7 @@ function getUserDb(userId) {
 
     function clearGroupMessages(groupId) {
         db.prepare('DELETE FROM group_messages WHERE group_id = ?').run(groupId);
+        db.prepare('DELETE FROM group_conversation_digest_cache WHERE group_id = ?').run(groupId);
         db.prepare('DELETE FROM char_relationships WHERE source = ?').run(`group:${groupId}`);
         db.prepare('DELETE FROM memories WHERE group_id = ?').run(groupId);
     }
@@ -1331,6 +1825,7 @@ function getUserDb(userId) {
 
     function removeGroupMember(groupId, memberId) {
         db.prepare('DELETE FROM group_members WHERE group_id = ? AND member_id = ?').run(groupId, memberId);
+        db.prepare('DELETE FROM group_conversation_digest_cache WHERE group_id = ? AND character_id = ?').run(groupId, memberId);
     }
 
     function hideGroupMessagesByRange(groupId, startIdx, endIdx) {
@@ -1360,6 +1855,10 @@ function getUserDb(userId) {
     function deleteCharacter(id) {
         db.prepare('DELETE FROM messages WHERE character_id = ?').run(id);
         db.prepare('DELETE FROM memories WHERE character_id = ?').run(id);
+        db.prepare('DELETE FROM history_window_cache WHERE character_id = ?').run(id);
+        db.prepare('DELETE FROM prompt_block_cache WHERE character_id = ?').run(id);
+        db.prepare('DELETE FROM conversation_digest_cache WHERE character_id = ?').run(id);
+        db.prepare('DELETE FROM group_conversation_digest_cache WHERE character_id = ?').run(id);
         // clean up moment interactions authored by this character
         const charMoments = db.prepare('SELECT id FROM moments WHERE character_id=?').all(id);
         for (const m of charMoments) {
@@ -1687,13 +2186,455 @@ function getUserDb(userId) {
         }
     }
 
+    function getLlmCache(cacheKey) {
+        try {
+            const now = Date.now();
+            const row = db.prepare(`
+                SELECT *
+                FROM llm_cache
+                WHERE cache_key = ?
+                  AND expires_at > ?
+                LIMIT 1
+            `).get(cacheKey, now);
+            if (!row) return null;
+            db.prepare('UPDATE llm_cache SET hit_count = hit_count + 1, last_hit_at = ? WHERE id = ?').run(now, row.id);
+            return {
+                ...row,
+                response_meta: safeParseJson(row.response_meta, {})
+            };
+        } catch (e) {
+            console.error('[DB] Error reading llm cache:', e.message);
+            return null;
+        }
+    }
+
+    function incrementLlmCacheLookup(scope = 'global', wasHit = false) {
+        try {
+            const now = Date.now();
+            db.prepare(`
+                INSERT INTO llm_cache_stats (scope, lookup_count, hit_count, updated_at)
+                VALUES (?, 1, ?, ?)
+                ON CONFLICT(scope) DO UPDATE SET
+                    lookup_count = lookup_count + 1,
+                    hit_count = hit_count + excluded.hit_count,
+                    updated_at = excluded.updated_at
+            `).run(String(scope || 'global'), wasHit ? 1 : 0, now);
+            return true;
+        } catch (e) {
+            console.error('[DB] Error updating llm cache stats:', e.message);
+            return false;
+        }
+    }
+
+    function getLlmCacheStats(scope = 'global') {
+        try {
+            return db.prepare(`
+                SELECT scope, lookup_count, hit_count, updated_at
+                FROM llm_cache_stats
+                WHERE scope = ?
+                LIMIT 1
+            `).get(String(scope || 'global')) || null;
+        } catch (e) {
+            console.error('[DB] Error reading llm cache stats:', e.message);
+            return null;
+        }
+    }
+
+    function upsertLlmCache(entry = {}) {
+        try {
+            const now = Date.now();
+            const expiresAt = Number(entry.expires_at || now + 3600000);
+            db.prepare(`
+                INSERT INTO llm_cache (
+                    cache_key, cache_type, cache_scope, character_id, model, prompt_hash, prompt_preview,
+                    response_text, response_meta, prompt_tokens, completion_tokens,
+                    hit_count, created_at, last_hit_at, expires_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(cache_key) DO UPDATE SET
+                    cache_type = excluded.cache_type,
+                    cache_scope = excluded.cache_scope,
+                    character_id = excluded.character_id,
+                    model = excluded.model,
+                    prompt_hash = excluded.prompt_hash,
+                    prompt_preview = excluded.prompt_preview,
+                    response_text = excluded.response_text,
+                    response_meta = excluded.response_meta,
+                    prompt_tokens = excluded.prompt_tokens,
+                    completion_tokens = excluded.completion_tokens,
+                    expires_at = excluded.expires_at
+            `).run(
+                String(entry.cache_key || ''),
+                String(entry.cache_type || 'generic'),
+                String(entry.cache_scope || ''),
+                String(entry.character_id || ''),
+                String(entry.model || ''),
+                String(entry.prompt_hash || ''),
+                String(entry.prompt_preview || ''),
+                String(entry.response_text || ''),
+                stringifyJson(entry.response_meta || {}),
+                Number(entry.prompt_tokens || 0),
+                Number(entry.completion_tokens || 0),
+                Number(entry.hit_count || 0),
+                Number(entry.created_at || now),
+                Number(entry.last_hit_at || 0),
+                expiresAt
+            );
+            return true;
+        } catch (e) {
+            console.error('[DB] Error writing llm cache:', e.message);
+            return false;
+        }
+    }
+
+    function pruneExpiredLlmCache(limit = 500) {
+        try {
+            const now = Date.now();
+            return db.prepare(`
+                DELETE FROM llm_cache
+                WHERE id IN (
+                    SELECT id
+                    FROM llm_cache
+                    WHERE expires_at <= ?
+                    ORDER BY expires_at ASC
+                    LIMIT ?
+                )
+            `).run(now, Math.max(1, Number(limit || 500))).changes || 0;
+        } catch (e) {
+            console.error('[DB] Error pruning llm cache:', e.message);
+            return 0;
+        }
+    }
+
+    function getPromptBlockCache(characterId, blockType, sourceHash) {
+        try {
+            const now = Date.now();
+            const row = db.prepare(`
+                SELECT *
+                FROM prompt_block_cache
+                WHERE character_id = ?
+                  AND block_type = ?
+                  AND source_hash = ?
+                LIMIT 1
+            `).get(String(characterId || ''), String(blockType || ''), String(sourceHash || '')) || null;
+            if (!row) return null;
+            db.prepare('UPDATE prompt_block_cache SET hit_count = COALESCE(hit_count, 0) + 1, last_hit_at = ? WHERE id = ?').run(now, row.id);
+            return {
+                ...row,
+                hit_count: Number(row.hit_count || 0) + 1,
+                last_hit_at: now
+            };
+        } catch (e) {
+            console.error('[DB] Error reading prompt block cache:', e.message);
+            return null;
+        }
+    }
+
+    function upsertPromptBlockCache(entry = {}) {
+        try {
+            const now = Date.now();
+            db.prepare(`
+                INSERT INTO prompt_block_cache (
+                    character_id, block_type, source_hash, compiled_text, hit_count, created_at, last_hit_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(character_id, block_type) DO UPDATE SET
+                    source_hash = excluded.source_hash,
+                    compiled_text = excluded.compiled_text,
+                    hit_count = COALESCE(prompt_block_cache.hit_count, 0) + COALESCE(excluded.hit_count, 0),
+                    created_at = CASE
+                        WHEN COALESCE(prompt_block_cache.created_at, 0) > 0 THEN prompt_block_cache.created_at
+                        ELSE excluded.created_at
+                    END,
+                    last_hit_at = CASE
+                        WHEN COALESCE(excluded.last_hit_at, 0) > COALESCE(prompt_block_cache.last_hit_at, 0) THEN excluded.last_hit_at
+                        ELSE prompt_block_cache.last_hit_at
+                    END,
+                    updated_at = excluded.updated_at
+            `).run(
+                String(entry.character_id || ''),
+                String(entry.block_type || ''),
+                String(entry.source_hash || ''),
+                String(entry.compiled_text || ''),
+                Number(entry.hit_count || 0),
+                Number(entry.created_at || now),
+                Number(entry.last_hit_at || 0),
+                Number(entry.updated_at || now)
+            );
+            return true;
+        } catch (e) {
+            console.error('[DB] Error writing prompt block cache:', e.message);
+            return false;
+        }
+    }
+
+    function getHistoryWindowCache(characterId, windowType, windowSize, sourceHash) {
+        try {
+            const now = Date.now();
+            const row = db.prepare(`
+                SELECT *
+                FROM history_window_cache
+                WHERE character_id = ?
+                  AND window_type = ?
+                  AND window_size = ?
+                  AND source_hash = ?
+                LIMIT 1
+            `).get(
+                String(characterId || ''),
+                String(windowType || ''),
+                Number(windowSize || 0),
+                String(sourceHash || '')
+            );
+            if (!row) return null;
+            db.prepare('UPDATE history_window_cache SET hit_count = COALESCE(hit_count, 0) + 1, last_hit_at = ? WHERE id = ?').run(now, row.id);
+            return {
+                ...row,
+                message_ids_json: safeParseJson(row.message_ids_json, []),
+                compiled_json: safeParseJson(row.compiled_json, []),
+                hit_count: Number(row.hit_count || 0) + 1,
+                last_hit_at: now
+            };
+        } catch (e) {
+            console.error('[DB] Error reading history window cache:', e.message);
+            return null;
+        }
+    }
+
+    function getLatestHistoryWindowCache(characterId, windowType, windowSize) {
+        try {
+            const row = db.prepare(`
+                SELECT *
+                FROM history_window_cache
+                WHERE character_id = ?
+                  AND window_type = ?
+                  AND window_size = ?
+                LIMIT 1
+            `).get(
+                String(characterId || ''),
+                String(windowType || ''),
+                Number(windowSize || 0)
+            );
+            if (!row) return null;
+            return {
+                ...row,
+                message_ids_json: safeParseJson(row.message_ids_json, []),
+                compiled_json: safeParseJson(row.compiled_json, [])
+            };
+        } catch (e) {
+            console.error('[DB] Error reading latest history window cache:', e.message);
+            return null;
+        }
+    }
+
+    function upsertHistoryWindowCache(entry = {}) {
+        try {
+            const now = Date.now();
+            db.prepare(`
+                INSERT INTO history_window_cache (
+                    character_id, window_type, window_size, source_hash, message_ids_json, compiled_json, hit_count, created_at, last_hit_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(character_id, window_type, window_size) DO UPDATE SET
+                    source_hash = excluded.source_hash,
+                    message_ids_json = excluded.message_ids_json,
+                    compiled_json = excluded.compiled_json,
+                    hit_count = COALESCE(history_window_cache.hit_count, 0) + COALESCE(excluded.hit_count, 0),
+                    created_at = CASE
+                        WHEN COALESCE(history_window_cache.created_at, 0) > 0 THEN history_window_cache.created_at
+                        ELSE excluded.created_at
+                    END,
+                    last_hit_at = CASE
+                        WHEN COALESCE(excluded.last_hit_at, 0) > COALESCE(history_window_cache.last_hit_at, 0) THEN excluded.last_hit_at
+                        ELSE history_window_cache.last_hit_at
+                    END,
+                    updated_at = excluded.updated_at
+            `).run(
+                String(entry.character_id || ''),
+                String(entry.window_type || ''),
+                Number(entry.window_size || 0),
+                String(entry.source_hash || ''),
+                stringifyJson(entry.message_ids_json || []),
+                stringifyJson(entry.compiled_json || []),
+                Number(entry.hit_count || 0),
+                Number(entry.created_at || now),
+                Number(entry.last_hit_at || 0),
+                Number(entry.updated_at || now)
+            );
+            return true;
+        } catch (e) {
+            console.error('[DB] Error writing history window cache:', e.message);
+            return false;
+        }
+    }
+
+    function getConversationDigest(characterId, options = {}) {
+        try {
+            const row = db.prepare(`
+                SELECT *
+                FROM conversation_digest_cache
+                WHERE character_id = ?
+                LIMIT 1
+            `).get(String(characterId || ''));
+            if (!row) return null;
+            const normalized = normalizeConversationDigestRow(row);
+            if (options.trackHit === false) {
+                return normalized;
+            }
+            const now = Date.now();
+            db.prepare('UPDATE conversation_digest_cache SET hit_count = COALESCE(hit_count, 0) + 1, last_hit_at = ? WHERE id = ?').run(now, row.id);
+            return {
+                ...normalized,
+                hit_count: normalized.hit_count + 1,
+                last_hit_at: now
+            };
+        } catch (e) {
+            console.error('[DB] Error reading conversation digest cache:', e.message);
+            return null;
+        }
+    }
+
+    function getGroupConversationDigest(groupId, characterId, options = {}) {
+        try {
+            const row = db.prepare(`
+                SELECT *
+                FROM group_conversation_digest_cache
+                WHERE group_id = ? AND character_id = ?
+                LIMIT 1
+            `).get(String(groupId || ''), String(characterId || ''));
+            if (!row) return null;
+            const normalized = normalizeGroupConversationDigestRow(row);
+            if (options.trackHit === false) {
+                return normalized;
+            }
+            const now = Date.now();
+            db.prepare('UPDATE group_conversation_digest_cache SET hit_count = COALESCE(hit_count, 0) + 1, last_hit_at = ? WHERE id = ?').run(now, row.id);
+            return {
+                ...normalized,
+                hit_count: normalized.hit_count + 1,
+                last_hit_at: now
+            };
+        } catch (e) {
+            console.error('[DB] Error reading group conversation digest cache:', e.message);
+            return null;
+        }
+    }
+
+    function upsertConversationDigest(entry = {}) {
+        try {
+            const now = Date.now();
+            db.prepare(`
+                INSERT INTO conversation_digest_cache (
+                    character_id, source_hash, digest_text, emotion_state,
+                    relationship_state_json, open_loops_json, recent_facts_json, scene_state_json,
+                    last_message_id, hit_count, created_at, last_hit_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(character_id) DO UPDATE SET
+                    source_hash = excluded.source_hash,
+                    digest_text = excluded.digest_text,
+                    emotion_state = excluded.emotion_state,
+                    relationship_state_json = excluded.relationship_state_json,
+                    open_loops_json = excluded.open_loops_json,
+                    recent_facts_json = excluded.recent_facts_json,
+                    scene_state_json = excluded.scene_state_json,
+                    last_message_id = excluded.last_message_id,
+                    hit_count = COALESCE(conversation_digest_cache.hit_count, 0) + COALESCE(excluded.hit_count, 0),
+                    created_at = CASE
+                        WHEN COALESCE(conversation_digest_cache.created_at, 0) > 0 THEN conversation_digest_cache.created_at
+                        ELSE excluded.created_at
+                    END,
+                    last_hit_at = CASE
+                        WHEN COALESCE(excluded.last_hit_at, 0) > COALESCE(conversation_digest_cache.last_hit_at, 0) THEN excluded.last_hit_at
+                        ELSE conversation_digest_cache.last_hit_at
+                    END,
+                    updated_at = excluded.updated_at
+            `).run(
+                String(entry.character_id || ''),
+                String(entry.source_hash || ''),
+                String(entry.digest_text || ''),
+                String(entry.emotion_state || ''),
+                stringifyJson(entry.relationship_state_json || []),
+                stringifyJson(entry.open_loops_json || []),
+                stringifyJson(entry.recent_facts_json || []),
+                stringifyJson(entry.scene_state_json || []),
+                Number(entry.last_message_id || 0),
+                Number(entry.hit_count || 0),
+                Number(entry.created_at || now),
+                Number(entry.last_hit_at || 0),
+                Number(entry.updated_at || now)
+            );
+            return true;
+        } catch (e) {
+            console.error('[DB] Error writing conversation digest cache:', e.message);
+            return false;
+        }
+    }
+
+    function upsertGroupConversationDigest(entry = {}) {
+        try {
+            const now = Date.now();
+            db.prepare(`
+                INSERT INTO group_conversation_digest_cache (
+                    group_id, character_id, source_hash, digest_text, emotion_state,
+                    relationship_state_json, open_loops_json, recent_facts_json, scene_state_json,
+                    last_message_id, hit_count, created_at, last_hit_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(group_id, character_id) DO UPDATE SET
+                    source_hash = excluded.source_hash,
+                    digest_text = excluded.digest_text,
+                    emotion_state = excluded.emotion_state,
+                    relationship_state_json = excluded.relationship_state_json,
+                    open_loops_json = excluded.open_loops_json,
+                    recent_facts_json = excluded.recent_facts_json,
+                    scene_state_json = excluded.scene_state_json,
+                    last_message_id = excluded.last_message_id,
+                    hit_count = COALESCE(group_conversation_digest_cache.hit_count, 0) + COALESCE(excluded.hit_count, 0),
+                    created_at = CASE
+                        WHEN COALESCE(group_conversation_digest_cache.created_at, 0) > 0 THEN group_conversation_digest_cache.created_at
+                        ELSE excluded.created_at
+                    END,
+                    last_hit_at = CASE
+                        WHEN COALESCE(excluded.last_hit_at, 0) > COALESCE(group_conversation_digest_cache.last_hit_at, 0) THEN excluded.last_hit_at
+                        ELSE group_conversation_digest_cache.last_hit_at
+                    END,
+                    updated_at = excluded.updated_at
+            `).run(
+                String(entry.group_id || ''),
+                String(entry.character_id || ''),
+                String(entry.source_hash || ''),
+                String(entry.digest_text || ''),
+                String(entry.emotion_state || ''),
+                stringifyJson(entry.relationship_state_json || []),
+                stringifyJson(entry.open_loops_json || []),
+                stringifyJson(entry.recent_facts_json || []),
+                stringifyJson(entry.scene_state_json || []),
+                Number(entry.last_message_id || 0),
+                Number(entry.hit_count || 0),
+                Number(entry.created_at || now),
+                Number(entry.last_hit_at || 0),
+                Number(entry.updated_at || now)
+            );
+            return true;
+        } catch (e) {
+            console.error('[DB] Error writing group conversation digest cache:', e.message);
+            return false;
+        }
+    }
+
     const dbInstance = {
 
         rawRun,
         addTokenUsage,
+        getLlmCache,
+        getLlmCacheStats,
+        getPromptBlockCache,
+        getHistoryWindowCache,
+        getLatestHistoryWindowCache,
+        getConversationDigest,
+        getGroupConversationDigest,
         initDb,
         getCharacters,
         getCharacter,
+        addEmotionLog,
+        addLlmDebugLog,
+        getEmotionLogs,
+        getLlmDebugLogs,
         getCharacterHiddenState,
         updateCharacterHiddenState,
         updateCharacter,
@@ -1702,6 +2643,7 @@ function getUserDb(userId) {
         getMessagesBefore,
         getVisibleMessages,
         getVisibleMessagesSince,
+        getLastUserMessageTimestamp,
         getUnsummarizedMessages,
         countUnsummarizedMessages,
         getOverflowMessages,
@@ -1719,9 +2661,12 @@ function getUserDb(userId) {
         clearMemories,
         clearMoments,
         clearDiaries,
+        clearConversationDigest,
+        clearGroupConversationDigest,
         exportCharacterData,
         getMemories,
         getMemory,
+        getMemoryByDedupeKey,
         addMemory,
         markMemoriesRetrieved,
         updateMemory,
@@ -1745,6 +2690,7 @@ function getUserDb(userId) {
         updateUserProfile,
         getJealousyState,
         getTokenUsageSummary,
+        pruneExpiredLlmCache,
         addFriend,
         clearFriends,
         clearCharRelationships,
@@ -1794,6 +2740,12 @@ function getUserDb(userId) {
         getUnclaimedRedPacketsForGroup,
         getWallet,
         getMomentsContextForChar,
+        incrementLlmCacheLookup,
+        upsertLlmCache,
+        upsertPromptBlockCache,
+        upsertHistoryWindowCache,
+        upsertConversationDigest,
+        upsertGroupConversationDigest,
         getRawDb: () => db,
         close: () => db.close(),
         getDbPath: () => dbPath,

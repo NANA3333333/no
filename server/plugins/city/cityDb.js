@@ -235,6 +235,7 @@ module.exports = function initCityDb(db) {
 
         const configDefaults = [
             ['dlc_enabled', '0'],
+            ['city_actions_paused', '0'],
             ['metabolism_rate', '20'],
             ['inflation', '1.0'],
             ['work_bonus', '1.0'],
@@ -321,10 +322,31 @@ module.exports = function initCityDb(db) {
 
     // --- Logs ---
     function logAction(charId, actionType, content, dCal = 0, dMoney = 0, loc = '') {
+        const now = Date.now();
+        const normalizedContent = String(content || '').replace(/\s+/g, ' ').trim();
+        if (charId && normalizedContent) {
+            const recent = db.prepare(`
+                SELECT id, action_type, location, content, timestamp
+                FROM city_logs
+                WHERE character_id = ?
+                ORDER BY timestamp DESC
+                LIMIT 1
+            `).get(charId);
+            if (recent) {
+                const recentContent = String(recent.content || '').replace(/\s+/g, ' ').trim();
+                const withinShortWindow = Math.abs(now - Number(recent.timestamp || 0)) <= 5 * 60 * 1000;
+                const sameContent = recentContent === normalizedContent;
+                const sameLocation = String(recent.location || '') === String(loc || '');
+                if (withinShortWindow && sameContent && sameLocation) {
+                    return;
+                }
+            }
+        }
+
         db.prepare(`
             INSERT INTO city_logs (character_id, action_type, content, delta_calories, delta_money, location, timestamp)
             VALUES (?, ?, ?, ?, ?, ?, ?)
-        `).run(charId, actionType, content, dCal, dMoney, loc, Date.now());
+        `).run(charId, actionType, content, dCal, dMoney, loc, now);
     }
 
     function getCityLogs(limit = 100) {

@@ -1,6 +1,7 @@
 ﻿import React, { useState, useEffect, useCallback } from 'react';
 import { Plus, Trash2, ToggleLeft, ToggleRight, Save, DollarSign, Heart, Edit3, X, Power, Package, ShoppingBag, AlertTriangle } from 'lucide-react';
 import { resolveAvatarUrl } from '../../utils/avatar';
+import { deriveEmotion } from '../../utils/emotion';
 
 const FALLBACK_AVATAR = 'https://api.dicebear.com/7.x/shapes/svg?seed=User';
 const avatarSrc = (url, apiUrl) => resolveAvatarUrl(url, apiUrl) || FALLBACK_AVATAR;
@@ -25,8 +26,21 @@ const inputStyle = {
 };
 const labelStyle = { fontSize: '12px', color: '#666', marginBottom: '4px', display: 'block', fontWeight: '500' };
 
+const stateColor = (value, inverted = false) => {
+    const normalized = Number(value ?? 0);
+    if (inverted) {
+        if (normalized <= 30) return '#2e7d32';
+        if (normalized <= 60) return '#ef6c00';
+        return '#c62828';
+    }
+    if (normalized >= 70) return '#2e7d32';
+    if (normalized >= 40) return '#ef6c00';
+    return '#c62828';
+};
+
 const CONFIG_LABELS = {
     dlc_enabled: 'DLC 总开关',
+    city_actions_paused: '暂停主动活动',
     metabolism_rate: '基础代谢 (每 tick)',
     inflation: '通货膨胀倍率',
     work_bonus: '打工奖金倍率',
@@ -141,6 +155,7 @@ export default function CityManager({ apiUrl, onRefreshLogs }) {
     const [quests, setQuests] = useState([]);
     const [previewTimeSkipMinutes, setPreviewTimeSkipMinutes] = useState(0);
     const [isSkippingTime, setIsSkippingTime] = useState(false);
+    const refreshTimerRef = React.useRef(null);
     const token = localStorage.getItem('token');
     const headers = { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' };
 
@@ -181,7 +196,27 @@ export default function CityManager({ apiUrl, onRefreshLogs }) {
         finally { setLoading(false); }
     }, [apiUrl, token]);
 
-    useEffect(() => { fetchAll(); }, [fetchAll]);
+    useEffect(() => {
+        fetchAll();
+        const scheduleRefresh = () => {
+            if (refreshTimerRef.current) return;
+            refreshTimerRef.current = setTimeout(() => {
+                refreshTimerRef.current = null;
+                fetchAll();
+            }, 800);
+        };
+        const handleCityUpdate = () => scheduleRefresh();
+        window.addEventListener('city_update', handleCityUpdate);
+        const interval = setInterval(fetchAll, 5000);
+        return () => {
+            window.removeEventListener('city_update', handleCityUpdate);
+            clearInterval(interval);
+            if (refreshTimerRef.current) {
+                clearTimeout(refreshTimerRef.current);
+                refreshTimerRef.current = null;
+            }
+        };
+    }, [fetchAll]);
 
     const saveDistrict = async (d) => { await fetch(`${apiUrl}/city/districts`, { method: 'POST', headers, body: JSON.stringify(d) }); setEditing(null); fetchAll(); };
     const applyDistrictTemplate = (templateKey) => {
@@ -266,6 +301,7 @@ export default function CityManager({ apiUrl, onRefreshLogs }) {
     };
 
     const dlcEnabled = config.dlc_enabled === '1' || config.dlc_enabled === 'true';
+    const actionsPaused = config.city_actions_paused === '1' || config.city_actions_paused === 'true';
     if (loading) return <div style={{ padding: '20px', textAlign: 'center', color: '#999' }}>加载中...</div>;
 
     const mayorEnabled = config.mayor_enabled === '1' || config.mayor_enabled === 'true';
@@ -289,6 +325,26 @@ export default function CityManager({ apiUrl, onRefreshLogs }) {
                 </div>
             </div>
 
+            <div style={{ ...sectionStyle, border: !dlcEnabled ? '2px solid #bdbdbd' : actionsPaused ? '2px solid #ff9800' : '2px solid #4caf50', opacity: dlcEnabled ? 1 : 0.82 }}>
+                    <div style={{ padding: '16px 20px', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                        <div>
+                            <h3 style={{ margin: 0, fontSize: '16px', display: 'flex', alignItems: 'center', gap: '8px' }}>
+                                <Power size={18} color={!dlcEnabled ? '#9e9e9e' : actionsPaused ? '#ff9800' : '#4caf50'} /> 暂停主动活动
+                            </h3>
+                            <p style={{ margin: '4px 0 0', fontSize: '12px', color: '#888' }}>
+                                {!dlcEnabled
+                                    ? '当前 DLC 总开关处于关闭状态。这里是预设项：重新启用商业街后，会按这里的设置决定是否继续主动活动。'
+                                    : actionsPaused
+                                    ? '角色不会继续跑日程、主动行动和社交，但睡眠债、饱腹值等被动生理仍会随时间变化。'
+                                    : '角色会继续自主行动并消耗 API；被动生理也会继续变化。'}
+                            </p>
+                        </div>
+                        <button style={btnStyle(actionsPaused ? '#4caf50' : '#ff9800')} onClick={() => updateConfig('city_actions_paused', actionsPaused ? '0' : '1')}>
+                            {actionsPaused ? <><ToggleLeft size={16} /> 恢复主动活动</> : <><ToggleRight size={16} /> 暂停主动活动</>}
+                        </button>
+                    </div>
+                </div>
+
             {economy && (
                 <div style={{ display: 'flex', gap: '12px', marginBottom: '16px', flexWrap: 'wrap' }}>
                     {[
@@ -303,6 +359,39 @@ export default function CityManager({ apiUrl, onRefreshLogs }) {
                     ))}
                 </div>
             )}
+
+            <div style={sectionStyle}>
+                <details open>
+                    <summary style={{ ...headerStyle, cursor: 'pointer', listStyle: 'none' }}>
+                        <span style={{ fontSize: '16px', fontWeight: '600', color: '#333' }}>规则说明</span>
+                    </summary>
+                    <div style={{ padding: '14px 18px', fontSize: '13px', color: '#555', lineHeight: 1.7 }}>
+                        <div style={{ fontWeight: '600', marginBottom: '8px', color: '#333' }}>当前已实装规则</div>
+                        <div>1. 生存基础：角色会持续消耗体力，并随着时间累积精力波动、睡眠债、压力、社交需求和健康变化。</div>
+                        <div>2. 进食反馈：吃东西后会提升饱腹感，心情通常会变好，同时增加睡眠债。</div>
+                        <div>3. 过量进食：如果胃负担过高，角色会更困、更没精神，压力也会上升。</div>
+                        <div>4. 被动消化：饱腹感和胃负担会随时间慢慢下降，胃负担高时会额外推高睡眠债。</div>
+                        <div>5. 休息恢复：休息会降低睡眠债，并帮助恢复精力和部分健康。</div>
+                        <div>6. 精力阈值：精力低于 35 时会明显偏向恢复类行动；低于 20 时会硬性避开工作、学习、赌博和高强度娱乐。</div>
+                        <div>7. 高精力状态：精力高于 70 时，角色更愿意活动、探索和主动表达；高于 85 时这种倾向会更明显。</div>
+                        <div>8. 睡眠债对对话：睡眠债高于 40 时回复会更疲惫、更短；高于 70 时更烦躁、更容易觉得聊天是负担；高于 85 时除非情绪特别强烈，否则会明显不想聊，只想休息。</div>
+                        <div>9. 情绪触发来源：私聊收到用户消息、角色发出私聊回复、群聊里看到用户发言、群聊里自己发言、商业街社交事件结算，都会回写心情、压力和社交需求。</div>
+                        <div>10. 私聊情绪回写：收到用户私聊时，角色会明显提振心情、降低压力、缓解社交饥渴；如果已经等了较久，变化会更大。角色自己发出私聊后，也会小幅缓解压力和社交需求。</div>
+                        <div>11. 群聊情绪回写：群里普通看到用户发言会有轻微变化；被点名 @ 时变化更明显；@all 介于两者之间。角色自己在群里发言后，也会小幅缓解压力和社交需求。</div>
+                        <div>12. 商业街社交回写：在商业街发生偶遇、攀谈、社交结算后，角色会额外提升一点心情，并降低一点压力和社交需求。</div>
+                        <div>13. 主情绪判定阈值：难受 🤒 由低健康或高胃负担触发；困倦 😪 由高睡眠债触发；委屈 🥺 由高压力、商业街消息被忽略或被冷落触发；生气 😤 由高压力配合低心情触发；吃醋 😾 需要较高嫉妒值且必须有明确嫉妒对象；寂寞 🫥 由高社交需求配合偏低心情触发；开心 😄、伤心 😞、烦躁 😣 则由心情和压力区间共同决定。</div>
+                        <div>14. 主情绪对私聊：生气会更冲、更带刺；委屈会更试探、更索要安抚；开心会更主动、更愿意展开；寂寞会更想延长对话；困倦和难受会更短句、更不想多聊。</div>
+                        <div>15. 主情绪对群聊：生气更容易呛人或反驳；委屈更容易沉默或轻微带刺；开心更容易接话和活跃；寂寞更想被注意；困倦和难受更容易潜水和少参与。</div>
+                        <div>16. 主情绪对商业街：难受和困倦更偏向医疗或休息；委屈和伤心更偏向安全、熟悉、低刺激地点；寂寞更偏向公共场所和休闲区；生气和烦躁更偏向散心、发泄或转移注意力；开心更偏向娱乐、探索和主动活动。</div>
+                        <div>17. 实时刷新：收到私聊消息、群聊消息、商业街更新和联系人刷新事件时，前端会自动刷新联系人情绪，不需要手动刷新页面。</div>
+                        <div>18. 暂停主动活动：开启后，商业街角色不会继续跑日程、主动行动和社交，但睡眠债、饱腹值、精力等被动生理仍会随时间流逝。</div>
+                        <div>19. 被动生理结算周期：角色的“商业街活动频率 (次/小时)”现在也会决定被动生理多久结算一次。频率越高，精力、睡眠债、饱腹感、胃负担等变化越平滑；频率越低，变化会更成块，但同一段总时间内的整体生理消耗仍尽量保持一致。</div>
+                        <div>20. 场景化私聊：角色在工作中、睡觉中、吃饭中时，私聊和群聊语气会带上当前场景，不再像完全空闲时那样聊天。</div>
+                        <div>21. 工作打扰：角色在工作中被用户频繁私聊或群聊点名时，会累计分心值；工作结束时可能少赚一点钱，压力也会上升。</div>
+                        <div>22. 睡眠打扰：角色在睡觉时被用户频繁私聊或群聊点名时，会累计睡眠打断值；休息结束时睡眠债恢复会变差，精力也会受影响。</div>
+                    </div>
+                </details>
+            </div>
 
             <div style={sectionStyle}>
                 <div style={headerStyle}>
@@ -592,11 +681,16 @@ export default function CityManager({ apiUrl, onRefreshLogs }) {
                     <h3 style={{ margin: 0, fontSize: '16px' }}>管理员操作</h3>
                 </div>
                 <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(260px, 1fr))', gap: '8px', padding: '12px' }}>
-                    {characters.map(c => (
+                    {characters.map(c => {
+                        const emotion = deriveEmotion(c);
+                        return (
                         <div key={c.id} style={{ display: 'flex', alignItems: 'center', gap: '8px', padding: '8px', border: '1px solid #eee', borderRadius: '8px' }}>
                             <img src={avatarSrc(c.avatar, apiUrl)} alt="" style={{ width: '28px', height: '28px', borderRadius: '50%', objectFit: 'cover' }} />
                             <div style={{ flex: 1, minWidth: 0 }}>
-                                <div style={{ fontWeight: '500', fontSize: '12px' }}>{c.name}</div>
+                                <div style={{ fontWeight: '500', fontSize: '12px', display: 'flex', alignItems: 'center', gap: '6px', flexWrap: 'wrap' }}>
+                                    <span>{c.name}</span>
+                                    <span style={{ fontSize: '10px', color: emotion.color, fontWeight: '700' }}>{emotion.emoji} {emotion.label}</span>
+                                </div>
                                 <div style={{ fontSize: '10px', color: '#999' }}>{(c.wallet || 0).toFixed(0)}币 · {c.calories}卡 · <span onClick={(e) => { e.stopPropagation(); setViewInventory({ charName: c.name, inventory: c.inventory || [] }); }} style={{ cursor: 'pointer', color: (c.inventory || []).length > 0 ? 'var(--accent-color, #2196f3)' : '#999', textDecoration: (c.inventory || []).length > 0 ? 'underline' : 'none' }}>背包 {(c.inventory || []).length} 件</span></div>
                                 <div style={{ display: 'flex', gap: '6px', marginTop: '2px' }}>
                                     <span style={{ fontSize: '9px', padding: '1px 4px', borderRadius: '3px', backgroundColor: '#e3f2fd', color: '#1565c0' }}>智 {c.stat_int ?? 50}</span>
@@ -608,7 +702,8 @@ export default function CityManager({ apiUrl, onRefreshLogs }) {
                             <button onClick={() => feedChar(c.id, c.name)} style={{ ...btnStyle('#4caf50'), padding: '3px 6px', fontSize: '10px' }} title="补体力"><Heart size={10} /></button>
                             <button onClick={() => setGiveItemTarget({ charId: c.id, charName: c.name })} style={{ ...btnStyle('#9c27b0'), padding: '3px 6px', fontSize: '10px' }} title="送物品"><Package size={10} /></button>
                         </div>
-                    ))}
+                        );
+                    })}
                 </div>
                 <div style={{ marginTop: '16px', padding: '16px', borderTop: '1px dashed #ddd', backgroundColor: '#fff5f5' }}>
                     <h4 style={{ margin: '0 0 12px 0', fontSize: '14px', color: '#d32f2f' }}>危险操作（全局记录与数据清理）</h4>

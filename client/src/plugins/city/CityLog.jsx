@@ -13,6 +13,7 @@ import {
 } from 'lucide-react';
 import CityManager from './CityManager';
 import { resolveAvatarUrl } from '../../utils/avatar';
+import { deriveEmotion } from '../../utils/emotion';
 
 const FALLBACK_AVATAR = 'https://api.dicebear.com/7.x/shapes/svg?seed=User';
 const avatarSrc = (url, apiUrl) => resolveAvatarUrl(url, apiUrl) || FALLBACK_AVATAR;
@@ -86,6 +87,18 @@ function getActionEmoji(type) {
     }
 }
 
+function getStateColor(value) {
+    if (value >= 70) return '#4caf50';
+    if (value >= 40) return '#ff9800';
+    return '#f44336';
+}
+
+function getInvertedStateColor(value) {
+    if (value <= 30) return '#4caf50';
+    if (value <= 60) return '#ff9800';
+    return '#f44336';
+}
+
 export default function CityLog({ apiUrl, userProfile }) {
     const [tab, setTab] = useState('feed');
     const [logs, setLogs] = useState([]);
@@ -94,6 +107,7 @@ export default function CityLog({ apiUrl, userProfile }) {
     const [expandedBag, setExpandedBag] = useState(null);
     const [collapsedDates, setCollapsedDates] = useState({});
     const [isMobile, setIsMobile] = useState(() => window.innerWidth <= 768);
+    const refreshTimerRef = React.useRef(null);
     const token = localStorage.getItem('token');
 
     useEffect(() => {
@@ -122,8 +136,24 @@ export default function CityLog({ apiUrl, userProfile }) {
 
     useEffect(() => {
         fetchData();
-        const interval = setInterval(fetchData, 15000);
-        return () => clearInterval(interval);
+        const scheduleRefresh = () => {
+            if (refreshTimerRef.current) return;
+            refreshTimerRef.current = setTimeout(() => {
+                refreshTimerRef.current = null;
+                fetchData();
+            }, 800);
+        };
+        const handleCityUpdate = () => scheduleRefresh();
+        window.addEventListener('city_update', handleCityUpdate);
+        const interval = setInterval(fetchData, 5000);
+        return () => {
+            window.removeEventListener('city_update', handleCityUpdate);
+            clearInterval(interval);
+            if (refreshTimerRef.current) {
+                clearTimeout(refreshTimerRef.current);
+                refreshTimerRef.current = null;
+            }
+        };
     }, [apiUrl, token]);
 
     const latestLogDateTag = logs.length > 0
@@ -310,14 +340,25 @@ export default function CityLog({ apiUrl, userProfile }) {
                             <div style={{ flex: 1, minHeight: 0, overflowY: 'auto', padding: '8px' }}>
                                 {characters.map((c) => {
                                     const status = getStatusDetails(c.city_status);
+                                    const emotion = deriveEmotion(c);
                                     const pct = Math.min(100, Math.max(0, (c.calories / 4000) * 100));
                                     const bagOpen = expandedBag === c.id;
                                     const inventory = c.inventory || [];
+                                    const stateChips = [
+                                        { label: '精力 ⚡', value: c.energy ?? 100, color: getStateColor(c.energy ?? 100) },
+                                        { label: '睡眠债 😴', value: c.sleep_debt ?? 0, color: getInvertedStateColor(c.sleep_debt ?? 0) },
+                                        { label: '压力 🔥', value: c.stress ?? 20, color: getInvertedStateColor(c.stress ?? 20) },
+                                        { label: '社交需求 💬', value: c.social_need ?? 50, color: getInvertedStateColor(c.social_need ?? 50) },
+                                        { label: '健康 ❤️', value: c.health ?? 100, color: getStateColor(c.health ?? 100) },
+                                        { label: '饱腹感 🍽️', value: c.satiety ?? 45, color: getStateColor(c.satiety ?? 45) },
+                                        { label: '胃负担 🤰', value: c.stomach_load ?? 0, color: getInvertedStateColor(c.stomach_load ?? 0) },
+                                    ];
                                     return (
                                         <div key={c.id} style={{ padding: isMobile ? '8px' : '10px', border: '1px solid #eee', borderRadius: '8px', marginBottom: '8px' }}>
                                             <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '6px' }}>
                                                 <img src={avatarSrc(c.avatar, apiUrl)} alt="" style={{ width: isMobile ? '26px' : '28px', height: isMobile ? '26px' : '28px', borderRadius: '50%', objectFit: 'cover' }} />
                                                 <span style={{ fontWeight: '500', flex: 1, minWidth: 0, fontSize: isMobile ? '12px' : '13px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{c.name}</span>
+                                                <span style={{ fontSize: '10px', color: emotion.color, fontWeight: '700', flexShrink: 0 }}>{emotion.emoji} {emotion.label}</span>
                                                 <span style={{ fontSize: '12px', fontWeight: '600', color: '#ff9800', flexShrink: 0 }}>{(c.wallet || 0).toFixed(0)}💰</span>
                                             </div>
                                             <div style={{ display: 'flex', alignItems: 'center', gap: '4px', fontSize: isMobile ? '10px' : '11px', color: status.color, marginBottom: '6px', padding: '4px 6px', backgroundColor: `${status.color}12`, borderRadius: '4px', overflow: 'hidden', whiteSpace: 'nowrap', textOverflow: 'ellipsis' }}>
@@ -325,6 +366,14 @@ export default function CityLog({ apiUrl, userProfile }) {
                                             </div>
                                             <div style={{ width: '100%', height: '5px', backgroundColor: '#eee', borderRadius: '3px', overflow: 'hidden' }}>
                                                 <div style={{ width: `${pct}%`, height: '100%', backgroundColor: pct < 20 ? '#f44336' : pct < 50 ? '#ff9800' : '#4caf50', transition: 'width 0.3s' }} />
+                                            </div>
+                                            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, minmax(0, 1fr))', gap: '4px', marginTop: '6px' }}>
+                                                {stateChips.map((chip) => (
+                                                    <div key={chip.label} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', fontSize: '10px', padding: '3px 5px', borderRadius: '4px', backgroundColor: `${chip.color}12`, color: chip.color }}>
+                                                        <span>{chip.label}</span>
+                                                        <span style={{ fontWeight: '700' }}>{chip.value}</span>
+                                                    </div>
+                                                ))}
                                             </div>
                                             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '8px', marginTop: '4px' }}>
                                                 <span style={{ fontSize: '10px', color: '#aaa' }}>{c.calories}/4000 卡路里</span>
